@@ -23,8 +23,7 @@ Oh My MAGI!는 에반게리온의 MAGI에서 영감을 받은 무료 팬 프로�
 | [보안과 자료](docs/SECURITY.md) | 로컬 접근·외부 전송·에이전트 격리·비밀·삭제·내보내기 |
 | [운영](docs/OPERATIONS.md) | 지원 환경·한도·중단·복구·저장·배포·성능 목표 |
 | [수용 시나리오](docs/SCENARIOS.md) | 요구사항을 확인하는 정상·실패·경계·동시성·보안·복구 사례 |
-| [설계 근거](docs/REFERENCES.md) | 공개 기술 자료·원작 시각 참고·기존 프로젝트·근거의 적용 범위 |
-| [상업 프로젝트 인계](docs/REUSE.md) | 팬 요소와 독립적인 심의·근거·복구 계약의 적용 제안 |
+| [설계 근거](docs/REFERENCES.md) | 기술 자료·관련 프로젝트·연구·원작 시각·라이선스 근거와 적용 범위 |
 | [아키텍처 결정](docs/decisions/0001-command-console.md) | 검토한 대안·선택 이유·선택의 결과 |
 
 [공통 2D 콘솔 셸](docs/decisions/0002-shared-console-shell.md) · [데스크톱과 메뉴 막대](docs/decisions/0003-desktop-menu-bar.md)

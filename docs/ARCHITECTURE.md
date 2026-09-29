@@ -206,4 +206,4 @@ import는 별도의 `ExternalReplay`를 생성한다. 이 객체는 `external_re
 
 심의 엔진은 대화·근거·역할·제안·표결 계약을 소유하고 MAGI 이름·도형·음원·연출은 presentation package가 소유한다. 역할 preset은 버전 있는 데이터이며 실행 코드·셸·외부 MCP URL을 포함하지 않는다. import한 preset도 스키마와 권한 검사를 거친다.
 
-재사용 가능한 합의 과정은 [재사용 인계](REUSE.md)의 중립 계약으로 설명한다. 이 앱의 저장소·콘솔을 상업 프로젝트에 숨은 런타임 의존성으로 연결하지 않는다. 제품 구조의 선택은 [기본 설계 결정](decisions/0001-command-console.md), macOS 호스트와 메뉴 막대의 선택은 [데스크톱 설계 결정](decisions/0003-desktop-menu-bar.md)에 둔다.
+제품 구조의 선택은 [기본 설계 결정](decisions/0001-command-console.md), macOS 호스트와 메뉴 막대의 선택은 [데스크톱 설계 결정](decisions/0003-desktop-menu-bar.md)에 둔다.
