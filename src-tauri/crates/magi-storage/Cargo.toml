@@ -1,0 +1,17 @@
+[package]
+name = "magi-storage"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[dependencies]
+fs2 = "0.4"
+magi-context = { path = "../magi-context" }
+magi-domain = { path = "../magi-domain" }
+rusqlite = "0.32"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }

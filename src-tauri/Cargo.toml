@@ -1,0 +1,36 @@
+[workspace]
+members = [
+  ".",
+  "crates/magi-context",
+  "crates/magi-domain",
+  "crates/magi-provider",
+  "crates/magi-storage",
+]
+resolver = "2"
+
+[package]
+name = "magi-console"
+version = "0.1.0"
+description = "Local MAGI command console for macOS"
+edition = "2024"
+rust-version = "1.90"
+
+[lib]
+name = "magi_console_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+cap-std = "=3.4.6"
+libc = "0.2"
+magi-context = { path = "crates/magi-context" }
+magi-domain = { path = "crates/magi-domain" }
+magi-provider = { path = "crates/magi-provider" }
+magi-storage = { path = "crates/magi-storage" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-dialog = "2"
+uuid = { version = "1", features = ["v4"] }

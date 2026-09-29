@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "companion-capability",
+  "description": "Menu bar companion receives only core window and event permissions.",
+  "windows": ["companion"],
+  "permissions": ["core:default"]
+}

@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>MAGI COMMAND CONSOLE</title>
+    <link rel="stylesheet" href="tokens.css" />
+    <link rel="stylesheet" href="styles.css" />
+    <link rel="stylesheet" href="setup.css" />
+    <link rel="stylesheet" href="records.css" />
+    <script src="ui-kit.js" defer></script>
+    <script src="runtime.js" defer></script>
+    <script src="setup.js" defer></script>
+    <script src="records.js" defer></script>
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <aside class="review-toolbar" aria-label="화면 설계 검토 도구">
+      <p><strong>macOS 전체 화면 설계</strong> · 고정 자료의 상호작용 검토본입니다. 모델 호출·파일 접근·네이티브 작업은 실행하지 않습니다. 한국어가 전체 디자인 기준이며 영어 선택은 공통 메뉴와 설정의 언어 미리보기에 적용됩니다.</p>
+      <div class="atlas-controls"><label>화면 <select id="atlas-screen"></select></label><label>상태 <select id="atlas-variant"></select></label><label>대화상자 <select id="atlas-overlay"><option value="">선택</option><option value="core">코어 의견</option><option value="source">원문</option><option value="issue">쟁점</option><option value="cancel">취소 확인</option><option value="quit">종료 확인</option><option value="command">명령 찾기</option><option value="discard">미저장 편집</option><option value="delete">기록 삭제</option><option value="revoke">권한 철회</option><option value="overwrite">덮어쓰기</option></select></label><button id="atlas-reopen" type="button" hidden>콘솔 다시 열기</button><span id="atlas-status" role="status"></span></div>
+    </aside>
+    <div class="console-shell" id="console-shell">
+      <header class="console-header" id="console-header" data-component="ConsoleHeader">
+        <div class="native-control-safe-area" aria-hidden="true"></div>
+        <h1 class="console-title"><span class="title-full">MAGI COMMAND CONSOLE</span><span class="title-compact">MAGI CONSOLE</span></h1>
+        <nav class="header-actions" aria-label="콘솔 설정">
+          <button type="button" data-action="history">기록</button>
+          <button type="button" data-action="settings">설정</button>
+          <button type="button" data-action="sound" aria-pressed="false">소리 끔</button>
+          <button type="button" data-action="motion" aria-pressed="false">동작 줄임</button>
+        </nav>
+      </header>
+      <section class="agenda" id="agenda" data-component="Agenda" aria-label="현재 안건">
+        <div class="section-marker"><span>안건</span><small>AGENDA</small></div>
+        <div class="question-slot">
+          <label class="sr-only" for="question-input">심의할 질문</label>
+          <textarea id="question-input" rows="2" spellcheck="false">새 기능을 제한 공개할까요?</textarea>
+        </div>
+        <div class="agenda-actions">
+          <button type="button" class="source-count" data-action="sources"><span aria-hidden="true">▤</span> <span id="source-count-label">자료 3개</span></button>
+          <button type="button" class="button button-primary" id="agenda-action" data-action="confirm">입력 확인 <span aria-hidden="true">↗</span></button>
+        </div>
+      </section>
+      <main id="screen-content" tabindex="-1"></main>
+      <footer class="console-footer" id="console-footer" data-component="ConsoleFooter">
+        <span class="footer-system">MAGI SYSTEM <span aria-hidden="true">///</span></span>
+        <span class="footer-line" aria-hidden="true"></span>
+        <span id="footer-save">로컬 보존</span><span id="footer-stage">안건 입력</span>
+        <button type="button" class="connection-state" data-action="connections"><span aria-hidden="true">○</span> 연결 미확인</button>
+      </footer>
+    </div>
+    <aside class="toast" id="toast" hidden><span id="toast-text"></span><button type="button" data-action="dismiss-toast" aria-label="알림 닫기">닫기</button></aside>
+    <p id="announcement" class="sr-only" role="status" aria-live="polite"></p>
+    <dialog id="console-dialog" aria-labelledby="dialog-title">
+      <div class="dialog-header"><span class="dialog-kicker">MAGI / CONTROL</span><button type="button" class="dialog-close" data-action="close-dialog" aria-label="닫기">✕</button></div>
+      <h2 id="dialog-title"></h2>
+      <div id="dialog-content"></div>
+      <div class="dialog-actions" id="dialog-actions"></div>
+    </dialog>
+  </body>
+</html>

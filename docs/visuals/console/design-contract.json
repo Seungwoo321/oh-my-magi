@@ -1,0 +1,392 @@
+{
+  "schemaVersion": 1,
+  "scope": "macos-desktop-ui-design",
+  "entry": "index.html",
+  "mainMinimum": {
+    "width": 1024,
+    "height": 720
+  },
+  "referenceViewport": {
+    "width": 1440,
+    "height": 960
+  },
+  "companionViewport": {
+    "width": 440,
+    "height": 560
+  },
+  "surfaces": [
+    {
+      "id": "input",
+      "profile": "desktop",
+      "variants": [
+        "default",
+        "empty",
+        "no-sources",
+        "followup",
+        "queued"
+      ]
+    },
+    {
+      "id": "independent",
+      "profile": "desktop",
+      "variants": [
+        "default",
+        "preparing"
+      ]
+    },
+    {
+      "id": "review",
+      "profile": "desktop",
+      "variants": [
+        "default"
+      ]
+    },
+    {
+      "id": "proposal",
+      "profile": "desktop",
+      "variants": [
+        "default"
+      ]
+    },
+    {
+      "id": "sealed",
+      "profile": "desktop",
+      "variants": [
+        "default"
+      ]
+    },
+    {
+      "id": "verdict",
+      "profile": "desktop",
+      "variants": [
+        "default",
+        "unanimous",
+        "rejected",
+        "unresolved",
+        "abstention"
+      ]
+    },
+    {
+      "id": "evidence",
+      "profile": "desktop",
+      "variants": [
+        "default",
+        "changed",
+        "missing",
+        "unavailable"
+      ]
+    },
+    {
+      "id": "paused",
+      "profile": "desktop",
+      "variants": [
+        "auth",
+        "quota",
+        "needs-input",
+        "validation"
+      ]
+    },
+    {
+      "id": "interrupted",
+      "profile": "desktop",
+      "variants": [
+        "default",
+        "checking",
+        "timeout"
+      ]
+    },
+    {
+      "id": "cancelling",
+      "profile": "desktop",
+      "variants": [
+        "default",
+        "remote-unknown"
+      ]
+    },
+    {
+      "id": "cancelled",
+      "profile": "desktop",
+      "variants": [
+        "default"
+      ]
+    },
+    {
+      "id": "failed",
+      "profile": "desktop",
+      "variants": [
+        "default",
+        "schema"
+      ]
+    },
+    {
+      "id": "save-error",
+      "profile": "desktop",
+      "variants": [
+        "default",
+        "corrupt"
+      ]
+    },
+    {
+      "id": "connections",
+      "profile": "desktop",
+      "variants": [
+        "default",
+        "empty",
+        "checking",
+        "auth",
+        "quota",
+        "unsupported",
+        "missing",
+        "policy"
+      ]
+    },
+    {
+      "id": "provider",
+      "profile": "desktop",
+      "variants": [
+        "default",
+        "api",
+        "invalid"
+      ]
+    },
+    {
+      "id": "intake",
+      "profile": "desktop",
+      "variants": [
+        "default",
+        "empty",
+        "scanning",
+        "permission",
+        "excluded",
+        "changed",
+        "paste"
+      ]
+    },
+    {
+      "id": "confirmation",
+      "profile": "desktop",
+      "variants": [
+        "default",
+        "blocked",
+        "changed",
+        "oversize"
+      ]
+    },
+    {
+      "id": "roles",
+      "profile": "desktop",
+      "variants": [
+        "default",
+        "invalid",
+        "unsaved",
+        "import"
+      ]
+    },
+    {
+      "id": "settings",
+      "profile": "desktop",
+      "variants": [
+        "default",
+        "clear",
+        "reduced",
+        "budget"
+      ]
+    },
+    {
+      "id": "history",
+      "profile": "desktop",
+      "variants": [
+        "default",
+        "empty",
+        "loading",
+        "no-results",
+        "error",
+        "branches"
+      ]
+    },
+    {
+      "id": "replay",
+      "profile": "desktop",
+      "variants": [
+        "default",
+        "example",
+        "external",
+        "paused",
+        "complete"
+      ]
+    },
+    {
+      "id": "share",
+      "profile": "desktop",
+      "variants": [
+        "default",
+        "redacted",
+        "sensitive",
+        "saving",
+        "saved",
+        "error",
+        "overwrite",
+        "archive"
+      ]
+    },
+    {
+      "id": "import",
+      "profile": "desktop",
+      "variants": [
+        "default",
+        "checking",
+        "invalid"
+      ]
+    },
+    {
+      "id": "data",
+      "profile": "desktop",
+      "variants": [
+        "default",
+        "revoked",
+        "delete",
+        "backup",
+        "restore",
+        "restore-error"
+      ]
+    },
+    {
+      "id": "maintenance",
+      "profile": "desktop",
+      "variants": [
+        "default",
+        "available",
+        "downloading",
+        "blocked",
+        "invalid",
+        "migrating",
+        "migration-error",
+        "diagnostics",
+        "about"
+      ]
+    },
+    {
+      "id": "companion",
+      "profile": "companion",
+      "variants": [
+        "default",
+        "empty",
+        "sealed",
+        "majority",
+        "unanimous",
+        "rejected",
+        "unresolved",
+        "paused",
+        "offline",
+        "record",
+        "deleted",
+        "multiple",
+        "display"
+      ]
+    }
+  ],
+  "journeys": [
+    {
+      "id": "connect",
+      "routes": [
+        "input",
+        "connections",
+        "provider",
+        "connections",
+        "roles",
+        "confirmation"
+      ]
+    },
+    {
+      "id": "sources",
+      "routes": [
+        "input",
+        "intake",
+        "confirmation",
+        "independent"
+      ]
+    },
+    {
+      "id": "deliberate",
+      "routes": [
+        "independent",
+        "review",
+        "proposal",
+        "sealed",
+        "verdict",
+        "evidence"
+      ]
+    },
+    {
+      "id": "followup",
+      "routes": [
+        "verdict",
+        "evidence",
+        "input",
+        "intake",
+        "confirmation"
+      ]
+    },
+    {
+      "id": "recover",
+      "routes": [
+        "paused",
+        "connections",
+        "interrupted",
+        "independent",
+        "save-error",
+        "data"
+      ]
+    },
+    {
+      "id": "records",
+      "routes": [
+        "history",
+        "replay",
+        "share",
+        "import",
+        "replay"
+      ]
+    },
+    {
+      "id": "data-and-release",
+      "routes": [
+        "data",
+        "maintenance",
+        "history"
+      ]
+    },
+    {
+      "id": "companion",
+      "routes": [
+        "companion",
+        "verdict",
+        "companion",
+        "cancelling",
+        "cancelled"
+      ]
+    }
+  ],
+  "overlays": [
+    "core",
+    "source",
+    "issue",
+    "cancel",
+    "quit",
+    "command",
+    "discard",
+    "delete",
+    "revoke",
+    "overwrite"
+  ],
+  "invariants": [
+    "one-common-main-header",
+    "one-core-topology",
+    "sealed-ballots-have-no-direction",
+    "outcomes-preserve-dissent-and-abstention",
+    "navigation-preserves-drafts",
+    "no-network-or-native-effects-in-review",
+    "native-boundaries-are-explicit",
+    "ui-has-no-project-brand-duplication"
+  ]
+}
