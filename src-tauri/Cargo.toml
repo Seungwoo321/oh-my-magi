@@ -49,6 +49,7 @@ magi-context = { path = "crates/magi-context" }
 magi-domain = { path = "crates/magi-domain" }
 magi-provider = { path = "crates/magi-provider" }
 magi-storage = { path = "crates/magi-storage" }
+rusqlite = { version = "=0.32.1", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2", features = ["tray-icon"] }

@@ -19,6 +19,33 @@ const UNAVAILABLE: &str = "The verified native extraction helper is unavailable.
 static CONFIGURED: OnceLock<Arc<NativeHelperAuthority>> = OnceLock::new();
 static CONFIGURATION_LOCK: Mutex<()> = Mutex::new(());
 
+#[cfg(test)]
+struct CompletionGate {
+    ready: std::sync::mpsc::Sender<VerificationRequest>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+#[cfg(test)]
+static COMPLETION_GATE: Mutex<Option<CompletionGate>> = Mutex::new(None);
+#[cfg(test)]
+static FENCE_NOTIFICATION: Mutex<Option<std::sync::mpsc::Sender<()>>> = Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn observe_next_operation_fence(ready: std::sync::mpsc::Sender<()>) {
+    let mut notification = FENCE_NOTIFICATION.lock().unwrap();
+    assert!(notification.is_none());
+    *notification = Some(ready);
+}
+
+#[cfg(test)]
+pub(crate) fn hold_next_completion(
+    ready: std::sync::mpsc::Sender<VerificationRequest>,
+    release: std::sync::mpsc::Receiver<()>,
+) {
+    let mut gate = COMPLETION_GATE.lock().unwrap();
+    assert!(gate.is_none());
+    *gate = Some(CompletionGate { ready, release });
+}
+
 struct HelperState {
     closed: bool,
     next_operation: u64,
@@ -112,6 +139,15 @@ impl ExtractionOperationLease for NativeHelperOperation {
     fn finish(mut self: Box<Self>, proof: ExtractionCompletionProof) -> Result<(), String> {
         if !proof.matches(&self.invocation) {
             return Err(UNAVAILABLE.into());
+        }
+        #[cfg(test)]
+        if let Some(gate) = COMPLETION_GATE.lock().map_err(|_| UNAVAILABLE)?.take() {
+            gate.ready
+                .send(self.request.clone())
+                .map_err(|_| UNAVAILABLE)?;
+            gate.release
+                .recv_timeout(Duration::from_secs(10))
+                .map_err(|_| UNAVAILABLE)?;
         }
         drop(self.activity.take());
         self.request.revoke();
@@ -354,12 +390,67 @@ pub(crate) fn verify_cold_resource(
     }))
 }
 
+pub(crate) fn fence_operation_roots() -> Result<Vec<VerificationRequest>, String> {
+    let helper = CONFIGURED.get().ok_or(UNAVAILABLE)?;
+    let roots = {
+        let mut state = helper.state.lock().map_err(|_| UNAVAILABLE)?;
+        state.closed = true;
+        state.operations.values().cloned().collect::<Vec<_>>()
+    };
+    for root in &roots {
+        root.revoke();
+    }
+    #[cfg(test)]
+    if let Some(ready) = FENCE_NOTIFICATION.lock().map_err(|_| UNAVAILABLE)?.take() {
+        let _ = ready.send(());
+    }
+    Ok(roots)
+}
+
 pub(crate) fn assert_unconfigured() -> Result<(), String> {
     let _configuration = CONFIGURATION_LOCK.try_lock().map_err(|_| UNAVAILABLE)?;
     if CONFIGURED.get().is_some() {
         return Err(UNAVAILABLE.into());
     }
     Ok(())
+}
+
+pub(crate) fn assert_unconfigured_until(
+    deadline: Instant,
+) -> Result<(), magi_provider::ProviderError> {
+    loop {
+        match CONFIGURATION_LOCK.try_lock() {
+            Ok(_configuration) => {
+                return if CONFIGURED.get().is_none() {
+                    Ok(())
+                } else {
+                    Err(magi_provider::ProviderError::ArtifactVerification)
+                };
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(magi_provider::ProviderError::ArtifactVerification);
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    return Err(magi_provider::ProviderError::Timeout);
+                }
+                std::thread::sleep(
+                    Duration::from_millis(1)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn hold_configuration_for_test(
+    ready: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+) {
+    let _configuration = CONFIGURATION_LOCK.lock().unwrap();
+    ready.send(()).unwrap();
+    release.recv_timeout(Duration::from_secs(5)).unwrap();
 }
 
 pub(crate) fn attach_installed_resource(

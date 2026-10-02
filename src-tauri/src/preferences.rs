@@ -3,16 +3,15 @@ use serde::{Deserialize, Serialize};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::{
     fs::{self, OpenOptions},
-    io::{Read, Write},
+    io::Read,
     path::PathBuf,
     sync::Mutex,
 };
-use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
+use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 
-use crate::commands::DesktopState;
+#[path = "preferences_authority.rs"]
+mod authority;
 
-const SCHEMA_VERSION: u8 = 2;
-const LEGACY_SCHEMA_VERSION: u8 = 1;
 const MAX_PREFERENCES_BYTES: u64 = 4 * 1024;
 static PREFERENCES_LOCK: Mutex<()> = Mutex::new(());
 
@@ -68,42 +67,143 @@ fn default_ui_language() -> UiLanguage {
     UiLanguage::Ko
 }
 
-#[derive(Serialize, Deserialize)]
+pub use authority::{SettingsCommand, SettingsReceipt, SettingsSnapshot};
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct StoredPreferences {
+pub struct ReadPreferencesInput {
+    defaults: ConsolePreferences,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationState {
+    Delivered,
+    Pending,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NotificationResult {
+    state: NotificationState,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CommittedPreferences {
     schema_version: u8,
-    preferences: ConsolePreferences,
+    receipt: SettingsReceipt,
+    notification: NotificationResult,
 }
 
 #[tauri::command]
 pub fn get_console_preferences(
     window: WebviewWindow,
     app: AppHandle,
-) -> Result<Option<ConsolePreferences>, String> {
+    input: ReadPreferencesInput,
+) -> Result<SettingsSnapshot, String> {
     ensure_console_window(&window)?;
     let _guard = PREFERENCES_LOCK
         .lock()
         .map_err(|_| "Console preferences are temporarily unavailable.")?;
-    read_preferences(&app)
+    let directory = state_directory(&app)?;
+    let (mut connection, snapshot) = activate(&directory, input.defaults)?;
+    let _ = deliver_events(&mut connection, |event| {
+        app.emit("magi:preferences-changed", event).is_ok()
+    });
+    Ok(snapshot)
 }
 
 #[tauri::command]
 pub fn save_console_preferences(
     window: WebviewWindow,
     app: AppHandle,
-    state: State<'_, DesktopState>,
-    preferences: ConsolePreferences,
-) -> Result<(), String> {
+    input: SettingsCommand,
+) -> Result<CommittedPreferences, String> {
     ensure_console_window(&window)?;
-    if !state.is_storage_ready() {
-        return Err("Local storage is unavailable; preferences were not saved.".into());
-    }
     let _guard = PREFERENCES_LOCK
         .lock()
         .map_err(|_| "Console preferences are temporarily unavailable.")?;
-    write_preferences(&app, preferences)?;
-    app.emit("magi:preferences-changed", preferences)
-        .map_err(|_| "Saved preferences could not be broadcast.".into())
+    let directory = state_directory(&app)?;
+    commit_at(
+        &directory,
+        &input,
+        &crate::profiles::now_rfc3339(),
+        |event| app.emit("magi:preferences-changed", event).is_ok(),
+    )
+}
+
+fn activate(
+    directory: &std::path::Path,
+    defaults: ConsolePreferences,
+) -> Result<(rusqlite::Connection, SettingsSnapshot), String> {
+    let mut connection = open_authority(directory)?;
+    let version: u32 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|_| settings_error())?;
+    let legacy = if version == 0 {
+        read_legacy(directory)?
+    } else {
+        None
+    };
+    authority::initialize_with_defaults(&mut connection, legacy.as_deref(), defaults)
+        .map_err(map_error)?;
+    let snapshot = authority::load(&connection).map_err(map_error)?;
+    Ok((connection, snapshot))
+}
+
+fn commit_at(
+    directory: &std::path::Path,
+    input: &SettingsCommand,
+    at: &str,
+    emit: impl FnMut(&authority::SettingsEvent) -> bool,
+) -> Result<CommittedPreferences, String> {
+    let mut connection = open_authority(directory)?;
+    let current = authority::load(&connection).map_err(map_error)?;
+    authority::initialize_with_defaults(&mut connection, None, current.preferences)
+        .map_err(map_error)?;
+    let receipt = authority::apply(&mut connection, input, at).map_err(map_error)?;
+    let state = deliver_events(&mut connection, emit);
+    Ok(CommittedPreferences {
+        schema_version: 1,
+        receipt,
+        notification: NotificationResult { state },
+    })
+}
+
+fn settings_error() -> String {
+    "Console preference authority is unavailable or invalid.".into()
+}
+fn map_error(error: authority::SettingsError) -> String {
+    match error {
+        authority::SettingsError::Conflict => {
+            "Console preference field revision conflict; input was retained.".into()
+        }
+        authority::SettingsError::IdempotencyConflict => {
+            "Console preference command identity conflict.".into()
+        }
+        _ => settings_error(),
+    }
+}
+
+fn deliver_events(
+    connection: &mut rusqlite::Connection,
+    mut emit: impl FnMut(&authority::SettingsEvent) -> bool,
+) -> NotificationState {
+    let page = match authority::pending_events(connection, 100) {
+        Ok(page) => page,
+        Err(_) => return NotificationState::Pending,
+    };
+    for event in page.events {
+        if !emit(&event) || authority::acknowledge_event(connection, &event).is_err() {
+            return NotificationState::Pending;
+        }
+    }
+    if page.has_more {
+        NotificationState::Pending
+    } else {
+        NotificationState::Delivered
+    }
 }
 
 fn ensure_console_window(window: &WebviewWindow) -> Result<(), String> {
@@ -114,120 +214,257 @@ fn ensure_console_window(window: &WebviewWindow) -> Result<(), String> {
     }
 }
 
-fn read_preferences(app: &AppHandle) -> Result<Option<ConsolePreferences>, String> {
-    let directory = state_directory(app)?;
-    let path = directory.join("console-preferences.json");
-    let metadata = match fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err("Console preferences could not be inspected.".into()),
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err("Console preferences are not a regular local file.".into());
+fn inspect_private_file(path: &std::path::Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if metadata.uid() != unsafe { libc::geteuid() } || metadata.nlink() != 1 {
+                    return Err(settings_error());
+                }
+            }
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(settings_error());
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(settings_error()),
     }
-    if metadata.len() > MAX_PREFERENCES_BYTES {
-        return Err("Console preferences exceed the supported size.".into());
-    }
+}
 
+fn open_authority(directory: &std::path::Path) -> Result<rusqlite::Connection, String> {
+    inspect_directory_chain(directory)?;
+    let metadata = fs::symlink_metadata(directory).map_err(|_| settings_error())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(settings_error());
+        }
+    }
+    for name in [
+        "console-preferences.sqlite",
+        "console-preferences.sqlite-wal",
+        "console-preferences.sqlite-shm",
+    ] {
+        inspect_private_file(&directory.join(name))?;
+    }
+    let path = directory.join("console-preferences.sqlite");
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW).mode(0o600);
+    let pinned = options.open(&path).map_err(|_| settings_error())?;
+    let connection = rusqlite::Connection::open_with_flags(
+        &path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(|_| settings_error())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let before = pinned.metadata().map_err(|_| settings_error())?;
+        let after = fs::symlink_metadata(&path).map_err(|_| settings_error())?;
+        if (before.dev(), before.ino()) != (after.dev(), after.ino()) {
+            return Err(settings_error());
+        }
+    }
+    connection
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|_| settings_error())?;
+    Ok(connection)
+}
+
+fn read_legacy(directory: &std::path::Path) -> Result<Option<Vec<u8>>, String> {
+    let path = directory.join("console-preferences.json");
+    inspect_private_file(&path)?;
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(settings_error()),
+    };
+    if metadata.len() > MAX_PREFERENCES_BYTES {
+        return Err(settings_error());
+    }
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
     options.custom_flags(libc::O_NOFOLLOW);
-    let file = options
-        .open(&path)
-        .map_err(|_| "Console preferences could not be read safely.")?;
-    let opened_metadata = file
-        .metadata()
-        .map_err(|_| "Console preferences could not be inspected.")?;
-    if !opened_metadata.is_file() || opened_metadata.len() > MAX_PREFERENCES_BYTES {
-        return Err("Console preferences failed local validation.".into());
-    }
-    let mut bytes = Vec::with_capacity(opened_metadata.len() as usize);
+    let file = options.open(path).map_err(|_| settings_error())?;
+    let mut bytes = Vec::new();
     file.take(MAX_PREFERENCES_BYTES + 1)
         .read_to_end(&mut bytes)
-        .map_err(|_| "Console preferences could not be read.")?;
+        .map_err(|_| settings_error())?;
     if bytes.len() as u64 > MAX_PREFERENCES_BYTES {
-        return Err("Console preferences exceed the supported size.".into());
+        return Err(settings_error());
     }
-    let stored: StoredPreferences = serde_json::from_slice(&bytes)
-        .map_err(|_| "Console preferences are invalid and were not changed.")?;
-    if ![LEGACY_SCHEMA_VERSION, SCHEMA_VERSION].contains(&stored.schema_version) {
-        return Err("Console preferences use an unsupported version.".into());
-    }
-    stored.preferences.validate()?;
-    Ok(Some(stored.preferences))
+    Ok(Some(bytes))
 }
 
-fn write_preferences(app: &AppHandle, preferences: ConsolePreferences) -> Result<(), String> {
-    preferences.validate()?;
-    let directory = state_directory(app)?;
-    let destination = directory.join("console-preferences.json");
-    match fs::symlink_metadata(&destination) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-            return Err("Console preferences are not a regular local file.".into());
+fn inspect_directory_chain(path: &std::path::Path) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err(settings_error());
+    }
+    let mut prefix = PathBuf::new();
+    for component in path.components() {
+        if matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::CurDir
+        ) {
+            return Err(settings_error());
         }
-        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-            return Err("Console preferences could not be inspected.".into());
+        prefix.push(component.as_os_str());
+        match fs::symlink_metadata(&prefix) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(settings_error());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(settings_error()),
         }
-        _ => {}
     }
-
-    let stored = StoredPreferences {
-        schema_version: SCHEMA_VERSION,
-        preferences,
-    };
-    let bytes =
-        serde_json::to_vec(&stored).map_err(|_| "Console preferences could not be encoded.")?;
-    if bytes.len() as u64 > MAX_PREFERENCES_BYTES {
-        return Err("Console preferences exceed the supported size.".into());
-    }
-    let temporary = directory.join(format!(".console-preferences-{}.tmp", uuid::Uuid::new_v4()));
-    let result = write_atomically(&directory, &temporary, &destination, &bytes);
-    if result.is_err() {
-        let _ = fs::remove_file(temporary);
-    }
-    result
-}
-
-fn write_atomically(
-    directory: &PathBuf,
-    temporary: &PathBuf,
-    destination: &PathBuf,
-    bytes: &[u8],
-) -> Result<(), String> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options
-        .open(temporary)
-        .map_err(|_| "Console preferences could not be staged safely.")?;
-    file.write_all(bytes)
-        .map_err(|_| "Console preferences could not be written.")?;
-    file.sync_all()
-        .map_err(|_| "Console preferences could not be synchronized.")?;
-    fs::rename(temporary, destination)
-        .map_err(|_| "Console preferences could not be committed atomically.")?;
-    fs::File::open(directory)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|_| "Console preference storage could not be synchronized.".into())
+    Ok(())
 }
 
 fn state_directory(app: &AppHandle) -> Result<PathBuf, String> {
-    let data_root = app
-        .path()
-        .app_data_dir()
-        .map_err(|_| "The application data location is unavailable.")?;
-    let directory = data_root.join("state");
-    fs::create_dir_all(&directory)
-        .map_err(|_| "Console preference storage could not be created.")?;
-    let metadata = fs::symlink_metadata(&directory)
-        .map_err(|_| "Console preference storage could not be inspected.")?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err("Console preference storage is not a regular local directory.".into());
+    let root = app.path().app_data_dir().map_err(|_| settings_error())?;
+    inspect_directory_chain(&root)?;
+    fs::create_dir_all(&root).map_err(|_| settings_error())?;
+    let directory = root.join("state");
+    inspect_directory_chain(&directory)?;
+    fs::create_dir_all(&directory).map_err(|_| settings_error())?;
+    for path in [&root, &directory] {
+        let metadata = fs::symlink_metadata(path).map_err(|_| settings_error())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.uid() != unsafe { libc::geteuid() } {
+                return Err(settings_error());
+            }
+        }
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(settings_error());
+        }
+        #[cfg(unix)]
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .map_err(|_| settings_error())?;
     }
-    #[cfg(unix)]
-    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
-        .map_err(|_| "Console preference storage permissions could not be secured.")?;
+    inspect_directory_chain(&directory)?;
     Ok(directory)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    struct OwnedDirectory(PathBuf);
+    impl OwnedDirectory {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("magi-preferences-{}", uuid::Uuid::new_v4()));
+            fs::create_dir(&path).unwrap();
+            Self(path.canonicalize().unwrap())
+        }
+    }
+    impl Drop for OwnedDirectory {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+    fn defaults() -> ConsolePreferences {
+        ConsolePreferences {
+            motion: MotionPreference::Reduced,
+            sound: false,
+            theme: ThemePreference::Command,
+            font_scale: 100,
+            language: UiLanguage::Ko,
+        }
+    }
+    fn command(id: &str, font: u16, revision: u64) -> SettingsCommand {
+        serde_json::from_value(serde_json::json!({"schemaVersion":1,"commandId":id,"idempotencyKey":format!("key-{id}"),"target":"console_preferences","patch":{"fontScale":font},"expectedFieldRevisions":{"fontScale":revision}})).unwrap()
+    }
+
+    #[test]
+    fn production_adapter_preserves_os_defaults_restart_and_committed_notification_failure() {
+        let root = OwnedDirectory::new();
+        let (connection, snapshot) = activate(&root.0, defaults()).unwrap();
+        assert_eq!(snapshot.preferences.motion, MotionPreference::Reduced);
+        drop(connection);
+        let input = command("font", 150, 0);
+        let first = commit_at(&root.0, &input, "time", |_| false).unwrap();
+        assert!(matches!(
+            first.notification.state,
+            NotificationState::Pending
+        ));
+        let mut full_defaults = defaults();
+        full_defaults.motion = MotionPreference::Full;
+        let (mut connection, restored) = activate(&root.0, full_defaults).unwrap();
+        assert_eq!(restored.preferences.motion, MotionPreference::Reduced);
+        assert_eq!(restored.preferences.font_scale, 150);
+        assert_eq!(
+            authority::pending_events(&mut connection, 100)
+                .unwrap()
+                .events
+                .len(),
+            1
+        );
+        drop(connection);
+        let replay = commit_at(&root.0, &input, "later", |_| true).unwrap();
+        assert_eq!(first.receipt, replay.receipt);
+        assert!(matches!(
+            replay.notification.state,
+            NotificationState::Delivered
+        ));
+    }
+
+    #[test]
+    fn production_adapter_imports_once_and_never_resets_corruption() {
+        let root = OwnedDirectory::new();
+        let legacy = root.0.join("console-preferences.json");
+        fs::write(&legacy, br#"{"schemaVersion":2,"preferences":{"motion":"off","sound":true,"theme":"clear","fontScale":125,"language":"ko"}}"#).unwrap();
+        let (connection, snapshot) = activate(&root.0, defaults()).unwrap();
+        assert_eq!(snapshot.preferences.motion, MotionPreference::Off);
+        drop(connection);
+        fs::write(&legacy, b"corrupt-after-one-time-import").unwrap();
+        let (connection, restored) = activate(&root.0, defaults()).unwrap();
+        assert_eq!(snapshot, restored);
+        connection
+            .execute("DELETE FROM settings_import", [])
+            .unwrap();
+        drop(connection);
+        assert!(activate(&root.0, defaults()).is_err());
+        let corrupt = OwnedDirectory::new();
+        fs::write(corrupt.0.join("console-preferences.json"), b"corrupt").unwrap();
+        assert!(activate(&corrupt.0, defaults()).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn production_adapter_rejects_symlink_database_sidecar_legacy_and_directory() {
+        use std::os::unix::fs::symlink;
+        let root = OwnedDirectory::new();
+        let other = OwnedDirectory::new();
+        let original = other.0.join("private");
+        fs::write(&original, b"unchanged").unwrap();
+        for leaf in [
+            "console-preferences.sqlite",
+            "console-preferences.sqlite-wal",
+            "console-preferences.sqlite-shm",
+            "console-preferences.json",
+        ] {
+            let link = root.0.join(leaf);
+            symlink(&original, &link).unwrap();
+            assert!(activate(&root.0, defaults()).is_err());
+            fs::remove_file(link).unwrap();
+            let db = root.0.join("console-preferences.sqlite");
+            if db.exists() {
+                fs::remove_file(db).unwrap();
+            }
+        }
+        let linked = root.0.join("linked");
+        symlink(&other.0, &linked).unwrap();
+        assert!(open_authority(&linked).is_err());
+        assert_eq!(fs::read(original).unwrap(), b"unchanged");
+    }
 }

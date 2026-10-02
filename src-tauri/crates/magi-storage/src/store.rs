@@ -119,7 +119,139 @@ pub struct StorageReader {
     objects_root: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConnectionProfileMetadata {
+    pub history: Vec<ProviderProfileRevision>,
+    pub selected_catalog: Option<ProviderCatalogSnapshot>,
+    pub latest_catalog: Option<ProviderCatalogSnapshot>,
+    pub model_selection: Option<crate::ProviderModelSelection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConnectionMetadataSnapshot {
+    pub schema_version: u8,
+    pub store_identity: StoreIdentity,
+    pub catalog_high_water: u64,
+    pub profiles: Vec<ConnectionProfileMetadata>,
+}
+
 impl StorageReader {
+    /// Reads profile and model metadata without importing authentication or core authority.
+    pub fn connection_metadata_snapshot(&self) -> Result<ConnectionMetadataSnapshot, StorageError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let store_identity = read_only_store_identity(&transaction)?;
+        if store_identity.schema_version < 10 {
+            return Err(StorageError::Integrity(
+                "connection metadata schema unsupported".into(),
+            ));
+        }
+        let mut statement = transaction.prepare(
+            "SELECT provider_profile_id,provider_id,revision FROM provider_profile_heads ORDER BY provider_profile_id LIMIT 4",
+        )?;
+        let heads = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        if heads.len() != 3 {
+            return Err(StorageError::Integrity(
+                "connection metadata requires exactly three profiles".into(),
+            ));
+        }
+        let mut profiles = Vec::with_capacity(3);
+        for (id, provider_id, head) in heads {
+            validate_draft_id(&id)?;
+            let head = u64::try_from(head)
+                .map_err(|_| StorageError::Corrupt("negative profile head".into()))?;
+            if head > 64 {
+                return Err(StorageError::Integrity(
+                    "connection metadata history capacity exceeded".into(),
+                ));
+            }
+            let mut statement = transaction.prepare(
+                "SELECT revision,digest,runtime_home_id,payload_json FROM provider_profile_revisions WHERE provider_profile_id=?1 ORDER BY revision LIMIT 66",
+            )?;
+            let rows = statement
+                .query_map([&id], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(statement);
+            if rows.len() as u64 != head + 1 {
+                return Err(StorageError::Corrupt(
+                    "connection metadata history is incomplete".into(),
+                ));
+            }
+            let mut history = Vec::with_capacity(rows.len());
+            for (expected, (revision, digest, home, payload)) in rows.into_iter().enumerate() {
+                if revision != expected as i64 {
+                    return Err(StorageError::Corrupt(
+                        "connection metadata history is not contiguous".into(),
+                    ));
+                }
+                let profile = decode_provider_profile(&id, revision, &digest, &home, &payload)?;
+                if profile.provider_id != provider_id
+                    || profile.authentication_method
+                        != magi_domain::ProviderAuthenticationMethod::LocalSubscription
+                    || profile.secret_reference.is_some()
+                {
+                    return Err(StorageError::Integrity(
+                        "connection metadata profile is not local subscription metadata".into(),
+                    ));
+                }
+                history.push(profile);
+            }
+            let model_selection = model_selection_row(&transaction, &id)?;
+            let selected_catalog = if let Some(selection) = &model_selection {
+                validate_model_selection(&transaction, selection)?;
+                Some(
+                    load_provider_catalog_snapshot_from(
+                        &transaction,
+                        &selection.binding.catalog_snapshot_id,
+                    )?
+                    .ok_or_else(|| {
+                        StorageError::Corrupt("selected metadata catalog missing".into())
+                    })?,
+                )
+            } else {
+                None
+            };
+            let latest_catalog = latest_selection_catalog(&transaction, &id, head)?;
+            profiles.push(ConnectionProfileMetadata {
+                history,
+                selected_catalog,
+                latest_catalog,
+                model_selection,
+            });
+        }
+        let catalog_high_water = transaction.query_row(
+            "SELECT COALESCE(MAX(rowid),0) FROM provider_catalog_snapshots",
+            [],
+            |row| row.get::<_, u64>(0),
+        )?;
+        let snapshot = ConnectionMetadataSnapshot {
+            schema_version: 1,
+            store_identity,
+            catalog_high_water,
+            profiles,
+        };
+        transaction.commit()?;
+        Ok(snapshot)
+    }
+
     pub fn load_admission_request_cancellation(
         &self,
         intent: &crate::AdmissionRequestIntent,
@@ -136,6 +268,177 @@ impl StorageReader {
         };
         transaction.commit()?;
         Ok(result)
+    }
+
+    pub fn connection_metadata_from_captured_snapshot(
+        bytes: &[u8],
+        expected_digest: &str,
+    ) -> Result<ConnectionMetadataSnapshot, StorageError> {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+        if bytes.is_empty()
+            || bytes.len() > 20 * 1024 * 1024
+            || Digest::from_bytes(bytes).as_str() != expected_digest
+        {
+            return Err(StorageError::Integrity(
+                "captured metadata snapshot pin invalid".to_owned(),
+            ));
+        }
+        struct SnapshotCleanup {
+            root: PathBuf,
+            dev: u64,
+            ino: u64,
+            leaf: Option<(u64, u64)>,
+        }
+        impl SnapshotCleanup {
+            fn finish(&mut self) -> Result<(), StorageError> {
+                let directory = fs::symlink_metadata(&self.root)?;
+                if !directory.is_dir() || directory.dev() != self.dev || directory.ino() != self.ino
+                {
+                    return Err(StorageError::Integrity(
+                        "snapshot cleanup custody changed".to_owned(),
+                    ));
+                }
+                let path = self.root.join("snapshot.sqlite");
+                let leaf = fs::symlink_metadata(&path)?;
+                if !leaf.is_file() || Some((leaf.dev(), leaf.ino())) != self.leaf {
+                    return Err(StorageError::Integrity(
+                        "snapshot cleanup leaf changed".to_owned(),
+                    ));
+                }
+                fs::set_permissions(&self.root, fs::Permissions::from_mode(0o700))?;
+                fs::remove_file(path)?;
+                self.leaf = None;
+                fs::remove_dir(&self.root)?;
+                Ok(())
+            }
+        }
+        impl Drop for SnapshotCleanup {
+            fn drop(&mut self) {
+                if let Ok(metadata) = fs::symlink_metadata(&self.root)
+                    && metadata.is_dir()
+                    && metadata.dev() == self.dev
+                    && metadata.ino() == self.ino
+                {
+                    let _ = fs::set_permissions(&self.root, fs::Permissions::from_mode(0o700));
+                    let path = self.root.join("snapshot.sqlite");
+                    if let (Some(expected), Ok(leaf)) = (self.leaf, fs::symlink_metadata(&path))
+                        && leaf.is_file()
+                        && (leaf.dev(), leaf.ino()) == expected
+                    {
+                        let _ = fs::remove_file(path);
+                    }
+                    let _ = fs::remove_dir(&self.root);
+                }
+            }
+        }
+        let root = fs::canonicalize(std::env::temp_dir())?
+            .join(format!("magi-captured-metadata-{}", Uuid::new_v4()));
+        fs::create_dir(&root)?;
+        let identity = fs::symlink_metadata(&root)?;
+        let mut cleanup = SnapshotCleanup {
+            root: root.clone(),
+            dev: identity.dev(),
+            ino: identity.ino(),
+            leaf: None,
+        };
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+        let path = root.join("snapshot.sqlite");
+        let mut writer = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)?;
+        let leaf = writer.metadata()?;
+        cleanup.leaf = Some((leaf.dev(), leaf.ino()));
+        writer.write_all(bytes)?;
+        writer.sync_all()?;
+        writer.set_permissions(fs::Permissions::from_mode(0o400))?;
+        drop(writer);
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o500))?;
+        let held = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)?;
+        let sealed = held.metadata()?;
+        if !sealed.is_file()
+            || sealed.mode() & 0o777 != 0o400
+            || sealed.uid() != unsafe { libc::geteuid() }
+            || sealed.nlink() != 1
+            || sealed.len() != bytes.len() as u64
+        {
+            return Err(StorageError::Integrity(
+                "sealed metadata snapshot invalid".to_owned(),
+            ));
+        }
+        let check = || -> Result<(), StorageError> {
+            let directory = fs::symlink_metadata(&root)?;
+            let current = fs::symlink_metadata(&path)?;
+            let opened = held.metadata()?;
+            let same = |value: &fs::Metadata| {
+                value.is_file()
+                    && value.dev() == sealed.dev()
+                    && value.ino() == sealed.ino()
+                    && value.mode() == sealed.mode()
+                    && value.uid() == sealed.uid()
+                    && value.nlink() == 1
+                    && value.len() == sealed.len()
+                    && value.mtime() == sealed.mtime()
+                    && value.mtime_nsec() == sealed.mtime_nsec()
+                    && value.ctime() == sealed.ctime()
+                    && value.ctime_nsec() == sealed.ctime_nsec()
+            };
+            if !directory.is_dir()
+                || directory.dev() != cleanup.dev
+                || directory.ino() != cleanup.ino
+                || directory.mode() & 0o777 != 0o500
+                || directory.uid() != sealed.uid()
+                || !same(&current)
+                || !same(&opened)
+                || (sealed.dev(), sealed.ino()) != cleanup.leaf.unwrap()
+            {
+                return Err(StorageError::Integrity(
+                    "captured metadata custody changed".to_owned(),
+                ));
+            }
+            Ok(())
+        };
+        check()?;
+        let encoded = path
+            .as_os_str()
+            .as_encoded_bytes()
+            .iter()
+            .map(|byte| format!("%{byte:02X}"))
+            .collect::<String>();
+        let connection = Connection::open_with_flags(
+            format!("file:{encoded}?mode=ro&immutable=1"),
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_URI
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        read_only_store_identity(&connection)?;
+        let reader = Self {
+            connection: Mutex::new(connection),
+            objects_root: root.join("objects"),
+        };
+        let projection = reader.connection_metadata_snapshot();
+        drop(reader);
+        check()?;
+        let mut actual = Vec::new();
+        held.try_clone()?
+            .take(20 * 1024 * 1024 + 1)
+            .read_to_end(&mut actual)?;
+        if actual != bytes
+            || root.join("snapshot.sqlite-wal").exists()
+            || root.join("snapshot.sqlite-shm").exists()
+        {
+            return Err(StorageError::Integrity(
+                "captured metadata snapshot changed".to_owned(),
+            ));
+        }
+        drop(held);
+        cleanup.finish()?;
+        projection
     }
 
     pub fn open_read_only(data_root: impl AsRef<Path>) -> Result<Self, StorageError> {
@@ -11770,6 +12073,98 @@ mod saved_model_selection_tests {
         }
     }
 
+    fn metadata_reader_fixture() -> (PathBuf, Storage) {
+        let root = std::env::temp_dir().join(format!("magi-metadata-reader-{}", Uuid::new_v4()));
+        let storage = Storage::open_or_create(&root).unwrap();
+        for index in 0..3 {
+            let input = profile(&format!("metadata-{index}"));
+            let first = storage
+                .save_provider_profile(&input, None, "2026-10-01T00:00:00Z")
+                .unwrap();
+            let current = storage
+                .save_provider_profile(&input, Some(first.revision), "2026-10-01T00:00:01Z")
+                .unwrap();
+            let observed = catalog(&format!("metadata-catalog-{index}"), &current, "model");
+            storage.save_provider_catalog_snapshot(&observed).unwrap();
+            storage
+                .select_provider_model(&model_input(&observed, "model", None))
+                .unwrap();
+        }
+        (root, storage)
+    }
+
+    #[test]
+    fn connection_metadata_reader_preserves_database_and_consistent_history() {
+        use std::os::unix::fs::MetadataExt;
+        let (root, storage) = metadata_reader_fixture();
+        let database = root.join("state/magi.sqlite");
+        let wal = root.join("state/magi.sqlite-wal");
+        let before = (
+            fs::read(&database).unwrap(),
+            fs::read(&wal).unwrap(),
+            fs::metadata(&database).unwrap().ino(),
+        );
+        let reader = StorageReader::open_read_only(&root).unwrap();
+        let projection = reader.connection_metadata_snapshot().unwrap();
+        assert_eq!(projection.store_identity, *storage.identity());
+        assert_eq!(projection.profiles.len(), 3);
+        assert_eq!(projection.catalog_high_water, 3);
+        for item in &projection.profiles {
+            assert_eq!(
+                item.history
+                    .iter()
+                    .map(|profile| profile.revision)
+                    .collect::<Vec<_>>(),
+                vec![0, 1]
+            );
+            let selection = item.model_selection.as_ref().unwrap();
+            assert_eq!(selection.binding.profile_revision, 1);
+            assert_eq!(
+                item.selected_catalog.as_ref().unwrap().catalog_snapshot_id,
+                selection.binding.catalog_snapshot_id
+            );
+            assert_eq!(item.selected_catalog, item.latest_catalog);
+        }
+        assert_eq!(projection, reader.connection_metadata_snapshot().unwrap());
+        assert_eq!(
+            before,
+            (
+                fs::read(&database).unwrap(),
+                fs::read(&wal).unwrap(),
+                fs::metadata(&database).unwrap().ino()
+            )
+        );
+        drop(reader);
+        drop(storage);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn connection_metadata_reader_rejects_missing_history_and_stale_selection() {
+        let (root, storage) = metadata_reader_fixture();
+        let reader = StorageReader::open_read_only(&root).unwrap();
+        {
+            let connection = storage.connection().unwrap();
+            let trigger: String = connection.query_row("SELECT sql FROM sqlite_master WHERE name='provider_profile_revisions_no_delete'", [], |row| row.get(0)).unwrap();
+            connection.execute_batch("DROP TRIGGER provider_profile_revisions_no_delete; DELETE FROM provider_profile_revisions WHERE provider_profile_id='metadata-0' AND revision=0;").unwrap();
+            connection.execute_batch(&trigger).unwrap();
+        }
+        assert!(reader.connection_metadata_snapshot().is_err());
+        drop(reader);
+        drop(storage);
+        fs::remove_dir_all(root).unwrap();
+
+        let (root, storage) = metadata_reader_fixture();
+        let reader = StorageReader::open_read_only(&root).unwrap();
+        storage
+            .save_provider_profile(&profile("metadata-0"), Some(1), "2026-10-01T00:00:02Z")
+            .unwrap();
+        assert!(reader.connection_metadata_snapshot().is_err());
+        drop(reader);
+        drop(storage);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn equivalent_catalog_observations_preserve_three_saved_authorities() {
         let root = std::env::temp_dir().join(format!("magi-catalog-witness-{}", Uuid::new_v4()));
@@ -16945,11 +17340,14 @@ mod saved_model_selection_tests {
         let source = root.join("state/fifteen-source.sqlite");
         fs::rename(&database, &source).unwrap();
         let old = Connection::open(&database).unwrap();
+        old.pragma_update(None, "foreign_keys", true).unwrap();
         old.execute_batch("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY CHECK(version>0),checksum TEXT NOT NULL,applied_at TEXT NOT NULL);").unwrap();
         for version in 1..=15 {
             old.execute_batch(migration_sql(version).unwrap()).unwrap();
         }
         old.execute("ATTACH DATABASE ?1 AS prior", [source.to_str().unwrap()])
+            .unwrap();
+        old.execute_batch("BEGIN IMMEDIATE; PRAGMA defer_foreign_keys=ON;")
             .unwrap();
         let tables: Vec<String> = old.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name<>'schema_migrations' ORDER BY rowid").unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
         for table in tables {
@@ -16971,7 +17369,15 @@ mod saved_model_selection_tests {
             ))
             .unwrap();
         }
-        old.execute_batch("INSERT INTO schema_migrations SELECT * FROM prior.schema_migrations WHERE version<=15; PRAGMA user_version=15; UPDATE store_meta SET value='15' WHERE key='schema_version'; DETACH DATABASE prior;").unwrap();
+        old.execute_batch("INSERT INTO schema_migrations SELECT * FROM prior.schema_migrations WHERE version<=15; PRAGMA user_version=15; UPDATE store_meta SET value='15' WHERE key='schema_version';").unwrap();
+        assert_eq!(
+            old.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, u64>(0)
+            })
+            .unwrap(),
+            0
+        );
+        old.execute_batch("COMMIT; DETACH DATABASE prior;").unwrap();
         assert_eq!(
             old.query_row(
                 "SELECT count(*) FROM sqlite_master WHERE name='clarification_drafts'",
@@ -17828,6 +18234,7 @@ mod saved_model_selection_tests {
         let source = root.join("state/fixture-source.sqlite");
         fs::rename(&database, &source).unwrap();
         let twelve = Connection::open(&database).unwrap();
+        twelve.pragma_update(None, "foreign_keys", true).unwrap();
         twelve.execute_batch("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY CHECK(version>0),checksum TEXT NOT NULL,applied_at TEXT NOT NULL);").unwrap();
         for version in 1..=14 {
             twelve
@@ -17836,6 +18243,9 @@ mod saved_model_selection_tests {
         }
         twelve
             .execute("ATTACH DATABASE ?1 AS prior", [source.to_str().unwrap()])
+            .unwrap();
+        twelve
+            .execute_batch("BEGIN IMMEDIATE; PRAGMA defer_foreign_keys=ON;")
             .unwrap();
         let tables:Vec<String>=twelve.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name<>'schema_migrations' ORDER BY rowid").unwrap().query_map([],|row|row.get(0)).unwrap().map(Result::unwrap).collect();
         for table in tables {
@@ -17858,7 +18268,18 @@ mod saved_model_selection_tests {
                 ))
                 .unwrap();
         }
-        twelve.execute_batch("INSERT INTO schema_migrations SELECT * FROM prior.schema_migrations WHERE version<=14; PRAGMA user_version=14; UPDATE store_meta SET value='14' WHERE key='schema_version'; DETACH DATABASE prior;").unwrap();
+        twelve.execute_batch("INSERT INTO schema_migrations SELECT * FROM prior.schema_migrations WHERE version<=14; PRAGMA user_version=14; UPDATE store_meta SET value='14' WHERE key='schema_version';").unwrap();
+        assert_eq!(
+            twelve
+                .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get::<_, u64>(0)
+                })
+                .unwrap(),
+            0
+        );
+        twelve
+            .execute_batch("COMMIT; DETACH DATABASE prior;")
+            .unwrap();
         let receipt: String = twelve
             .query_row(
                 "SELECT receipt_json FROM live_run_receipts WHERE run_id='run-core'",

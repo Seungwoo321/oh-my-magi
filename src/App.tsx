@@ -53,6 +53,10 @@ import {
   getConsolePreferences,
   saveConsolePreferences,
   type ConsolePreferences,
+  type PreferenceField,
+  type SettingsSnapshot,
+  type SettingsCommand,
+  type SettingsReceipt,
   type ConsoleSnapshot,
   type ActiveRolePresetSelection,
   type ContextSelectionSummary,
@@ -381,6 +385,10 @@ export default function App() {
   const preferenceReadGeneration = useRef(0);
   const reloadPreferences = useRef<(() => Promise<void>) | null>(null);
   const preferenceSaveQueue = useRef<Promise<void>>(Promise.resolve());
+  const preferenceAuthority = useRef<SettingsSnapshot | null>(null);
+  const preferenceEditGenerations = useRef<Record<PreferenceField, number>>({ motion: 0, sound: 0, theme: 0, fontScale: 0, language: 0 });
+  type PreferenceOperation = { promise: Promise<SettingsReceipt>; retry: () => Promise<SettingsReceipt>; state: "pending" | "committed" | "conflict" | "unresolved" };
+  const preferencePredecessors = useRef<Partial<Record<PreferenceField, PreferenceOperation>>>({});
   const profileSavePending = useRef(false);
   const providerSelectionRevision = useRef<number | null>(null);
   const activeProviderAuthentication = useRef<{ profileId: string; profileRevision: number } | null>(null);
@@ -1578,19 +1586,63 @@ export default function App() {
     }
   }, [announce]);
 
-  const queuePreferenceSave = useCallback((preferences: ConsolePreferences) => {
-    preferenceSaveQueue.current = preferenceSaveQueue.current
-      .catch(() => undefined)
-      .then(async () => {
-        await saveConsolePreferences(preferences);
-        for (const field of changedPreferenceFields.current) {
-          if (preferencesRef.current[field] === preferences[field]) changedPreferenceFields.current.delete(field);
+  const displayPreferences = useCallback((snapshot: SettingsSnapshot) => {
+    if (preferenceAuthority.current && snapshot.revision < preferenceAuthority.current.revision) return;
+    preferenceAuthority.current = snapshot;
+    const resolved = { ...snapshot.preferences };
+    for (const field of changedPreferenceFields.current) Object.assign(resolved, { [field]: preferencesRef.current[field] });
+    preferencesRef.current = resolved;
+    setMotion(resolved.motion); setSound(resolved.sound); setTheme(resolved.theme); setFontScale(resolved.fontScale);
+  }, []);
+
+  const queuePreferenceSave = useCallback((preferences: ConsolePreferences, onlyField?: PreferenceField) => {
+    const baseline = preferenceAuthority.current;
+    if (!baseline) return;
+    const fields = onlyField ? [onlyField] : [...changedPreferenceFields.current];
+    if (!fields.length) return;
+    const patch: Partial<ConsolePreferences> = {};
+    const generations = { ...preferenceEditGenerations.current };
+    const dependencies = fields.map(field => ({ field, revision: baseline.fieldRevisions[field], predecessor: preferencePredecessors.current[field] }));
+    for (const field of fields) Object.assign(patch, { [field]: preferences[field] });
+    let issued: SettingsCommand | null = null;
+    let operation: PreferenceOperation;
+    const commit = async (): Promise<SettingsReceipt> => {
+      if (!issued) {
+        const expectedFieldRevisions: SettingsCommand["expectedFieldRevisions"] = {};
+        for (const dependency of dependencies) {
+          let expected = dependency.revision;
+          if (dependency.predecessor && dependency.predecessor.state !== "conflict") {
+            const previous = dependency.predecessor.state === "unresolved" ? await dependency.predecessor.retry() : await dependency.predecessor.promise;
+            expected = previous.snapshot.fieldRevisions[dependency.field];
+          }
+          if ((preferenceAuthority.current?.fieldRevisions[dependency.field] ?? -1) > expected) throw new Error("Console preference field revision conflict.");
+          expectedFieldRevisions[dependency.field] = expected;
         }
-        preferenceReadGeneration.current++;
-        await reloadPreferences.current?.();
-      })
-      .catch(() => announce("콘솔 설정을 저장하지 못했습니다. 현재 화면의 선택은 유지됩니다."));
-  }, [announce]);
+        issued = { schemaVersion: 1, commandId: crypto.randomUUID(), idempotencyKey: crypto.randomUUID(), target: "console_preferences", patch, expectedFieldRevisions };
+      }
+      let result;
+      try { result = await saveConsolePreferences(issued); }
+      catch (error) {
+        if (String(error).includes("revision conflict") || String(error).includes("identity conflict")) throw error;
+        result = await saveConsolePreferences(issued);
+      }
+      operation.state = "committed";
+      for (const field of fields) if (preferenceEditGenerations.current[field] === generations[field]) changedPreferenceFields.current.delete(field);
+      displayPreferences(result.receipt.snapshot);
+      if (result.notification.state === "pending") announce("설정은 저장했습니다. 다른 창의 알림 전달은 대기 중입니다.");
+      return result.receipt;
+    };
+    const retry = async () => {
+      try { return await commit(); }
+      catch (error) { operation.state = String(error).includes("conflict") ? "conflict" : "unresolved"; throw error; }
+    };
+    operation = { state: "pending", retry, promise: preferenceSaveQueue.current.catch(() => undefined).then(retry) };
+    for (const field of fields) preferencePredecessors.current[field] = operation;
+    preferenceSaveQueue.current = operation.promise.then(() => undefined).catch(async () => {
+      announce("콘솔 설정을 저장하지 못했습니다. 입력은 유지했습니다. 충돌한 설정은 다시 확인해 주세요.");
+      await reloadPreferences.current?.();
+    });
+  }, [announce, displayPreferences]);
 
   useEffect(() => {
     let disposed = false;
@@ -1599,83 +1651,50 @@ export default function App() {
       const generation = ++preferenceReadGeneration.current;
       const initial = !preferencesReady.current;
       try {
-        const saved = await getConsolePreferences();
-        if (saved !== null && (!saved || !["full", "reduced", "off"].includes(saved.motion)
-          || typeof saved.sound !== "boolean" || !["command", "clear"].includes(saved.theme)
-          || ![100, 125, 150, 200].includes(saved.fontScale) || !["ko", "en"].includes(saved.language))) {
-          throw new Error("Invalid console preferences.");
-        }
-        if (disposed || generation !== preferenceReadGeneration.current) return;
-        const current = preferencesRef.current;
-        const resolved: ConsolePreferences = { ...preferenceDefaults, ...saved };
-        if (resolved.language !== "ko") changedPreferenceFields.current.add("language");
-        resolved.language = "ko";
-        if (changedPreferenceFields.current.has("motion")) resolved.motion = current.motion;
-        if (changedPreferenceFields.current.has("sound")) resolved.sound = current.sound;
-        if (changedPreferenceFields.current.has("theme")) resolved.theme = current.theme;
-        if (changedPreferenceFields.current.has("fontScale")) resolved.fontScale = current.fontScale;
-        preferencesRef.current = resolved;
-        setMotion(resolved.motion);
-        setSound(resolved.sound);
-        setTheme(resolved.theme);
-        setFontScale(resolved.fontScale);
+        const snapshot = await getConsolePreferences(preferenceDefaults);
+        if (disposed || generation !== preferenceReadGeneration.current || snapshot === null) return;
+        displayPreferences(snapshot);
         preferencesReady.current = true;
-        if (initial && (changedPreferenceFields.current.size > 0 || saved?.language !== "ko")) queuePreferenceSave(resolved);
+        if (snapshot.preferences.language !== "ko") {
+          changedPreferenceFields.current.add("language"); preferenceEditGenerations.current.language++;
+          preferencesRef.current = { ...preferencesRef.current, language: "ko" };
+        }
+        if (initial && changedPreferenceFields.current.size > 0) queuePreferenceSave(preferencesRef.current);
       } catch {
         if (disposed || generation !== preferenceReadGeneration.current) return;
-        preferencesReady.current = true;
         announce("저장된 콘솔 설정을 읽지 못했습니다. 현재 화면의 선택은 유지됩니다.");
-        if (initial && changedPreferenceFields.current.size > 0) queuePreferenceSave(preferencesRef.current);
       }
     }
     reloadPreferences.current = reload;
     void (async () => {
-      try {
-        const stop = await listenShellEvent("magi:preferences-changed", () => { if (!disposed) void reload(); });
-        if (disposed) stop(); else unlisten = stop;
-      } catch { if (!disposed) announce("다른 창의 설정 변경을 확인하지 못했습니다."); }
+      try { const stop = await listenShellEvent("magi:preferences-changed", () => { if (!disposed) void reload(); }); if (disposed) stop(); else unlisten = stop; }
+      catch { if (!disposed) announce("다른 창의 설정 변경을 확인하지 못했습니다."); }
       if (!disposed) await reload();
     })();
-    return () => {
-      disposed = true;
-      preferenceReadGeneration.current++;
-      if (reloadPreferences.current === reload) reloadPreferences.current = null;
-      unlisten?.();
-    };
-  }, [announce, preferenceDefaults, queuePreferenceSave]);
+    return () => { disposed = true; preferenceReadGeneration.current++; if (reloadPreferences.current === reload) reloadPreferences.current = null; unlisten?.(); };
+  }, [announce, displayPreferences, preferenceDefaults, queuePreferenceSave]);
 
   const changeMotion = useCallback((value: MotionSetting) => {
-    changedPreferenceFields.current.add("motion");
-    const next = { ...preferencesRef.current, motion: value };
-    preferencesRef.current = next;
-    setMotion(value);
-    if (preferencesReady.current) queuePreferenceSave(next);
+    changedPreferenceFields.current.add("motion"); preferenceEditGenerations.current.motion++;
+    const next = { ...preferencesRef.current, motion: value }; preferencesRef.current = next; setMotion(value);
+    if (preferencesReady.current) queuePreferenceSave(next, "motion");
   }, [queuePreferenceSave]);
-
   const changeSound = useCallback((value: boolean) => {
     const wasEnabled = preferencesRef.current.sound;
-    changedPreferenceFields.current.add("sound");
-    const next = { ...preferencesRef.current, sound: value };
-    preferencesRef.current = next;
-    setSound(value);
+    changedPreferenceFields.current.add("sound"); preferenceEditGenerations.current.sound++;
+    const next = { ...preferencesRef.current, sound: value }; preferencesRef.current = next; setSound(value);
     if (value && !wasEnabled) playSoundPreview();
-    if (preferencesReady.current) queuePreferenceSave(next);
+    if (preferencesReady.current) queuePreferenceSave(next, "sound");
   }, [queuePreferenceSave]);
-
   const changeTheme = useCallback((value: ThemeSetting) => {
-    changedPreferenceFields.current.add("theme");
-    const next = { ...preferencesRef.current, theme: value };
-    preferencesRef.current = next;
-    setTheme(value);
-    if (preferencesReady.current) queuePreferenceSave(next);
+    changedPreferenceFields.current.add("theme"); preferenceEditGenerations.current.theme++;
+    const next = { ...preferencesRef.current, theme: value }; preferencesRef.current = next; setTheme(value);
+    if (preferencesReady.current) queuePreferenceSave(next, "theme");
   }, [queuePreferenceSave]);
-
   const changeFontScale = useCallback((value: ConsolePreferences["fontScale"]) => {
-    changedPreferenceFields.current.add("fontScale");
-    const next = { ...preferencesRef.current, fontScale: value };
-    preferencesRef.current = next;
-    setFontScale(value);
-    if (preferencesReady.current) queuePreferenceSave(next);
+    changedPreferenceFields.current.add("fontScale"); preferenceEditGenerations.current.fontScale++;
+    const next = { ...preferencesRef.current, fontScale: value }; preferencesRef.current = next; setFontScale(value);
+    if (preferencesReady.current) queuePreferenceSave(next, "fontScale");
   }, [queuePreferenceSave]);
 
   const confirmQuestion = () => {

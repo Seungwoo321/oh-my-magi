@@ -488,6 +488,26 @@ export type ConsolePreferences = {
   language: "ko" | "en";
 };
 
+export type PreferenceField = keyof ConsolePreferences;
+export type PreferenceRevisions = Record<PreferenceField, number>;
+export type SettingsSnapshot = { schemaVersion: 1; revision: number; preferences: ConsolePreferences; fieldRevisions: PreferenceRevisions };
+export type SettingsCommand = { schemaVersion: 1; commandId: string; idempotencyKey: string; target: "console_preferences"; patch: Partial<ConsolePreferences>; expectedFieldRevisions: Partial<PreferenceRevisions> };
+export type SettingsReceipt = { schemaVersion: 1; commandId: string; idempotencyKey: string; intentDigest: string; committedAt: string; snapshot: SettingsSnapshot };
+export type CommittedPreferences = { schemaVersion: 1; receipt: SettingsReceipt; notification: { state: "delivered" | "pending" } };
+const preferenceFields: PreferenceField[] = ["motion", "sound", "theme", "fontScale", "language"];
+function settingsObject(value: unknown, keys: string[]): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).sort().join() !== [...keys].sort().join()) throw new Error("Invalid settings response.");
+  return value as Record<string, unknown>;
+}
+function settingsRevision(value: unknown): value is number { return typeof value === "number" && Number.isSafeInteger(value) && value >= 0; }
+export function validateSettingsSnapshot(value: unknown): SettingsSnapshot {
+  const object = settingsObject(value, ["schemaVersion", "revision", "preferences", "fieldRevisions"]);
+  const preferences = settingsObject(object.preferences, preferenceFields);
+  const revisions = settingsObject(object.fieldRevisions, preferenceFields);
+  if (object.schemaVersion !== 1 || !settingsRevision(object.revision) || (typeof preferences.motion !== "string" || !["full", "reduced", "off"].includes(preferences.motion)) || typeof preferences.sound !== "boolean" || (typeof preferences.theme !== "string" || !["command", "clear"].includes(preferences.theme)) || ![100,125,150,200].includes(preferences.fontScale as number) || typeof preferences.fontScale !== "number" || (typeof preferences.language !== "string" || !["ko", "en"].includes(preferences.language)) || preferenceFields.some(field => !settingsRevision(revisions[field]) || (revisions[field] as number) > (object.revision as number))) throw new Error("Invalid settings response.");
+  return value as SettingsSnapshot;
+}
+
 export type ShellContext = {
   windowLabel: "main" | "companion";
   platform: string;
@@ -988,14 +1008,20 @@ export async function saveRolePreset(draft: RolePresetDraftInput): Promise<Store
   return invoke("save_role_preset", { draft });
 }
 
-export async function getConsolePreferences(): Promise<ConsolePreferences | null> {
+export async function getConsolePreferences(defaults: ConsolePreferences): Promise<SettingsSnapshot | null> {
   if (!isDesktopApp()) return null;
-  return invoke<ConsolePreferences | null>("get_console_preferences");
+  return validateSettingsSnapshot(await invoke("get_console_preferences", { input: { defaults } }));
 }
 
-export async function saveConsolePreferences(preferences: ConsolePreferences): Promise<void> {
-  if (!isDesktopApp()) return;
-  await invoke("save_console_preferences", { preferences });
+export async function saveConsolePreferences(input: SettingsCommand): Promise<CommittedPreferences> {
+  if (!isDesktopApp()) throw new Error("Settings authority requires the desktop app.");
+  const result = await invoke<unknown>("save_console_preferences", { input });
+  const reply = settingsObject(result, ["schemaVersion", "receipt", "notification"]);
+  const receipt = settingsObject(reply.receipt, ["schemaVersion", "commandId", "idempotencyKey", "intentDigest", "committedAt", "snapshot"]);
+  const notification = settingsObject(reply.notification, ["state"]);
+  const snapshot = validateSettingsSnapshot(receipt.snapshot);
+  if (reply.schemaVersion !== 1 || receipt.schemaVersion !== 1 || typeof receipt.commandId !== "string" || !receipt.commandId || receipt.idempotencyKey !== input.idempotencyKey || typeof receipt.intentDigest !== "string" || !/^[a-f0-9]{64}$/.test(receipt.intentDigest) || typeof receipt.committedAt !== "string" || !receipt.committedAt || (typeof notification.state !== "string" || !["delivered", "pending"].includes(notification.state)) || Object.keys(input.patch).some(key => { const field = key as PreferenceField; return snapshot.preferences[field] !== input.patch[field] || snapshot.fieldRevisions[field] !== (input.expectedFieldRevisions[field] ?? -1) + 1; })) throw new Error("Invalid committed settings response.");
+  return result as CommittedPreferences;
 }
 
 export async function listenConsoleSnapshotChanged(

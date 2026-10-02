@@ -1,4 +1,6 @@
 mod commands;
+#[path = "../native/connection-ui-fixture.rs"]
+mod connection_ui_fixture;
 mod pdf_capture;
 mod preferences;
 mod profiles;
@@ -21,6 +23,7 @@ enum ProbePurpose {
     CatalogDiagnostic,
     RecoveryCancel,
     PdfUi,
+    ConnectionsUi,
 }
 
 impl ProbePurpose {
@@ -29,6 +32,7 @@ impl ProbePurpose {
             None | Some("deliberation") => Ok(Self::Deliberation),
             Some("catalog-diagnostic") => Ok(Self::CatalogDiagnostic),
             Some("pdf-ui") => Ok(Self::PdfUi),
+            Some("connections-ui") => Ok(Self::ConnectionsUi),
             Some("recovery-cancel") => Ok(Self::RecoveryCancel),
             _ => Err("invalid native probe purpose"),
         }
@@ -38,12 +42,325 @@ impl ProbePurpose {
         match self {
             Self::Deliberation => 3,
             Self::CatalogDiagnostic => 1,
-            Self::PdfUi | Self::RecoveryCancel => 0,
+            Self::PdfUi | Self::RecoveryCancel | Self::ConnectionsUi => 0,
         }
     }
 
     fn permits_admission(self) -> bool {
         self == Self::Deliberation
+    }
+}
+
+const UI_DRAFT_QUESTION: &str = "Owned WebView draft preservation check";
+
+struct ConnectionsUiState {
+    enabled: bool,
+    nonce: String,
+    checkpoints: Mutex<Vec<serde_json::Value>>,
+    cores: Mutex<Option<serde_json::Value>>,
+    failed: AtomicU8,
+}
+impl Default for ConnectionsUiState {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            nonce: uuid::Uuid::new_v4().to_string(),
+            checkpoints: Mutex::new(Vec::new()),
+            cores: Mutex::new(None),
+            failed: AtomicU8::new(0),
+        }
+    }
+}
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConnectionUiRow {
+    profile_id: String,
+    revision: u64,
+    model_id: Option<String>,
+    mode_id: Option<String>,
+    checked_at: Option<String>,
+    label_matched: bool,
+}
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+enum ConnectionUiCheckpoint {
+    Rows {
+        rows: Vec<ConnectionUiRow>,
+    },
+    DraftReturn {
+        question_digest: String,
+        question_length: usize,
+        cores_preserved: bool,
+    },
+    Modal {
+        profile_id: String,
+        previous_revision: u64,
+        saved_revision: u64,
+        add_initial_empty: bool,
+        add_focused: bool,
+        add_focus_returned: bool,
+        edit_initial_matches: bool,
+        edit_focused: bool,
+        edit_cancelled: bool,
+        discard_continue_retained: bool,
+        discard_committed: bool,
+        save_error_retained: bool,
+        save_committed: bool,
+    },
+    Complete {},
+    Failed {},
+}
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConnectionUiReport {
+    schema_version: u32,
+    nonce: String,
+    pid: u32,
+    checkpoint: ConnectionUiCheckpoint,
+}
+impl ConnectionUiReport {
+    fn validates_authority(&self, enabled: bool, nonce: &str, pid: u32, window: &str) -> bool {
+        enabled
+            && window == "main"
+            && self.schema_version == 1
+            && self.pid == pid
+            && self.nonce == nonce
+    }
+}
+#[tauri::command]
+fn connections_ui_probe_report(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, commands::DesktopState>,
+    report: tauri::State<'_, ConnectionsUiState>,
+    input: ConnectionUiReport,
+) -> Result<(), &'static str> {
+    if !input.validates_authority(
+        report.enabled,
+        &report.nonce,
+        std::process::id(),
+        window.label(),
+    ) {
+        return Err("UI report authority mismatch");
+    }
+    let storage = state.storage().map_err(|_| "UI store unavailable")?;
+    let mut accepted = report
+        .checkpoints
+        .lock()
+        .map_err(|_| "UI state unavailable")?;
+    match &input.checkpoint {
+        ConnectionUiCheckpoint::Rows { rows } => {
+            if !accepted.is_empty() || rows.is_empty() || rows.len() > 100 {
+                return Err("UI row count invalid");
+            }
+            let profiles = storage
+                .list_provider_profiles(100)
+                .map_err(|_| "UI profile query")?;
+            let local = profiles
+                .iter()
+                .filter(|profile| {
+                    profile.authentication_method
+                        == magi_domain::ProviderAuthenticationMethod::LocalSubscription
+                })
+                .collect::<Vec<_>>();
+            if rows.len() != local.len() {
+                return Err("UI native profile count mismatch");
+            }
+            for (row, profile) in rows.iter().zip(local) {
+                if row.profile_id != profile.provider_profile_id
+                    || row.revision != profile.revision
+                    || row.checked_at.is_some()
+                    || !row.label_matched
+                {
+                    return Err("UI native profile mismatch");
+                }
+                let catalog = profiles::load_provider_catalog(
+                    window.clone(),
+                    state.clone(),
+                    row.profile_id.clone(),
+                    row.revision,
+                )
+                .map_err(|_| "UI native catalog query")?;
+                let value = serde_json::to_value(catalog).map_err(|_| "UI catalog encoding")?;
+                let binding = &value["modelSelection"]["binding"];
+                if row.model_id.as_deref() != binding["modelId"].as_str()
+                    || row.mode_id.as_deref() != binding["modeId"].as_str()
+                {
+                    return Err("UI saved model mismatch");
+                }
+            }
+            *report.cores.lock().map_err(|_| "UI core state")? = Some(
+                serde_json::to_value(
+                    profiles::load_core_model_selections(window.clone(), state.clone())
+                        .map_err(|_| "UI core query")?,
+                )
+                .map_err(|_| "UI core encoding")?,
+            );
+        }
+        ConnectionUiCheckpoint::DraftReturn {
+            question_digest,
+            question_length,
+            cores_preserved,
+        } => {
+            if accepted.len() != 1
+                || !cores_preserved
+                || *question_length != UI_DRAFT_QUESTION.len()
+                || question_digest
+                    != magi_domain::Digest::from_bytes(UI_DRAFT_QUESTION.as_bytes()).as_str()
+            {
+                return Err("UI draft proof mismatch");
+            }
+            let current = serde_json::to_value(
+                profiles::load_core_model_selections(window.clone(), state.clone())
+                    .map_err(|_| "UI core query")?,
+            )
+            .map_err(|_| "UI core encoding")?;
+            if report.cores.lock().map_err(|_| "UI core state")?.as_ref() != Some(&current) {
+                return Err("UI saved cores changed");
+            }
+        }
+        ConnectionUiCheckpoint::Modal {
+            profile_id,
+            previous_revision,
+            saved_revision,
+            add_initial_empty,
+            add_focused,
+            add_focus_returned,
+            edit_initial_matches,
+            edit_focused,
+            edit_cancelled,
+            discard_continue_retained,
+            discard_committed,
+            save_error_retained,
+            save_committed,
+        } => {
+            if accepted.len() != 2
+                || ![
+                    add_initial_empty,
+                    add_focused,
+                    add_focus_returned,
+                    edit_initial_matches,
+                    edit_focused,
+                    edit_cancelled,
+                    discard_continue_retained,
+                    discard_committed,
+                    save_error_retained,
+                    save_committed,
+                ]
+                .into_iter()
+                .all(|value| *value)
+                || previous_revision.checked_add(1) != Some(*saved_revision)
+            {
+                return Err("UI modal proof invalid");
+            }
+            let original = &accepted[0]["rows"][0];
+            if original["profileId"].as_str() != Some(profile_id.as_str())
+                || original["revision"].as_u64() != Some(*previous_revision)
+            {
+                return Err("UI modal original profile mismatch");
+            }
+            let profile = storage
+                .load_provider_profile(profile_id)
+                .map_err(|_| "UI saved profile query")?
+                .ok_or("UI saved profile missing")?;
+            if profile.revision != *saved_revision {
+                return Err("UI saved profile revision mismatch");
+            }
+        }
+        ConnectionUiCheckpoint::Complete {} => {
+            if accepted.len() != 3 {
+                return Err("UI checkpoints incomplete");
+            }
+        }
+        ConnectionUiCheckpoint::Failed {} => {
+            report.failed.store(1, Ordering::Release);
+            return Ok(());
+        }
+    }
+    accepted.push(serde_json::to_value(input.checkpoint).map_err(|_| "UI report encoding")?);
+    Ok(())
+}
+
+async fn connections_ui_probe(
+    app: &tauri::AppHandle,
+    window: &tauri::WebviewWindow,
+    root: &std::path::Path,
+    monitor: &ProbeMonitor,
+) -> Result<(), String> {
+    monitor.mark("connections_ui");
+    let state = app.state::<ConnectionsUiState>();
+    let remaining = Duration::from_secs(300).saturating_sub(monitor.started.elapsed());
+    let config = serde_json::json!({"nonce": state.nonce, "pid":std::process::id(), "remainingMs":remaining.as_millis(), "question":UI_DRAFT_QUESTION, "unavailableHome":root.join("unavailable-home")});
+    window
+        .eval(format!(
+            "window.__magiConnectionProbe={config};\n{}",
+            include_str!("../native/connection-ui-probe.js")
+        ))
+        .map_err(|_| "UI script initialization")?;
+    loop {
+        monitor
+            .lifecycle
+            .check()
+            .map_err(|_| "UI absolute deadline")?;
+        if state.failed.load(Ordering::Acquire) != 0 {
+            return Err("physical UI checkpoint failed".into());
+        }
+        let complete = state
+            .checkpoints
+            .lock()
+            .map_err(|_| "UI report state")?
+            .len()
+            == 4;
+        if complete {
+            let body = {
+                let checkpoints = state.checkpoints.lock().map_err(|_| "UI report state")?;
+                let store = app.state::<commands::DesktopState>().storage()?;
+                serde_json::to_vec_pretty(&serde_json::json!({"schemaVersion":1,"pid":std::process::id(),"window":"main","nonce":state.nonce,"store":store.identity(),"checkpoints":*checkpoints,"providerActions":false})).map_err(|_| "UI output encoding")?
+            };
+            let digest = magi_domain::Digest::from_bytes(&body);
+            std::fs::write(root.join("connections-ui-report.json"), &body)
+                .map_err(|_| "UI report output")?;
+            std::fs::write(root.join("connections-ui-ready.json"), serde_json::to_vec(&serde_json::json!({"pid":std::process::id(),"nonce":state.nonce,"reportDigest":digest})).map_err(|_| "UI checkpoint encoding")?).map_err(|_| "UI checkpoint output")?;
+            monitor.mark("connections_ui_checkpoint");
+            loop {
+                monitor
+                    .lifecycle
+                    .check()
+                    .map_err(|_| "UI checkpoint deadline")?;
+                let release = root.join("connections-ui-release.json");
+                if release.exists() {
+                    use std::io::Read;
+                    use std::os::unix::fs::OpenOptionsExt;
+                    let file = std::fs::OpenOptions::new()
+                        .read(true)
+                        .custom_flags(libc::O_NOFOLLOW)
+                        .open(release)
+                        .map_err(|_| "UI release unavailable")?;
+                    let metadata = file.metadata().map_err(|_| "UI release metadata")?;
+                    if !metadata.is_file() || metadata.len() > 4096 {
+                        return Err("UI release invalid".into());
+                    }
+                    let mut bytes = Vec::new();
+                    file.take(4097)
+                        .read_to_end(&mut bytes)
+                        .map_err(|_| "UI release read")?;
+                    let value: serde_json::Value =
+                        serde_json::from_slice(&bytes).map_err(|_| "UI release shape")?;
+                    if value
+                        != serde_json::json!({"pid":std::process::id(),"nonce":state.nonce,"reportDigest":digest})
+                    {
+                        return Err("UI release authority mismatch".into());
+                    }
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
 
@@ -410,7 +727,142 @@ fn valid_recovery_run(run: &str) -> bool {
     })
 }
 
+fn prepare_connections_ui_store() -> Result<(), &'static str> {
+    if std::env::var_os("MAGI_TEST_UI_SOURCE_ROOT").is_some() {
+        return Err("legacy source root input is ambiguous");
+    }
+    let source = PathBuf::from(
+        std::env::var_os("MAGI_TEST_UI_SOURCE_DATABASE")
+            .ok_or("explicit source database file required")?,
+    );
+    let destination = PathBuf::from(
+        std::env::var_os("MAGI_TEST_DATA_ROOT").ok_or("explicit destination required")?,
+    );
+    let expected = std::env::var("MAGI_TEST_UI_SOURCE_DIGEST")
+        .map_err(|_| "explicit source digest required")?;
+    prepare_connection_metadata(&source, &destination, &expected)
+}
+
+fn prepare_connection_metadata(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+    expected: &str,
+) -> Result<(), &'static str> {
+    use std::io::{Read, Seek, SeekFrom};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    if expected.len() != 64
+        || !expected.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || destination.exists()
+    {
+        return Err("source pin or fresh destination invalid");
+    }
+    let database = source;
+    let sidecar = |suffix: &str| {
+        let mut path = database.as_os_str().to_os_string();
+        path.push(suffix);
+        PathBuf::from(path)
+    };
+    if sidecar("-wal").exists() || sidecar("-shm").exists() {
+        return Err("closed coherent source snapshot required");
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(database)
+        .map_err(|_| "source database unavailable")?;
+    let before = file.metadata().map_err(|_| "source identity unavailable")?;
+    if !before.is_file()
+        || before.nlink() != 1
+        || before.uid() != unsafe { libc::geteuid() }
+        || before.len() > 20 * 1024 * 1024
+    {
+        return Err("bounded owned source required");
+    }
+    let mut bytes = Vec::new();
+    file.try_clone()
+        .map_err(|_| "source custody unavailable")?
+        .take(20 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "source read failed")?;
+    if magi_domain::Digest::from_bytes(&bytes).as_str() != expected {
+        return Err("source digest mismatch");
+    }
+    let metadata =
+        magi_storage::StorageReader::connection_metadata_from_captured_snapshot(&bytes, expected)
+            .map_err(|_| "read-only metadata snapshot failed")?;
+    if metadata.schema_version != 1 {
+        return Err("unsupported metadata projection");
+    }
+    let entries = metadata
+        .profiles
+        .iter()
+        .map(|profile| {
+            Ok((
+                profile.history.as_slice(),
+                profile
+                    .selected_catalog
+                    .as_ref()
+                    .ok_or("actual catalog required")?,
+                profile.latest_catalog.as_ref(),
+                profile
+                    .model_selection
+                    .as_ref()
+                    .ok_or("actual model selection required")?,
+            ))
+        })
+        .collect::<Result<Vec<_>, &'static str>>()?;
+    let after =
+        std::fs::symlink_metadata(database).map_err(|_| "source final identity unavailable")?;
+    let opened = file
+        .metadata()
+        .map_err(|_| "source held identity unavailable")?;
+    let same = |value: &std::fs::Metadata| {
+        value.dev() == before.dev()
+            && value.ino() == before.ino()
+            && value.mode() == before.mode()
+            && value.nlink() == before.nlink()
+            && value.len() == before.len()
+            && value.mtime() == before.mtime()
+            && value.mtime_nsec() == before.mtime_nsec()
+            && value.ctime() == before.ctime()
+            && value.ctime_nsec() == before.ctime_nsec()
+    };
+    if !same(&after) || !same(&opened) {
+        return Err("source database identity changed during metadata preparation");
+    }
+    if sidecar("-wal").exists() || sidecar("-shm").exists() {
+        return Err("read-only metadata query acquired SQLite sidecars");
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| "source final seek failed")?;
+    let mut actual = Vec::new();
+    (&mut file)
+        .take(20 * 1024 * 1024 + 1)
+        .read_to_end(&mut actual)
+        .map_err(|_| "source final held read failed")?;
+    if magi_domain::Digest::from_bytes(&actual).as_str() != expected {
+        return Err("source final digest mismatch");
+    }
+    let (summaries, mut destination_cleanup) = connection_ui_fixture::seed(destination, &entries)?;
+    destination_cleanup.validate()?;
+    let destination_digest =
+        magi_domain::Digest::from_bytes(&destination_cleanup.database_bytes()?);
+    let body=serde_json::to_vec_pretty(&serde_json::json!({"schemaVersion":1,"sourceStore":metadata.store_identity,"sourceDigest":expected,"sourceCatalogHighWater":metadata.catalog_high_water,"preparedStoreDigest":destination_digest,"profiles":summaries,"coreSelectionsImported":false,"authenticationImported":false,"credentialsCopied":false})).map_err(|_| "metadata output encoding")?;
+    destination_cleanup.write_provenance(&body)?;
+    destination_cleanup.commit()?;
+    Ok(())
+}
+
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--prepare-connections-ui-store") {
+        assert_eq!(
+            std::env::args().count(),
+            2,
+            "closed preparation arguments required"
+        );
+        prepare_connections_ui_store().expect("owned metadata fixture preparation failed");
+        return;
+    }
     let configured_purpose = match std::env::var("MAGI_TEST_PROBE_PURPOSE") {
         Ok(value) => Some(value),
         Err(std::env::VarError::NotPresent) => None,
@@ -446,21 +898,71 @@ fn main() {
             "valid explicit observed selection required"
         );
     }
-    let selected = if matches!(purpose, ProbePurpose::PdfUi | ProbePurpose::RecoveryCancel) {
+    let selected = if matches!(
+        purpose,
+        ProbePurpose::PdfUi | ProbePurpose::RecoveryCancel | ProbePurpose::ConnectionsUi
+    ) {
         String::new()
     } else {
         std::env::var("MAGI_TEST_CREDENTIAL_HOME").expect("explicit selected authority required")
     };
-    if purpose == ProbePurpose::RecoveryCancel {
+    if matches!(
+        purpose,
+        ProbePurpose::RecoveryCancel | ProbePurpose::ConnectionsUi
+    ) {
         assert!(
             root.is_dir() && root.join("state/magi.sqlite").is_file(),
-            "existing recovery store required"
+            "explicit existing owned store required"
         );
     } else {
         assert!(!root.exists(), "probe data root must be fresh");
         std::fs::create_dir_all(&root).expect("create disposable data root");
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
             .expect("private disposable data root");
+    }
+    if purpose == ProbePurpose::ConnectionsUi {
+        use std::io::Read;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let metadata = std::fs::symlink_metadata(&root).expect("UI root metadata");
+        assert!(
+            metadata.is_dir()
+                && metadata.mode() & 0o777 == 0o700
+                && metadata.uid() == unsafe { libc::geteuid() },
+            "private owned UI root required"
+        );
+        let expected = std::env::var("MAGI_TEST_UI_STORE_DIGEST")
+            .expect("explicit prepared UI store digest required");
+        assert!(
+            expected.len() == 64 && expected.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "valid UI store digest required"
+        );
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(root.join("state/magi.sqlite"))
+            .expect("prepared UI store");
+        let meta = file.metadata().expect("UI store metadata");
+        assert!(
+            meta.is_file()
+                && meta.nlink() == 1
+                && meta.uid() == unsafe { libc::geteuid() }
+                && meta.len() <= 20 * 1024 * 1024,
+            "bounded owned UI store required"
+        );
+        let mut bytes = Vec::new();
+        file.take(20 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .expect("UI store read");
+        assert_eq!(
+            magi_domain::Digest::from_bytes(&bytes).as_str(),
+            expected,
+            "prepared UI store authority mismatch"
+        );
+        assert!(
+            !root.join("state/magi.sqlite-wal").exists()
+                && !root.join("state/magi.sqlite-shm").exists(),
+            "coherent closed UI store required"
+        );
     }
     let root = root.canonicalize().expect("canonical disposable data root");
     let mut context = tauri::generate_context!();
@@ -498,6 +1000,7 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             pdf_ui_probe_report,
+            connections_ui_probe_report,
             crate::pdf_capture::prepare_pdf_range_capture,
             crate::pdf_capture::apply_pdf_range_capture,
             crate::pdf_capture::discard_pdf_range_capture,
@@ -558,12 +1061,39 @@ fn main() {
         .setup(move |app| {
             setup_monitor.mark("setup");
             app.manage(commands::ExitAuthorization::new());
-            app.manage(if purpose == ProbePurpose::RecoveryCancel {
-                commands::DesktopState::open_quiet(app.handle())
-            } else {
-                commands::DesktopState::open(app.handle())
-            });
+            app.manage(
+                if matches!(
+                    purpose,
+                    ProbePurpose::RecoveryCancel | ProbePurpose::ConnectionsUi
+                ) {
+                    commands::DesktopState::open_quiet(app.handle())
+                } else {
+                    commands::DesktopState::open(app.handle())
+                },
+            );
             app.manage(PdfUiProbeState::default());
+            app.manage(ConnectionsUiState {
+                enabled: purpose == ProbePurpose::ConnectionsUi,
+                ..ConnectionsUiState::default()
+            });
+            if purpose == ProbePurpose::ConnectionsUi {
+                let desktop = app.state::<commands::DesktopState>();
+                let storage = desktop.storage().map_err(std::io::Error::other)?;
+                for core in magi_domain::CoreId::ALL {
+                    if storage.load_core_model_selection(core)?.is_some() {
+                        return Err(std::io::Error::other(
+                            "UI-only store must not contain execution core selections",
+                        )
+                        .into());
+                    }
+                }
+                if storage.list_provider_profiles(100)?.is_empty() {
+                    return Err(std::io::Error::other(
+                        "UI-only store requires actual profile metadata",
+                    )
+                    .into());
+                }
+            }
             let handle = app.handle().clone();
             let selected = selected.clone();
             let root = root.clone();
@@ -709,6 +1239,9 @@ async fn probe(
     }
     if purpose == ProbePurpose::PdfUi {
         return pdf_ui_probe(app, &window, &root, monitor).await;
+    }
+    if purpose == ProbePurpose::ConnectionsUi {
+        return connections_ui_probe(app, &window, &root, monitor).await;
     }
     let mut core_bindings = Vec::new();
     let mut observed_selections = Vec::new();
@@ -1198,7 +1731,439 @@ async fn probe(
 
 #[cfg(test)]
 mod purpose_tests {
-    use super::{PdfUiReport, ProbePurpose, valid_recovery_run};
+    use super::{ConnectionUiReport, PdfUiReport, ProbePurpose, valid_recovery_run};
+
+    struct MetadataTestCleanup(Vec<(std::path::PathBuf, u64, u64)>);
+    impl MetadataTestCleanup {
+        fn track(&mut self, path: &std::path::Path) {
+            use std::os::unix::fs::MetadataExt;
+            if let Ok(metadata) = std::fs::symlink_metadata(path) {
+                assert!(metadata.is_dir() && metadata.uid() == unsafe { libc::geteuid() });
+                self.0
+                    .push((path.to_path_buf(), metadata.dev(), metadata.ino()));
+            }
+        }
+    }
+    impl Drop for MetadataTestCleanup {
+        fn drop(&mut self) {
+            use std::os::unix::fs::MetadataExt;
+            for (path, device, inode) in &self.0 {
+                if std::fs::symlink_metadata(path).is_ok_and(|metadata| {
+                    metadata.is_dir()
+                        && metadata.dev() == *device
+                        && metadata.ino() == *inode
+                        && metadata.uid() == unsafe { libc::geteuid() }
+                }) {
+                    let _ = std::fs::remove_dir_all(path);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn connections_metadata_preparation_preserves_source_and_excludes_execution_bindings() {
+        let (root, storage, aggregate, _) =
+            crate::profiles::catalog_selection_ipc_tests::publication_fault_fixture();
+        let run_id = aggregate.run().run_id.clone();
+        drop(storage);
+        let source = root.canonicalize().unwrap();
+        let destination =
+            source.with_file_name(format!("connection-metadata-{}", uuid::Uuid::new_v4()));
+        let mut cleanup = MetadataTestCleanup(Vec::new());
+        cleanup.track(&source);
+        let database = source.join("state/magi.sqlite");
+        let bytes = std::fs::read(&database).unwrap();
+        let digest = magi_domain::Digest::from_bytes(&bytes);
+        assert!(
+            super::prepare_connection_metadata(
+                &database,
+                &destination,
+                magi_domain::Digest::from_bytes(b"different source").as_str()
+            )
+            .is_err()
+        );
+        assert!(!destination.exists());
+        assert_eq!(std::fs::read(&database).unwrap(), bytes);
+        let result = super::prepare_connection_metadata(&database, &destination, digest.as_str());
+        cleanup.track(&destination);
+        if let Err(error) = result {
+            panic!("metadata preparation control failed: {error}");
+        }
+        assert_eq!(std::fs::read(&database).unwrap(), bytes);
+        let prepared_bytes = std::fs::read(destination.join("state/magi.sqlite")).unwrap();
+        assert!(
+            super::prepare_connection_metadata(&database, &destination, digest.as_str()).is_err()
+        );
+        assert_eq!(
+            std::fs::read(destination.join("state/magi.sqlite")).unwrap(),
+            prepared_bytes
+        );
+        assert!(!source.join("state/magi.sqlite-wal").exists());
+        assert!(!source.join("state/magi.sqlite-shm").exists());
+        let original = magi_storage::StorageReader::connection_metadata_from_captured_snapshot(
+            &bytes,
+            digest.as_str(),
+        )
+        .unwrap();
+        let target = magi_storage::Storage::open_or_create(&destination).unwrap();
+        assert_eq!(target.list_provider_profiles(100).unwrap().len(), 3);
+        for profile in &original.profiles {
+            let head = profile.history.last().unwrap();
+            assert_eq!(
+                target
+                    .load_provider_profile(&head.provider_profile_id)
+                    .unwrap()
+                    .as_ref(),
+                Some(head)
+            );
+            assert_eq!(
+                target
+                    .load_provider_model_selection(&head.provider_profile_id)
+                    .unwrap()
+                    .unwrap()
+                    .binding,
+                profile.model_selection.as_ref().unwrap().binding
+            );
+        }
+        for core in magi_domain::CoreId::ALL {
+            assert!(target.load_core_model_selection(core).unwrap().is_none());
+        }
+        assert!(target.load_run_aggregate(&run_id).is_err());
+        drop(target);
+        drop(cleanup);
+        assert!(!destination.exists() && !root.exists());
+    }
+
+    #[test]
+    fn connections_metadata_flat_backup_file_replays_and_sidecars_reject() {
+        let (root, storage, _, _) =
+            crate::profiles::catalog_selection_ipc_tests::publication_fault_fixture();
+        drop(storage);
+        let root = root.canonicalize().unwrap();
+        let mut cleanup = MetadataTestCleanup(Vec::new());
+        cleanup.track(&root);
+        let database = root.join("closed backup.sqlite");
+        let bytes = std::fs::read(root.join("state/magi.sqlite")).unwrap();
+        std::fs::write(&database, &bytes).unwrap();
+        let digest = magi_domain::Digest::from_bytes(&bytes);
+        let destination = root.join("prepared");
+        for suffix in ["-wal", "-shm"] {
+            let mut sidecar = database.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            let sidecar = std::path::PathBuf::from(sidecar);
+            std::fs::write(&sidecar, b"pending snapshot").unwrap();
+            assert_eq!(
+                super::prepare_connection_metadata(&database, &destination, digest.as_str()),
+                Err("closed coherent source snapshot required")
+            );
+            assert!(!destination.exists());
+            assert_eq!(std::fs::read(&database).unwrap(), bytes);
+            assert_eq!(std::fs::read(&sidecar).unwrap(), b"pending snapshot");
+            std::fs::remove_file(sidecar).unwrap();
+        }
+        super::prepare_connection_metadata(&database, &destination, digest.as_str()).unwrap();
+        assert_eq!(std::fs::read(&database).unwrap(), bytes);
+        let target = magi_storage::Storage::open_or_create(&destination).unwrap();
+        assert_eq!(target.list_provider_profiles(100).unwrap().len(), 3);
+        for core in magi_domain::CoreId::ALL {
+            assert!(target.load_core_model_selection(core).unwrap().is_none());
+        }
+        drop(target);
+    }
+
+    #[test]
+    fn connections_metadata_source_pin_and_existing_destination_fail_before_writes() {
+        let root = std::env::temp_dir().join(format!(
+            "connection-metadata-invalid-{}",
+            uuid::Uuid::new_v4()
+        ));
+        assert!(super::prepare_connection_metadata(&root, &root, "invalid").is_err());
+        assert!(!root.exists());
+        std::fs::create_dir(&root).unwrap();
+        assert!(super::prepare_connection_metadata(&root, &root, &"a".repeat(64)).is_err());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        std::fs::remove_dir(&root).unwrap();
+    }
+
+    #[test]
+    fn connections_metadata_captured_corrupt_and_pin_inputs_fail_closed() {
+        let corrupt = b"not a sqlite database";
+        assert!(
+            magi_storage::StorageReader::connection_metadata_from_captured_snapshot(
+                corrupt,
+                magi_domain::Digest::from_bytes(corrupt).as_str()
+            )
+            .is_err()
+        );
+        assert!(
+            magi_storage::StorageReader::connection_metadata_from_captured_snapshot(
+                corrupt,
+                magi_domain::Digest::from_bytes(b"wrong pin").as_str()
+            )
+            .is_err()
+        );
+        assert!(
+            magi_storage::StorageReader::connection_metadata_from_captured_snapshot(
+                &[],
+                magi_domain::Digest::from_bytes(&[]).as_str()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn connections_metadata_failed_model_replay_removes_only_owned_destination() {
+        let (root, storage, _, _) =
+            crate::profiles::catalog_selection_ipc_tests::publication_fault_fixture();
+        drop(storage);
+        let mut cleanup = MetadataTestCleanup(Vec::new());
+        cleanup.track(&root);
+        let bytes = std::fs::read(root.join("state/magi.sqlite")).unwrap();
+        let digest = magi_domain::Digest::from_bytes(&bytes);
+        let mut metadata = magi_storage::StorageReader::connection_metadata_from_captured_snapshot(
+            &bytes,
+            digest.as_str(),
+        )
+        .unwrap();
+        metadata.profiles[0]
+            .model_selection
+            .as_mut()
+            .unwrap()
+            .binding
+            .model_id = "not-in-captured-catalog".into();
+        let entries = metadata
+            .profiles
+            .iter()
+            .map(|profile| {
+                (
+                    profile.history.as_slice(),
+                    profile.selected_catalog.as_ref().unwrap(),
+                    profile.latest_catalog.as_ref(),
+                    profile.model_selection.as_ref().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let destination = root.with_file_name(format!(
+            "connection-metadata-rollback-{}",
+            uuid::Uuid::new_v4()
+        ));
+        assert_eq!(
+            super::connection_ui_fixture::seed(&destination, &entries)
+                .err()
+                .unwrap(),
+            "saved model metadata replay failed"
+        );
+        assert!(!destination.exists());
+        assert_eq!(
+            std::fs::read(root.join("state/magi.sqlite")).unwrap(),
+            bytes
+        );
+        let wal = root.join("state/magi.sqlite-wal");
+        std::fs::write(&wal, b"uncheckpointed-source-control").unwrap();
+        assert!(
+            super::prepare_connection_metadata(
+                &root.join("state/magi.sqlite"),
+                &destination,
+                digest.as_str()
+            )
+            .is_err()
+        );
+        assert!(!destination.exists());
+        assert_eq!(
+            std::fs::read(&wal).unwrap(),
+            b"uncheckpointed-source-control"
+        );
+        drop(entries);
+        let lawful_model = metadata.profiles[0]
+            .selected_catalog
+            .as_ref()
+            .unwrap()
+            .models[0]
+            .model_id
+            .clone();
+        metadata.profiles[0]
+            .model_selection
+            .as_mut()
+            .unwrap()
+            .binding
+            .model_id = lawful_model;
+        let entries = metadata
+            .profiles
+            .iter()
+            .map(|profile| {
+                (
+                    profile.history.as_slice(),
+                    profile.selected_catalog.as_ref().unwrap(),
+                    profile.latest_catalog.as_ref(),
+                    profile.model_selection.as_ref().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let (_, mut authority) = super::connection_ui_fixture::seed(&destination, &entries)
+            .unwrap_or_else(|error| panic!("lawful metadata seed failed: {error}"));
+        let displaced = destination.with_file_name(format!(
+            "connection-metadata-displaced-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::rename(&destination, &displaced).unwrap();
+        cleanup.track(&displaced);
+        std::fs::create_dir(&destination).unwrap();
+        cleanup.track(&destination);
+        std::fs::write(
+            destination.join("foreign-sentinel"),
+            b"preserve foreign replacement",
+        )
+        .unwrap();
+        assert!(authority.write_provenance(b"rejected").is_err());
+        assert!(authority.commit().is_err());
+        drop(authority);
+        assert_eq!(
+            std::fs::read(destination.join("foreign-sentinel")).unwrap(),
+            b"preserve foreign replacement"
+        );
+        assert!(
+            !destination
+                .join("connection-ui-metadata-provenance.json")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn connections_metadata_history_revision_64_replays_and_65_rejects() {
+        let (root, storage, _, _) =
+            crate::profiles::catalog_selection_ipc_tests::publication_fault_fixture();
+        let mut cleanup = MetadataTestCleanup(Vec::new());
+        cleanup.track(&root);
+        let id = "pause-profile-0";
+        let original = storage.load_provider_profile(id).unwrap().unwrap();
+        let mut input = magi_domain::ProviderProfileInput {
+            provider_profile_id: id.into(),
+            provider_id: original.provider_id.clone(),
+            display_name: original.display_name.clone(),
+            account_alias: original.account_alias.clone(),
+            authentication_method: original.authentication_method,
+            secret_reference: None,
+            runtime_home_id: original.runtime_home_id.clone(),
+            credential_home: original.credential_home.clone(),
+        };
+        let selection = storage.load_provider_model_selection(id).unwrap().unwrap();
+        let mut catalog = storage
+            .load_provider_catalog_snapshot(&selection.binding.catalog_snapshot_id)
+            .unwrap()
+            .unwrap();
+        for revision in 1..=64 {
+            input.display_name = format!("History boundary {revision}");
+            assert_eq!(
+                storage
+                    .save_provider_profile(&input, Some(revision - 1), "2026-10-02T00:00:00Z")
+                    .unwrap()
+                    .revision,
+                revision
+            );
+        }
+        catalog.catalog_snapshot_id = "history-boundary-catalog-64".into();
+        catalog.profile_revision = 64;
+        catalog.catalog_digest = catalog.calculate_digest().unwrap();
+        storage.save_provider_catalog_snapshot(&catalog).unwrap();
+        storage
+            .select_provider_model(&magi_storage::ProviderModelSelectionInput {
+                provider_profile_id: id.into(),
+                profile_revision: 64,
+                catalog_snapshot_id: catalog.catalog_snapshot_id.clone(),
+                catalog_digest: catalog.catalog_digest.clone(),
+                model_id: selection.binding.model_id,
+                mode_id: selection.binding.mode_id,
+                expected_selection_revision: Some(selection.selection_revision),
+                updated_at: selection.updated_at,
+            })
+            .unwrap();
+        drop(storage);
+        let bytes = std::fs::read(root.join("state/magi.sqlite")).unwrap();
+        let metadata = magi_storage::StorageReader::connection_metadata_from_captured_snapshot(
+            &bytes,
+            magi_domain::Digest::from_bytes(&bytes).as_str(),
+        )
+        .unwrap();
+        assert_eq!(
+            metadata
+                .profiles
+                .iter()
+                .find(|profile| profile.history[0].provider_profile_id == id)
+                .unwrap()
+                .history
+                .len(),
+            65
+        );
+        let destination = root.with_file_name(format!(
+            "connection-metadata-history-{}",
+            uuid::Uuid::new_v4()
+        ));
+        super::prepare_connection_metadata(
+            &root.join("state/magi.sqlite"),
+            &destination,
+            magi_domain::Digest::from_bytes(&bytes).as_str(),
+        )
+        .unwrap();
+        cleanup.track(&destination);
+        let imported = magi_storage::Storage::open_or_create(&destination).unwrap();
+        assert_eq!(
+            imported
+                .load_provider_profile(id)
+                .unwrap()
+                .unwrap()
+                .revision,
+            64
+        );
+        assert!(
+            imported
+                .load_provider_profile_revision(id, 0)
+                .unwrap()
+                .is_some()
+        );
+        drop(imported);
+        let storage = magi_storage::Storage::open_or_create(&root).unwrap();
+        input.display_name = "History boundary 65".into();
+        assert_eq!(
+            storage
+                .save_provider_profile(&input, Some(64), "2026-10-02T00:00:00Z")
+                .unwrap()
+                .revision,
+            65
+        );
+        drop(storage);
+        let bytes = std::fs::read(root.join("state/magi.sqlite")).unwrap();
+        let error = magi_storage::StorageReader::connection_metadata_from_captured_snapshot(
+            &bytes,
+            magi_domain::Digest::from_bytes(&bytes).as_str(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("history capacity exceeded"));
+    }
+
+    #[test]
+    fn connections_ui_reports_are_closed_and_bound_to_enabled_main_process() {
+        let value = serde_json::json!({"schemaVersion":1,"nonce":"bound","pid":7,"checkpoint":{"kind":"complete"}});
+        let report: ConnectionUiReport = serde_json::from_value(value.clone()).unwrap();
+        assert!(report.validates_authority(true, "bound", 7, "main"));
+        for (enabled, nonce, pid, window) in [
+            (false, "bound", 7, "main"),
+            (true, "other", 7, "main"),
+            (true, "bound", 8, "main"),
+            (true, "bound", 7, "companion"),
+        ] {
+            assert!(!report.validates_authority(enabled, nonce, pid, window));
+        }
+        for invalid in [
+            serde_json::json!({"schemaVersion":1,"nonce":"bound","pid":7,"checkpoint":{"kind":"complete","private":"canary"}}),
+            serde_json::json!({"schemaVersion":1,"nonce":"bound","pid":7,"checkpoint":{"kind":"unknown"}}),
+            serde_json::json!({"schemaVersion":1,"nonce":"bound","pid":7,"checkpoint":{"kind":"complete"},"private":"canary"}),
+        ] {
+            assert!(serde_json::from_value::<ConnectionUiReport>(invalid).is_err());
+        }
+        let purpose = ProbePurpose::parse(Some("connections-ui")).unwrap();
+        assert_eq!(purpose.profile_count(), 0);
+        assert!(!purpose.permits_admission());
+    }
 
     #[test]
     fn catalog_diagnostic_is_single_profile_and_cannot_admit_inference() {

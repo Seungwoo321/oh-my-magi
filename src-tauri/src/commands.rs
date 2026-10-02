@@ -274,6 +274,7 @@ impl NativeResourceCoordinator {
     fn cold_shutdown_with_prepare<T>(
         &self,
         operation: &NativeResourceOperation,
+        deadline: Instant,
         prepare: impl FnOnce() -> Result<T, magi_provider::ProviderError>,
     ) -> Result<(NativeResourceQuiescence, T), magi_provider::ProviderError> {
         let mut state = self
@@ -290,8 +291,7 @@ impl NativeResourceCoordinator {
         {
             return Err(magi_provider::ProviderError::ArtifactVerification);
         }
-        extraction_helper::assert_unconfigured()
-            .map_err(|_| magi_provider::ProviderError::ArtifactVerification)?;
+        extraction_helper::assert_unconfigured_until(deadline)?;
         let prepared = prepare()?;
         state.cold_initialization = false;
         Ok((
@@ -1598,7 +1598,7 @@ impl DesktopState {
             }
             let result = (|| {
                 let (mut permission, pending_runs) = if cold {
-                    coordinator.cold_shutdown_with_prepare(&operation, || {
+                    coordinator.cold_shutdown_with_prepare(&operation, deadline, || {
                         prepare_application_cancellation(storage, &controls)
                     })?
                 } else if storage.is_some() {
@@ -1750,17 +1750,44 @@ impl DesktopState {
             return Ok(permission);
         }
         let cleanup = permission.cleanup_operation()?;
+        let retained = self.application_shutdown.clone();
+        let frozen_epoch = permission.epoch;
         let helper_fence = async_runtime::spawn_blocking(move || {
             let _cleanup = cleanup;
-            magi_context::close_extraction_helper_authority()
+            let roots = extraction_helper::fence_operation_roots()
+                .map_err(|_| magi_provider::ProviderError::ArtifactVerification)?;
+            let captured = {
+                let mut state = retained
+                    .lock()
+                    .map_err(|_| magi_provider::ProviderError::Cancelled)?;
+                let ApplicationShutdownState::Frozen(prepared) = &mut *state else {
+                    return Err(magi_provider::ProviderError::Cancelled);
+                };
+                if prepared.permission.epoch != frozen_epoch {
+                    return Err(magi_provider::ProviderError::Cancelled);
+                }
+                for root in roots {
+                    if !prepared
+                        .permission
+                        .roots
+                        .iter()
+                        .any(|existing| existing.shares_authority(&root))
+                    {
+                        prepared.permission.roots.push(root);
+                    }
+                }
+                prepared.permission.clone()
+            };
+            // Active operations remain fenced by their retained roots until the
+            // context supervisor consumes actual completion proof.
+            let _close = magi_context::close_extraction_helper_authority();
+            Ok::<_, magi_provider::ProviderError>(captured)
         });
-        // Closing first revokes active helper work; an unresolved return is not
-        // cleanup proof and must be retried only after actual worker settlement.
-        let _fence_result =
+        permission =
             tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), helper_fence)
                 .await
                 .map_err(|_| magi_provider::ProviderError::Timeout)?
-                .map_err(|_| magi_provider::ProviderError::ArtifactVerification)?;
+                .map_err(|_| magi_provider::ProviderError::ArtifactVerification)??;
         loop {
             if permission.check_settlement().is_ok() {
                 break;
@@ -1865,10 +1892,6 @@ impl DesktopState {
                 .map(|diagnostic| format!("{} ({})", diagnostic.message, diagnostic.code))
                 .unwrap_or_else(|| "Local storage is unavailable.".to_owned())
         })
-    }
-
-    pub(crate) fn is_storage_ready(&self) -> bool {
-        self.storage.is_some()
     }
 
     pub(crate) fn provider_operation_for_home(
@@ -3023,11 +3046,19 @@ pub(crate) mod resource_quiescence_tests {
     }
     impl SignedInstallationFixture {
         pub(crate) fn open() -> Self {
+            use std::os::unix::fs::MetadataExt;
             let publication = PathBuf::from(
                 std::env::var_os("MAGI_TEST_NATIVE_SIGNED_PUBLICATION")
                     .expect("explicit owned signed installation"),
             );
-            let (fixture, state, _) = application_fixture();
+            let (mut fixture, state, _) = application_fixture();
+            let original = fs::metadata(&fixture.0).unwrap();
+            fixture.0 = fixture.0.canonicalize().unwrap();
+            let canonical = fs::metadata(&fixture.0).unwrap();
+            assert_eq!(
+                (original.dev(), original.ino()),
+                (canonical.dev(), canonical.ino())
+            );
             application_runtime()
                 .block_on(state.ensure_installed_resources(
                     publication.clone(),
@@ -3147,6 +3178,53 @@ pub(crate) mod resource_quiescence_tests {
             storage.load_run_aggregate(&run_id).unwrap().run().run_id,
             run_id
         );
+    }
+
+    #[test]
+    fn application_concurrent_configuration_preparing_waits_without_false_artifact_failure() {
+        let (_fixture, state, run_id) = application_fixture();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            extraction_helper::hold_configuration_for_test(ready_tx, release_rx);
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let caller_state = state.clone();
+        let caller = std::thread::spawn(move || {
+            application_runtime().block_on(
+                caller_state
+                    .prepare_application_shutdown(Instant::now() + Duration::from_secs(3), true),
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !matches!(
+            *state.application_shutdown.lock().unwrap(),
+            ApplicationShutdownState::Preparing
+        ) {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(!caller.is_finished());
+        assert!(matches!(
+            application_runtime().block_on(state.prepare_application_shutdown(deadline, true,)),
+            Err(magi_provider::ProviderError::Timeout)
+        ));
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        let prepared = caller.join().unwrap().unwrap();
+        assert_eq!(prepared.permission.epoch, 1);
+        prepared.permission.validate().unwrap();
+        assert_eq!(prepared.pending_runs, vec![run_id.clone()]);
+        assert_eq!(
+            state
+                .storage()
+                .unwrap()
+                .get_live_run_snapshot(&run_id, 0)
+                .unwrap()
+                .status,
+            magi_storage::LiveRunStatus::Cancelling
+        );
+        assert!(state.resource_coordinator.enter(None).is_err());
     }
 
     #[test]
@@ -3293,6 +3371,151 @@ pub(crate) mod resource_quiescence_tests {
                 .status,
             magi_storage::LiveRunStatus::Cancelling
         );
+    }
+
+    fn signed_held_extraction_retry(overlap: bool) {
+        struct CompletionRelease(Option<mpsc::Sender<()>>);
+        impl CompletionRelease {
+            fn release(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+        impl Drop for CompletionRelease {
+            fn drop(&mut self) {
+                self.release();
+            }
+        }
+        let installation = SignedInstallationFixture::open();
+        let state = installation.state.clone();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        extraction_helper::hold_next_completion(ready_tx, release_rx);
+        let mut release = CompletionRelease(Some(release_tx));
+        let source = installation
+            .fixture
+            .as_ref()
+            .unwrap()
+            .0
+            .join("held-extraction.png");
+        let extraction = std::thread::spawn(move || {
+            let png = [
+                137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0,
+                1, 8, 2, 0, 0, 0, 144, 119, 83, 222, 0, 0, 0, 12, 73, 68, 65, 84, 120, 156, 99,
+                248, 207, 192, 0, 0, 3, 1, 1, 0, 201, 254, 146, 239, 0, 0, 0, 0, 73, 69, 78, 68,
+                174, 66, 96, 130,
+            ];
+            fs::write(&source, png).unwrap();
+            let mut grant = SourceGrant::selected_files(vec![(
+                open_selected_file(&source).unwrap(),
+                "held-extraction.png".into(),
+            )])
+            .unwrap();
+            let enumeration = grant.enumerate(CaptureLimits::default_policy()).unwrap();
+            let directives = enumeration
+                .candidates
+                .into_iter()
+                .map(|candidate| CaptureDirective {
+                    source_id: candidate.source_id,
+                    line_range: None,
+                })
+                .collect::<Vec<_>>();
+            grant.capture_selected(&directives, CaptureLimits::default_policy(), now_epoch_ms())
+        });
+        let request = ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(request.settlement().provider_operations, 1);
+        assert!(!request.observed_revoked_settlement());
+        let (fenced_tx, fenced_rx) = mpsc::channel();
+        extraction_helper::observe_next_operation_fence(fenced_tx);
+        let first_state = state.clone();
+        let first = std::thread::spawn(move || {
+            application_runtime().block_on(
+                first_state
+                    .freeze_resource_consumers(Instant::now() + Duration::from_millis(250), None),
+            )
+        });
+        if fenced_rx.recv_timeout(Duration::from_secs(2)).is_err() {
+            release.release();
+            let actual = extraction.join().unwrap();
+            let result = first.join().unwrap();
+            panic!(
+                "actual helper fencing unavailable: cleanup={:?}, extraction_completed={}",
+                result.err(),
+                actual.is_ok()
+            );
+        }
+        assert!(request.check().is_err());
+        assert!(state.shutdown_cleanup.try_lock().is_err());
+        let epoch = match &*state.application_shutdown.lock().unwrap() {
+            ApplicationShutdownState::Frozen(prepared) => prepared.permission.epoch,
+            _ => panic!("actual frozen authority missing"),
+        };
+        if overlap {
+            let concurrent = application_runtime().block_on(
+                state.freeze_resource_consumers(Instant::now() + Duration::from_millis(20), None),
+            );
+            assert!(matches!(
+                concurrent,
+                Err(magi_provider::ProviderError::Timeout)
+            ));
+            assert!(state.shutdown_cleanup.try_lock().is_err());
+            assert_eq!(request.settlement().provider_operations, 1);
+        }
+        let first_result = first.join().unwrap();
+        assert_eq!(request.settlement().provider_operations, 1);
+        assert!(!request.observed_revoked_settlement());
+        assert!(state.resource_coordinator.enter(None).is_err());
+        release.release();
+        let actual = extraction.join().unwrap().unwrap();
+        assert!(
+            matches!(first_result, Err(magi_provider::ProviderError::Timeout)),
+            "actual helper cleanup error: {:?}",
+            first_result.err()
+        );
+        assert_eq!(actual.objects.len(), 1);
+        assert_eq!(
+            actual.manifest.content.sources[0].representation_kind,
+            Some(magi_context::RepresentationKind::Image)
+        );
+        assert!(request.observed_revoked_settlement());
+        let stopped = application_runtime()
+            .block_on(
+                state.freeze_resource_consumers(Instant::now() + Duration::from_secs(5), None),
+            )
+            .unwrap();
+        assert_eq!(stopped.epoch, epoch);
+        stopped.validate().unwrap();
+        assert!(stopped.consumers_closed);
+        assert_eq!(
+            state.resource_coordinator.state.lock().unwrap().operations,
+            0
+        );
+        let namespace = magi_provider::resource_custody::ArtifactNamespace::installed_resources(
+            &installation.publication,
+            &installation.fixture.as_ref().unwrap().0,
+        )
+        .unwrap();
+        assert_eq!(
+            magi_provider::resource_custody::ResourceCustody::open(namespace)
+                .unwrap()
+                .unresolved_operations()
+                .unwrap(),
+            0
+        );
+        installation.finish();
+    }
+
+    #[test]
+    #[ignore = "Requires explicit signed installation in a dedicated process; no account or inference calls."]
+    fn application_signed_held_extraction_timeout_settlement_and_same_epoch_retry() {
+        signed_held_extraction_retry(false);
+    }
+
+    #[test]
+    #[ignore = "Requires explicit signed installation in a dedicated process; no account or inference calls."]
+    fn application_signed_overlapping_cleanup_preserves_single_frozen_authority() {
+        signed_held_extraction_retry(true);
     }
 
     #[test]
@@ -3460,8 +3683,9 @@ pub(crate) mod resource_quiescence_tests {
     fn never_issued_cold_shutdown_permanently_closes_initialization() {
         let coordinator = NativeResourceCoordinator::cold_start();
         let operation = coordinator.preflight_operation().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
         let (permission, ()) = coordinator
-            .cold_shutdown_with_prepare(&operation, || Ok(()))
+            .cold_shutdown_with_prepare(&operation, deadline, || Ok(()))
             .unwrap();
         assert!(permission.validate().is_err());
         drop(operation);
@@ -3486,11 +3710,15 @@ pub(crate) mod resource_quiescence_tests {
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
             let permission = worker_coordinator
-                .cold_shutdown_with_prepare(&operation, || {
-                    ready_tx.send(()).unwrap();
-                    release_rx.recv().unwrap();
-                    Ok(())
-                })
+                .cold_shutdown_with_prepare(
+                    &operation,
+                    Instant::now() + Duration::from_secs(5),
+                    || {
+                        ready_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        Ok(())
+                    },
+                )
                 .unwrap()
                 .0;
             assert!(permission.validate().is_err());
