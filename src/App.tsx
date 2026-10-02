@@ -1,3 +1,5 @@
+import type { EvidenceReadingTarget } from "./records";
+import { useCoreBindings } from "./core-bindings";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   getConsoleSnapshot,
@@ -10,34 +12,73 @@ import {
   confirmApplicationExit,
   listAcpAdapters,
   listProviderProfiles,
+  listProviderSourceScopes,
+  pickProviderSourceDirectory,
+  addProviderSourceScope,
+  revokeProviderSourceScope,
   loadActiveProviderProfileSelection,
   saveProviderProfile,
   setActiveProviderProfile,
   validateProviderProfile,
   authenticateProviderProfile,
+  cancelProviderAuthentication,
+  listenProviderAuthProgress,
+  refreshProviderCatalog,
+  startLiveRun,
+  cancelLiveRun,
+  getLiveRunSnapshot,
+  listenLiveRunChanged,
+  normalizeLiveRunError,
+  authenticationFailureBinding,
+  startClarification,
+  registerClarificationRequest,
+  cancelClarificationRequest,
   startDeliberation,
+  registerDeliberationRequest,
+  cancelDeliberationRequest,
   cancelDeliberation,
   loadRunDossier,
   listenRunUpdate,
   listRolePresets,
   loadActiveRolePresetSelection,
+  normalizeRoleStoreDiagnostic,
   setActiveRolePreset,
   cloneRolePreset,
   saveRolePreset,
   listRecentRuns,
   isDesktopApp,
+  catalogHasExecutionAuthority,
   selectContextFiles,
   selectContextDirectory,
   getConsolePreferences,
   saveConsolePreferences,
   type ConsolePreferences,
   type ConsoleSnapshot,
+  type ActiveRolePresetSelection,
   type ContextSelectionSummary,
   type ProviderProfileSummary,
+  type ProviderSourceScope,
   type ProviderAdmission,
+  type ProviderValidationFailure,
+  type AcpModelBindingInput,
+  type ProviderAuthProgress,
+  type LiveRunError,
+  type LiveRunSnapshot,
+  type LiveRunStatus,
+  type ProviderCatalogSnapshot,
+  type CancelLiveRunInput,
+  type StartLiveRunInput,
+  type StartDeliberationInput,
+  type AdmissionAuthority,
+  type CancelDeliberationRequestInput,
+  type CancelDeliberationRequestReceipt,
+  type ClarificationParent,
+  type ClarificationStartInput,
+  type ClarificationDraft,
   type RunDossierView,
   type RunUpdate,
   type StoredRolePreset,
+  type RoleStoreDiagnostic,
   type RolePresetDraftInput,
   type ShellContext,
 } from "./lib/desktop-api";
@@ -106,6 +147,8 @@ const emptySnapshot: ConsoleSnapshot = {
   storage: "unknown",
 };
 
+const liveRunStorageKey = "magi.last-live-run-id";
+
 const runtimeRoutes: Record<string, ScreenId> = {
   preparing: "confirmation",
   awaiting_confirmation: "confirmation",
@@ -130,32 +173,43 @@ function routeForDossier(dossier: RunDossierView): ScreenId | undefined {
   return stageRoute && !terminalRoutes.includes(stageRoute) ? stageRoute : undefined;
 }
 
-type SafeRunProgress = Pick<RunUpdate, "runId" | "stage" | "coreId" | "state">;
+type SafeRunProgress = Pick<RunUpdate, "runId" | "stage" | "coreId" | "state" | "text">;
+type LiveCatalogState = "idle" | "loading" | "ready" | "error";
+type LiveRequestState = "idle" | "starting" | "accepted" | "error";
+type LiveRunTextDelta = { sequence: number; text: string };
+type LiveCancelRequestState = { runId: string; state: "sending" | "accepted" | "error"; error?: LiveRunError } | null;
+
+function isLiveRunTerminal(status: LiveRunStatus | undefined): boolean {
+  return status === "completed" || status === "failed" || status === "cancelled";
+}
+
+function isLiveRunCancelable(status: LiveRunStatus | undefined): boolean {
+  return status === "queued" || status === "claimed" || status === "session_creation_intent" || status === "running" || status === "unknown";
+}
 
 function mapProviderAdmission(admission: ProviderAdmission): AcpProfile["admission"] {
   if (admission.state === "ready") {
     return {
       state: "admitted",
       profileId: admission.profileId,
-      adapterId: admission.adapterId,
-      rootBinding: admission.rootBinding,
-      checkedAt: admission.checkedAt,
-      modelId: admission.modelId,
-    };
-  }
-  if (admission.state === "needs_auth") {
-    return {
-      state: "needs_auth",
-      profileId: admission.profileId,
+      profileRevision: admission.profileRevision,
       adapterId: admission.adapterId,
       rootBinding: admission.rootBinding,
       checkedAt: admission.checkedAt,
     };
   }
-  if (admission.state === "blocked") {
-    return { state: "blocked", reason: admission.reason, checkedAt: admission.checkedAt };
-  }
-  return { state: "not_checked" };
+  return { state: "blocked", reason: admission.reason, checkedAt: admission.checkedAt };
+}
+
+function hasVerifiedProfileHome(profile: AcpProfile | undefined): profile is AcpProfile & {
+  admission: Extract<AcpProfile["admission"], { state: "admitted" }>;
+} {
+  return Boolean(profile
+    && profile.admission.state === "admitted"
+    && profile.admission.profileId === profile.id
+    && profile.admission.profileRevision === profile.revision
+    && profile.admission.adapterId === profile.adapterId
+    && profile.admission.rootBinding === "verified");
 }
 
 type DialogModel = {
@@ -195,6 +249,7 @@ function mapProviderProfile(profile: ProviderProfileSummary): AcpProfile {
     adapterId: profile.providerId,
     revision: profile.revision,
     authenticationMethod: profile.authenticationMethod,
+    credentialHome: profile.credentialHome,
     admission: { state: "not_checked" },
   };
 }
@@ -236,6 +291,7 @@ export default function App() {
   const [snapshot, setSnapshot] = useState<ConsoleSnapshot>(emptySnapshot);
   const [contextSelection, setContextSelection] = useState<ContextSelectionSummary | null>(null);
   const [homeData, setHomeData] = useState<HomeData>({ recordsState: "loading", recentRuns: [] });
+  const [evidenceReadingTarget, setEvidenceReadingTarget] = useState<EvidenceReadingTarget | null>(null);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [selectedRunDossier, setSelectedRunDossier] = useState<RunDossierView | null>(null);
   const [selectedRunDossierState, setSelectedRunDossierState] = useState<"idle" | "loading" | "ready" | "error">("idle");
@@ -243,21 +299,61 @@ export default function App() {
   const [acpAdapters, setAcpAdapters] = useState<AcpAdapterSummary[]>([]);
   const [acpProfilesState, setAcpProfilesState] = useState<AcpProfileStoreState>("loading");
   const [acpProfiles, setAcpProfiles] = useState<AcpProfile[]>([]);
+  const coreBindings = useCoreBindings(acpProfiles, acpProfilesState === "ready");
   const [selectedAcpProfileId, setSelectedAcpProfileId] = useState<string | null>(null);
+  const [providerSourceScopes, setProviderSourceScopes] = useState<ProviderSourceScope[]>([]);
+  const [providerSourceScopesState, setProviderSourceScopesState] = useState<"loading" | "ready" | "error" | "unavailable">("loading");
+  const [providerSourceScopePathInput, setProviderSourceScopePathInput] = useState("");
+  const [providerSourceScopeWriteState, setProviderSourceScopeWriteState] = useState<"idle" | "adding" | "revoking">("idle");
+  const [providerSourceScopeError, setProviderSourceScopeError] = useState("");
   const [authenticatingProfileId, setAuthenticatingProfileId] = useState<string | null>(null);
-  const [validatingProfileId, setValidatingProfileId] = useState<string | null>(null);
+  const [providerAuthProgress, setProviderAuthProgress] = useState<ProviderAuthProgress | null>(null);
+  const [cancellingProviderAuth, setCancellingProviderAuth] = useState<{ profileId: string; profileRevision: number } | null>(null);
+  const [validatingProfile, setValidatingProfile] = useState<{ profileId: string; profileRevision: number } | null>(null);
+  const [providerValidationError, setProviderValidationError] = useState<ProviderValidationFailure | null>(null);
+  const [authProfileError, setAuthProfileError] = useState<LiveRunError | null>(null);
+  const [authProfileErrorBinding, setAuthProfileErrorBinding] = useState<{ profileId: string; profileRevision: number } | null>(null);
+  const [liveCatalog, setLiveCatalog] = useState<ProviderCatalogSnapshot | null>(null);
+  const [liveCatalogState, setLiveCatalogState] = useState<LiveCatalogState>("idle");
+  const [liveCatalogError, setLiveCatalogError] = useState<LiveRunError | null>(null);
+
+  useEffect(() => {
+    setProviderValidationError((failure) => {
+      if (!failure) return failure;
+      const profile = acpProfiles.find((item) => item.id === failure.profileId);
+      return profile?.revision === failure.profileRevision ? failure : null;
+    });
+  }, [acpProfiles]);
+  const [selectedLiveModelId, setSelectedLiveModelId] = useState("");
+  const [liveQuestion, setLiveQuestion] = useState("");
+  const [liveRunId, setLiveRunId] = useState<string | null>(null);
+  const [liveRunSnapshot, setLiveRunSnapshot] = useState<LiveRunSnapshot | null>(null);
+  const [liveRunTextDeltas, setLiveRunTextDeltas] = useState<LiveRunTextDelta[]>([]);
+  const [liveSnapshotError, setLiveSnapshotError] = useState<LiveRunError | null>(null);
+  const [liveRequestState, setLiveRequestState] = useState<LiveRequestState>("idle");
+  const [liveRequestError, setLiveRequestError] = useState<LiveRunError | null>(null);
+  const [liveCancelRequest, setLiveCancelRequest] = useState<LiveCancelRequestState>(null);
   const [acpProfileDraft, setAcpProfileDraft] = useState<AcpProfileDraft | null>(null);
   const [acpProfileWriteState, setAcpProfileWriteState] = useState<AcpProfileWriteState>("idle");
   const [rolePresetsState, setRolePresetsState] = useState<RolePresetStoreState>("loading");
+  const [roleStoreDiagnostic, setRoleStoreDiagnostic] = useState<RoleStoreDiagnostic | null>(null);
+  const rolePresetLoad = useRef<Promise<[RolePreset[], ActiveRolePresetSelection | null]> | null>(null);
   const [rolePresets, setRolePresets] = useState<RolePreset[]>([]);
   const [selectedRolePresetId, setSelectedRolePresetId] = useState<string | null>(null);
   const [disclosureConfirmed, setDisclosureConfirmed] = useState(false);
+  const confirmedBindingsKey = JSON.stringify(coreBindings.destinations.map(item => item.reference));
+  useEffect(() => { setDisclosureConfirmed(false); }, [confirmedBindingsKey]);
   const [acceptedRunId, setAcceptedRunId] = useState<string | null>(null);
   const [runProgress, setRunProgress] = useState<SafeRunProgress | null>(null);
+  const [verifiedClarificationParent, setVerifiedClarificationParent] = useState<ClarificationParent | null>(null);
+  const [clarificationDraft, setClarificationDraft] = useState<ClarificationDraft | null>(null);
+  const clarificationDraftRef = useRef<ClarificationDraft | null>(null);
+  clarificationDraftRef.current = clarificationDraft;
   const [runDossier, setRunDossier] = useState<RunDossierView | null>(null);
   const [runDossierState, setRunDossierState] = useState<"idle" | "loading" | "ready" | "error">("idle");
   const [runStartState, setRunStartState] = useState<"idle" | "starting" | "error">("idle");
   const [runStartError, setRunStartError] = useState("");
+  const [admissionCancellation, setAdmissionCancellation] = useState<"idle" | "pending" | "accepted" | "error">("idle");
   const [cancelRequest, setCancelRequest] = useState<{ runId: string; state: "sending" | "sent" | "error"; message?: string } | null>(null);
   const [roleDraft, setRoleDraft] = useState<RolePresetDraft | null>(null);
   const [roleWriteState, setRoleWriteState] = useState<RolePresetWriteState>("idle");
@@ -266,25 +362,85 @@ export default function App() {
   const [notice, setNotice] = useState("");
   const [invalidQuestion, setInvalidQuestion] = useState(false);
   const mainRef = useRef<HTMLElement>(null);
+  const screenRef = useRef<ScreenId>(screen);
+  const connectionCheckSequence = useRef(0);
+  const automaticConnectionChecks = useRef(new Set<string>());
+  const [automaticCheckStep, setAutomaticCheckStep] = useState(0);
+  const profileRevisionsRef = useRef(acpProfiles);
+  profileRevisionsRef.current = acpProfiles;
+  const roleReturnScreen = useRef<ScreenId>("home");
+  const connectionReturnScreen = useRef<ScreenId>("home");
+  const settingsReturnScreen = useRef<ScreenId>("home");
+  const screenScrollPositions = useRef<Partial<Record<ScreenId, { top: number; left: number }>>>({});
   const dialogRef = useRef<HTMLDialogElement>(null);
   const dialogInvoker = useRef<HTMLElement | null>(null);
   const lastEventSequence = useRef(-1);
   const preferencesRef = useRef<ConsolePreferences>(preferenceDefaults);
   const changedPreferenceFields = useRef(new Set<keyof ConsolePreferences>());
   const preferencesReady = useRef(false);
+  const preferenceReadGeneration = useRef(0);
+  const reloadPreferences = useRef<(() => Promise<void>) | null>(null);
   const preferenceSaveQueue = useRef<Promise<void>>(Promise.resolve());
+  const profileSavePending = useRef(false);
   const providerSelectionRevision = useRef<number | null>(null);
+  const activeProviderAuthentication = useRef<{ profileId: string; profileRevision: number } | null>(null);
   const roleSelectionRevision = useRef<number | null>(null);
   const activeRunIdRef = useRef<string | null>(null);
   const selectedRunIdRef = useRef<string | null>(null);
+  const pendingLiveRunCommand = useRef<StartLiveRunInput | null>(null);
+  const pendingDeliberationCommand = useRef<StartDeliberationInput | null>(null);
+  const admissionFlow = useRef<{
+    request: StartDeliberationInput;
+    clarification: ClarificationStartInput | null;
+    authority: AdmissionAuthority | null;
+    cancellation: CancelDeliberationRequestInput | null;
+    receipt: CancelDeliberationRequestReceipt | null;
+    cancellationInFlight: Promise<void> | null;
+    registrationPending: boolean;
+    inFlight: boolean;
+  } | null>(null);
+  const pendingLiveCancellation = useRef<CancelLiveRunInput | null>(null);
+  const liveCancellationInFlight = useRef<string | null>(null);
+  const liveCancelFence = useRef<{ runId: string; storeId: string; storeGeneration: number; afterSequence: number } | null>(null);
+  const liveRunCursor = useRef<{
+    runId: string;
+    storeId: string | null;
+    storeGeneration: number | null;
+    afterSequence: number;
+    revision: number;
+  } | null>(null);
+  const liveRunRefreshQueue = useRef<Promise<LiveRunSnapshot | null>>(Promise.resolve(null));
+  const activeLiveRunIdRef = useRef<string | null>(null);
 
   const activeRun = snapshot.activeRun;
   const currentRunId = activeRun?.id ?? acceptedRunId;
   const currentRunProgress = runProgress?.runId === currentRunId ? runProgress : null;
   const currentRunDossier = runDossier?.runId === currentRunId ? runDossier : null;
   const selectedProviderProfile = acpProfiles.find((profile) => profile.id === selectedAcpProfileId);
+  const observedAuthenticationFailures = useRef(new Set<string>());
+  const observeAuthenticationFailure = useCallback((key: string, failure: unknown) => {
+    const binding = authenticationFailureBinding(failure);
+    if (!binding) return;
+    const identity = `${key}:${JSON.stringify(binding)}`;
+    if (observedAuthenticationFailures.current.has(identity)) return;
+    observedAuthenticationFailures.current.add(identity);
+    coreBindings.invalidateAuthentication(binding);
+  }, [coreBindings.invalidateAuthentication]);
+  const selectedAuthProfileResult = coreBindings.verifiedAuthentication(selectedProviderProfile);
+  const selectedLiveCatalog = liveCatalog && liveCatalog.providerProfileId === selectedProviderProfile?.id
+    && liveCatalog.profileRevision === selectedProviderProfile?.revision
+    && liveCatalog.providerId === selectedProviderProfile?.adapterId
+    && liveCatalog.adapterId === selectedProviderProfile?.adapterId
+    && liveCatalog.acpMode === "acp"
+    ? liveCatalog
+    : null;
+  const currentLiveRunSnapshot = liveRunSnapshot?.runId === liveRunId ? liveRunSnapshot : null;
+  const currentLiveRunText = currentLiveRunSnapshot?.status === "completed" && typeof currentLiveRunSnapshot.result?.finalText === "string"
+    ? currentLiveRunSnapshot.result.finalText
+    : liveRunTextDeltas.map((delta) => delta.text).join("");
   const selectedRolePreset = rolePresets.find((preset) => preset.id === selectedRolePresetId);
-  const shownQuestion = activeRun?.question ?? question;
+  const currentClarificationDraft = clarificationDraft?.parent.runId === currentRunId && currentRunDossier?.status === "paused" && verifiedClarificationParent?.runId === clarificationDraft.parent.runId && verifiedClarificationParent.revision === clarificationDraft.parent.revision && verifiedClarificationParent.inputDigest === clarificationDraft.parent.inputDigest && verifiedClarificationParent.generation === clarificationDraft.parent.generation ? clarificationDraft : null;
+  const shownQuestion = currentClarificationDraft && ["input", "confirmation", "intake"].includes(screen) ? currentClarificationDraft.question : activeRun?.question ?? question;
   const isDraft = screen === "input" && !activeRun;
 
   useEffect(() => {
@@ -296,7 +452,7 @@ export default function App() {
     let disposed = false;
     setSelectedRunDossierState("loading");
     void loadRunDossier(selectedRunId).then((dossier) => {
-      if (disposed || dossier.runId !== selectedRunId) return;
+      if (disposed || selectedRunIdRef.current !== selectedRunId || dossier.runId !== selectedRunId) return;
       setSelectedRunDossier(dossier);
       setSelectedRunDossierState("ready");
     }).catch(() => {
@@ -371,20 +527,159 @@ export default function App() {
     };
   }, []);
 
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listenProviderAuthProgress((progress) => {
+      const active = activeProviderAuthentication.current;
+      if (!active || active.profileId !== progress.profileId || active.profileRevision !== progress.profileRevision) return;
+      setProviderAuthProgress(progress);
+    }).then((stopListening) => {
+      if (disposed) stopListening();
+      else unlisten = stopListening;
+    }).catch(() => undefined);
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
   const announce = useCallback((message: string) => {
     setNotice(message);
     window.setTimeout(() => setNotice(""), 5000);
   }, []);
+
+  const refreshLiveRunSnapshot = useCallback((runId: string): Promise<LiveRunSnapshot | null> => {
+    const refresh = liveRunRefreshQueue.current.catch(() => undefined).then(async (): Promise<LiveRunSnapshot | null> => {
+      if (activeLiveRunIdRef.current !== runId) return null;
+      let cursor = liveRunCursor.current;
+      if (cursor?.runId !== runId) {
+        cursor = { runId, storeId: null, storeGeneration: null, afterSequence: 0, revision: -1 };
+        liveRunCursor.current = cursor;
+      }
+
+      try {
+        let latestSnapshot: LiveRunSnapshot | null = null;
+        let caughtUp = false;
+        while (!caughtUp) {
+          if (activeLiveRunIdRef.current !== runId) return null;
+          const currentCursor = liveRunCursor.current;
+          if (!currentCursor || currentCursor.runId !== runId) return null;
+          const next = await getLiveRunSnapshot(runId, currentCursor.afterSequence);
+          if (activeLiveRunIdRef.current !== runId || next.runId !== runId) return null;
+          if (next.eventCursor.runId !== runId
+            || next.eventCursor.storeId !== next.storeId
+            || next.eventCursor.storeGeneration !== next.storeGeneration) {
+            setLiveSnapshotError({
+              code: "live_run_cursor_mismatch",
+              message: "저장된 실행 cursor가 현재 snapshot과 일치하지 않습니다. 새 상태를 확인하십시오.",
+              retryable: true,
+            });
+            return null;
+          }
+          const storeChanged = currentCursor.storeId !== null
+            && (currentCursor.storeId !== next.storeId || currentCursor.storeGeneration !== next.storeGeneration);
+          if (storeChanged) {
+            currentCursor.storeId = next.storeId;
+            currentCursor.storeGeneration = next.storeGeneration;
+            currentCursor.afterSequence = 0;
+            currentCursor.revision = -1;
+            liveCancelFence.current = null;
+            setLiveRunSnapshot(null);
+            setLiveRunTextDeltas([]);
+            continue;
+          }
+          currentCursor.storeId = next.storeId;
+          currentCursor.storeGeneration = next.storeGeneration;
+          if (next.revision < currentCursor.revision) return latestSnapshot;
+
+          latestSnapshot = next;
+          const previousSequence = currentCursor.afterSequence;
+          const lastReturnedSequence = next.events.reduce((highest, event) => Math.max(highest, event.sequence), previousSequence);
+          currentCursor.afterSequence = next.eventCursor.complete
+            ? Math.max(previousSequence, next.eventCursor.highWaterSequence)
+            : lastReturnedSequence;
+          currentCursor.revision = next.revision;
+          observeAuthenticationFailure(`live:${next.runId}:${next.revision}`, next.failure);
+          setLiveRunSnapshot(next);
+          setLiveRunTextDeltas((existing) => {
+            const deltas = new Map(existing.map((delta) => [delta.sequence, delta]));
+            const cancellationFence = liveCancelFence.current;
+            next.events.forEach((event) => {
+              const afterCancellationFence = cancellationFence?.runId === runId
+                && cancellationFence.storeId === next.storeId
+                && cancellationFence.storeGeneration === next.storeGeneration
+                && event.sequence > cancellationFence.afterSequence;
+              if (event.kind === "text_delta" && typeof event.textDelta === "string" && !afterCancellationFence) {
+                deltas.set(event.sequence, { sequence: event.sequence, text: event.textDelta });
+              }
+            });
+            return [...deltas.values()].sort((left, right) => left.sequence - right.sequence);
+          });
+          if (isLiveRunTerminal(next.status)) pendingLiveCancellation.current = null;
+          setLiveRequestState("accepted");
+          setLiveRequestError(null);
+          setLiveSnapshotError(null);
+          caughtUp = next.eventCursor.complete || currentCursor.afterSequence <= previousSequence;
+        }
+        return latestSnapshot;
+      } catch (error) {
+        if (activeLiveRunIdRef.current !== runId) return null;
+        setLiveSnapshotError(normalizeLiveRunError(error));
+        return null;
+      }
+    });
+    liveRunRefreshQueue.current = refresh;
+    return refresh;
+  }, [observeAuthenticationFailure]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+
+    void (async () => {
+      try {
+        unlisten = await listenLiveRunChanged(({ runId }) => {
+          if (activeLiveRunIdRef.current === runId) void refreshLiveRunSnapshot(runId);
+        });
+        if (disposed) {
+          unlisten();
+          return;
+        }
+        let storedRunId: string | null = null;
+        try {
+          storedRunId = window.localStorage.getItem(liveRunStorageKey);
+        } catch {
+          storedRunId = null;
+        }
+        if (storedRunId) {
+          activeLiveRunIdRef.current = storedRunId;
+          liveRunCursor.current = { runId: storedRunId, storeId: null, storeGeneration: null, afterSequence: 0, revision: -1 };
+          setLiveRunId(storedRunId);
+          setLiveRequestState("accepted");
+          void refreshLiveRunSnapshot(storedRunId);
+        }
+      } catch {
+        if (!disposed) setLiveSnapshotError(normalizeLiveRunError(undefined));
+      }
+    })();
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [refreshLiveRunSnapshot]);
 
   useEffect(() => {
     let disposed = false;
     let unlisten: (() => void) | undefined;
     const runtimeScreens: ScreenId[] = ["confirmation", "independent", "review", "proposal", "sealed", "verdict", "paused", "interrupted", "cancelling", "cancelled", "failed"];
     const showRunDossier = (dossier: RunDossierView) => {
+      observeAuthenticationFailure(`deliberation:${dossier.runId}:${dossier.error?.code}`, dossier.error);
       setRunDossier(dossier);
       setRunDossierState("ready");
       const next = routeForDossier(dossier);
-      if (next) setScreen((current) => runtimeScreens.includes(current) ? next : current);
+      if (next) setScreen((current) => runtimeScreens.includes(current) && !(clarificationDraftRef.current?.parent.runId === dossier.runId && dossier.status === "paused" && ["input", "confirmation"].includes(current)) ? next : current);
     };
     const refreshRunState = async (runId: string) => {
       try {
@@ -404,7 +699,20 @@ export default function App() {
     void listenRunUpdate((update) => {
       if (!activeRunIdRef.current || activeRunIdRef.current !== update.runId) return;
       setAcceptedRunId(update.runId);
-      setRunProgress({ runId: update.runId, stage: update.stage, coreId: update.coreId, state: update.state });
+      setRunProgress((current) => {
+        const previousText = current?.runId === update.runId ? current.text ?? "" : "";
+        return {
+          runId: update.runId,
+          stage: update.stage,
+          coreId: update.coreId,
+          state: update.state,
+          text: update.text === undefined
+            ? previousText || undefined
+            : update.state === "streaming"
+              ? `${previousText}${update.text}`
+              : update.text,
+        };
+      });
       if (update.result?.runId === update.runId) {
         showRunDossier(update.result);
       } else if (update.state === "failed" || update.state === "cancelled" || update.state === "completed") {
@@ -413,7 +721,7 @@ export default function App() {
       if (!update.result && (update.state === "started" || update.state === "streaming")) {
         const next = runtimeRoutes[update.stage];
         if (next && !["verdict", "failed", "cancelled"].includes(next)) {
-          setScreen((current) => runtimeScreens.includes(current) ? next : current);
+          setScreen((current) => runtimeScreens.includes(current) && !(clarificationDraftRef.current?.parent.runId === update.runId && next === "paused" && ["input", "confirmation"].includes(current)) ? next : current);
         }
       }
     }).then((stop) => {
@@ -426,7 +734,7 @@ export default function App() {
       disposed = true;
       unlisten?.();
     };
-  }, [announce]);
+  }, [announce, observeAuthenticationFailure]);
 
   useEffect(() => {
     let disposed = false;
@@ -436,12 +744,59 @@ export default function App() {
     return () => { disposed = true; };
   }, []);
 
+  const reloadRolePresets = useCallback(async (isCurrent: () => boolean = () => true) => {
+    setRolePresetsState("loading");
+    setRoleStoreDiagnostic(null);
+    if (!rolePresetLoad.current) {
+      rolePresetLoad.current = (async (): Promise<[RolePreset[], ActiveRolePresetSelection | null]> => {
+        let storedPresets: StoredRolePreset[];
+        try {
+          storedPresets = await listRolePresets();
+        } catch (error) {
+          throw normalizeRoleStoreDiagnostic(error, "list_presets");
+        }
+
+        let selection: ActiveRolePresetSelection | null;
+        try {
+          selection = await loadActiveRolePresetSelection();
+        } catch (error) {
+          throw normalizeRoleStoreDiagnostic(error, "load_selection");
+        }
+
+        let presets: RolePreset[];
+        try {
+          presets = storedPresets.map(mapStoredRolePreset);
+        } catch {
+          throw normalizeRoleStoreDiagnostic(null, "map_presets");
+        }
+        return [presets, selection];
+      })();
+    }
+    const pending = rolePresetLoad.current;
+    try {
+      const [presets, selection] = await pending;
+      if (!isCurrent()) return;
+      setRolePresets(presets);
+      const fallback = presets.find((preset) => preset.id === "factory.magi.default") ?? presets.find((preset) => preset.kind === "factory");
+      setSelectedRolePresetId(selection?.presetId ?? fallback?.id ?? null);
+      roleSelectionRevision.current = selection?.selectionRevision ?? null;
+      setRolePresetsState("ready");
+    } catch (error) {
+      if (!isCurrent()) return;
+      setRoleStoreDiagnostic(normalizeRoleStoreDiagnostic(error));
+      setRolePresetsState("error");
+    } finally {
+      if (rolePresetLoad.current === pending) rolePresetLoad.current = null;
+    }
+  }, []);
+
   useEffect(() => {
     if (!isDesktopApp()) {
       setHomeData({ recordsState: "unavailable", recentRuns: [] });
       setAcpAdaptersState("unavailable");
       setAcpProfilesState("unavailable");
       setRolePresetsState("unavailable");
+      setRoleStoreDiagnostic(null);
       return;
     }
     if (shellContext?.windowLabel !== "main") return;
@@ -478,23 +833,38 @@ export default function App() {
       if (!disposed) setAcpProfilesState("error");
     });
 
-    void Promise.all([
-      listRolePresets(),
-      loadActiveRolePresetSelection(),
-    ]).then(([storedPresets, selection]) => {
-      if (disposed) return;
-      const presets = storedPresets.map(mapStoredRolePreset);
-      setRolePresets(presets);
-      const fallback = presets.find((preset) => preset.id === "factory.magi.default") ?? presets.find((preset) => preset.kind === "factory");
-      setSelectedRolePresetId(selection?.presetId ?? fallback?.id ?? null);
-      roleSelectionRevision.current = selection?.selectionRevision ?? null;
-      setRolePresetsState("ready");
-    }).catch(() => {
-      if (!disposed) setRolePresetsState("error");
-    });
+    void reloadRolePresets(() => !disposed);
 
     return () => { disposed = true; };
-  }, [shellContext?.windowLabel]);
+  }, [reloadRolePresets, shellContext?.windowLabel]);
+
+  useEffect(() => {
+    if (!isDesktopApp()) {
+      setProviderSourceScopes([]);
+      setProviderSourceScopesState("unavailable");
+      return;
+    }
+    if (!selectedAcpProfileId) {
+      setProviderSourceScopes([]);
+      setProviderSourceScopesState("ready");
+      setProviderSourceScopeError("");
+      return;
+    }
+    let disposed = false;
+    setProviderSourceScopesState("loading");
+    setProviderSourceScopeError("");
+    void listProviderSourceScopes(selectedAcpProfileId).then((scopes) => {
+      if (disposed) return;
+      setProviderSourceScopes(scopes);
+      setProviderSourceScopesState("ready");
+    }).catch(() => {
+      if (disposed) return;
+      setProviderSourceScopes([]);
+      setProviderSourceScopesState("error");
+      setProviderSourceScopeError("저장된 자료 접근 권한을 읽지 못했습니다.");
+    });
+    return () => { disposed = true; };
+  }, [selectedAcpProfileId, shellContext?.windowLabel]);
 
   useEffect(() => {
     if (!activeRun) return;
@@ -502,10 +872,10 @@ export default function App() {
     setAcceptedRunId(activeRun.id);
     const next = runtimeRoutes[activeRun.status];
     const runtimeScreens: ScreenId[] = ["input", "independent", "review", "proposal", "sealed", "verdict", "paused", "interrupted", "cancelling", "cancelled", "failed", "save-error", "confirmation"];
-    if (next && runtimeScreens.includes(screen) && screen !== next) {
+    if (next && runtimeScreens.includes(screen) && screen !== next && !(currentClarificationDraft && ["input", "confirmation"].includes(screen))) {
       setScreen(next);
     }
-  }, [activeRun?.id, activeRun?.status, screen]);
+  }, [activeRun?.id, activeRun?.status, screen, currentClarificationDraft]);
 
   useEffect(() => {
     if (!currentRunId) {
@@ -517,16 +887,17 @@ export default function App() {
     setRunDossierState("loading");
     void loadRunDossier(currentRunId).then((dossier) => {
       if (disposed || dossier.runId !== currentRunId) return;
+      observeAuthenticationFailure(`deliberation:${dossier.runId}:${dossier.error?.code}`, dossier.error);
       setRunDossier(dossier);
       setRunDossierState("ready");
       const next = routeForDossier(dossier);
       const runtimeScreens: ScreenId[] = ["confirmation", "independent", "review", "proposal", "sealed", "verdict", "paused", "interrupted", "cancelling", "cancelled", "failed"];
-      if (next) setScreen((current) => runtimeScreens.includes(current) ? next : current);
+      if (next) setScreen((current) => runtimeScreens.includes(current) && !(clarificationDraftRef.current?.parent.runId === dossier.runId && dossier.status === "paused" && ["input", "confirmation"].includes(current)) ? next : current);
     }).catch(() => {
       if (!disposed) setRunDossierState("error");
     });
     return () => { disposed = true; };
-  }, [currentRunId]);
+  }, [currentRunId, observeAuthenticationFailure]);
 
   useEffect(() => {
     const node = dialogRef.current;
@@ -551,13 +922,28 @@ export default function App() {
     return () => node.removeEventListener("close", restore);
   }, []);
 
-  const navigate = useCallback((next: ScreenId) => {
+  const navigate = useCallback((requested: ScreenId, returning = false) => {
+    const next = requested === "provider" ? "connections" : requested;
+    const current = screenRef.current;
+    screenScrollPositions.current[current] = { top: window.scrollY, left: window.scrollX };
+    if (!returning && next === "connections" && current !== "connections") connectionReturnScreen.current = current;
+    if (!returning && next === "settings" && current !== "settings") settingsReturnScreen.current = current;
+    if (next === "roles" && screenRef.current !== "roles") roleReturnScreen.current = screenRef.current;
+    screenRef.current = next;
     setScreen(next);
     setInvalidQuestion(false);
     setNotice("");
     setDialog(null);
-    setTimeout(() => mainRef.current?.focus(), 0);
+    setTimeout(() => {
+      mainRef.current?.focus({ preventScroll: true });
+      const position = screenScrollPositions.current[next];
+      window.scrollTo(position?.left ?? 0, position?.top ?? 0);
+    }, 0);
   }, []);
+
+  useEffect(() => { screenRef.current = screen; }, [screen]);
+
+  const returnFromRoles = useCallback(() => navigate(roleReturnScreen.current), [navigate]);
 
   const openRecentRun = useCallback((runId: string) => {
     selectedRunIdRef.current = runId;
@@ -566,7 +952,7 @@ export default function App() {
   }, [navigate]);
 
   const beginAcpProfileCreate = useCallback(() => {
-    setAcpProfileDraft({ profileId: null, expectedRevision: null, displayName: "", adapterId: "codex-acp" });
+    setAcpProfileDraft({ profileId: null, expectedRevision: null, displayName: "", adapterId: "codex-acp", credentialHomePath: "" });
     setAcpProfileWriteState("idle");
   }, []);
 
@@ -577,33 +963,113 @@ export default function App() {
       void listProviderProfiles().then((items) => setAcpProfiles(items.map(mapProviderProfile))).catch(() => setAcpProfilesState("error"));
       return;
     }
-    setAcpProfileDraft({ profileId: profile.id, expectedRevision: profile.revision, displayName: profile.displayName, adapterId: profile.adapterId });
+    setAcpProfileDraft({ profileId: profile.id, expectedRevision: profile.revision, displayName: profile.displayName, adapterId: profile.adapterId, credentialHomePath: profile.credentialHome?.displayPath ?? "" });
     setAcpProfileWriteState("idle");
   }, [acpProfiles, announce]);
 
   const saveAcpProfileDraft = useCallback(async (draft: AcpProfileDraft) => {
+    if (profileSavePending.current) return;
+    profileSavePending.current = true;
     setAcpProfileWriteState("saving");
+    let saved: Awaited<ReturnType<typeof saveProviderProfile>>;
     try {
-      const saved = await saveProviderProfile(draft);
-      const profiles = await listProviderProfiles();
-      setAcpProfiles(profiles.map(mapProviderProfile));
-      setAcpProfileDraft({ profileId: saved.providerProfileId, expectedRevision: saved.revision, displayName: saved.displayName, adapterId: saved.providerId });
-      setAcpProfileWriteState("saved");
-      setDisclosureConfirmed(false);
-      announce("연결 프로필과 별도 홈 바인딩을 저장했습니다. 런타임 검증 전까지 모델 호출은 차단됩니다.");
+      saved = await saveProviderProfile(draft);
     } catch (error) {
       const message = String(error).toLowerCase();
       setAcpProfileWriteState(message.includes("revision") || message.includes("conflict") ? "conflict" : "error");
       if (message.includes("revision") || message.includes("conflict")) {
         void listProviderProfiles().then((items) => setAcpProfiles(items.map(mapProviderProfile))).catch(() => setAcpProfilesState("error"));
       }
+      profileSavePending.current = false;
       announce("연결 프로필을 저장하지 못했습니다. 입력 내용을 유지했습니다.");
+      return;
+    }
+
+    setAcpProfiles((profiles) => {
+      const mapped = mapProviderProfile(saved);
+      return profiles.some((profile) => profile.id === mapped.id)
+        ? profiles.map((profile) => profile.id === mapped.id ? mapped : profile)
+        : [...profiles, mapped];
+    });
+    profileSavePending.current = false;
+    setAcpProfileDraft(null);
+    setAcpProfileWriteState("saved");
+    setDisclosureConfirmed(false);
+    announce(`연결 프로필 ${saved.displayName}을(를) 저장했습니다. 런타임 검증 전까지 모델 호출은 차단됩니다.`);
+
+    try {
+      const profiles = await listProviderProfiles();
+      setAcpProfiles(profiles.map(mapProviderProfile));
+      setAcpProfilesState("ready");
+    } catch {
+      setAcpProfilesState("error");
+      announce("프로필은 저장됐지만 목록을 다시 읽지 못했습니다. 저장된 값은 보존되어 있습니다.");
     }
   }, [announce]);
+
+  const refreshProviderSourceScopes = useCallback(async (profileId: string) => {
+    const scopes = await listProviderSourceScopes(profileId);
+    if (profileId === selectedAcpProfileId) {
+      setProviderSourceScopes(scopes);
+      setProviderSourceScopesState("ready");
+    }
+  }, [selectedAcpProfileId]);
+
+  const chooseProviderSourceDirectory = useCallback(async () => {
+    setProviderSourceScopeError("");
+    try {
+      const path = await pickProviderSourceDirectory();
+      if (path) setProviderSourceScopePathInput(path);
+    } catch {
+      setProviderSourceScopeError("자료 접근 폴더 선택을 완료하지 못했습니다.");
+    }
+  }, []);
+
+  const addProviderSourceRoot = useCallback(async () => {
+    const profileId = selectedAcpProfileId;
+    const pathInput = providerSourceScopePathInput.trim();
+    if (!profileId || !pathInput) return;
+    setProviderSourceScopeWriteState("adding");
+    setProviderSourceScopeError("");
+    try {
+      await addProviderSourceScope(profileId, pathInput);
+      await refreshProviderSourceScopes(profileId);
+      setProviderSourceScopePathInput("");
+      announce("이 프로필의 자료 읽기 권한을 저장했습니다. 이후 실행은 같은 폴더 권한을 사용합니다.");
+    } catch {
+      setProviderSourceScopeError("자료 폴더 권한을 저장하지 못했습니다. 경로와 폴더 접근 상태를 확인하십시오.");
+    } finally {
+      setProviderSourceScopeWriteState("idle");
+    }
+  }, [announce, providerSourceScopePathInput, refreshProviderSourceScopes, selectedAcpProfileId]);
+
+  const revokeProviderSourceRoot = useCallback(async (grantId: string) => {
+    const profileId = selectedAcpProfileId;
+    if (!profileId) return;
+    setProviderSourceScopeWriteState("revoking");
+    setProviderSourceScopeError("");
+    try {
+      await revokeProviderSourceScope(profileId, grantId);
+      await refreshProviderSourceScopes(profileId);
+      announce("자료 폴더 권한을 회수했습니다. 이후 ACP 읽기 요청에는 이 권한이 적용되지 않습니다.");
+    } catch {
+      setProviderSourceScopeError("자료 폴더 권한을 회수하지 못했습니다. 권한 목록을 다시 읽어 확인하십시오.");
+    } finally {
+      setProviderSourceScopeWriteState("idle");
+    }
+  }, [announce, refreshProviderSourceScopes, selectedAcpProfileId]);
 
   const selectAcpProfile = useCallback(async (profileId: string) => {
     const profile = acpProfiles.find((item) => item.id === profileId);
     if (!profile) return;
+    setAuthProfileError(null);
+    setLiveCatalog(null);
+    setLiveCatalogState("idle");
+    setLiveCatalogError(null);
+    setSelectedLiveModelId("");
+    setLiveRequestError(null);
+    setLiveRequestState("idle");
+    pendingLiveRunCommand.current = null;
     try {
       const selection = await setActiveProviderProfile(profile.adapterId, profile.id, providerSelectionRevision.current);
       providerSelectionRevision.current = selection.selectionRevision;
@@ -624,39 +1090,416 @@ export default function App() {
   }, [acpProfiles, announce]);
 
   const validateAcpProfile = useCallback(async (profileId: string) => {
-    setValidatingProfileId(profileId);
+    const profile = acpProfiles.find((item) => item.id === profileId);
+    if (!profile) return;
+    const binding = { profileId, profileRevision: profile.revision };
+    setProviderValidationError(null);
+    setValidatingProfile(binding);
+    setAcpProfiles((profiles) => profiles.map((profile) => profile.id === binding.profileId && profile.revision === binding.profileRevision
+      ? { ...profile, admission: { state: "not_checked" } }
+      : profile));
+    if (selectedProviderProfile?.id === profileId) {
+      setAuthProfileError(null);
+      setAuthProfileErrorBinding(null);
+      setLiveCatalog(null);
+      setLiveCatalogState("idle");
+      setLiveCatalogError(null);
+      setSelectedLiveModelId("");
+      setLiveRequestError(null);
+      setLiveRequestState("idle");
+      pendingLiveRunCommand.current = null;
+    }
     try {
       const result = await validateProviderProfile(profileId);
+      if (result.profileId !== binding.profileId
+        || result.profileRevision !== binding.profileRevision
+        || result.adapterId !== profile.adapterId) {
+        throw new Error("profile_validation_binding_mismatch");
+      }
       const admission = mapProviderAdmission(result);
-      setAcpProfiles((profiles) => profiles.map((profile) => profile.id === profileId ? { ...profile, admission } : profile));
-      announce(result.state === "ready" ? "프로필 인증·홈 바인딩·모델 검증이 확인되었습니다." : result.state === "needs_auth" ? "공식 로그인이 필요합니다. 로그인 후 프로필을 다시 확인합니다." : "프로필 실행 자격이 차단되었습니다. 표시된 사유를 확인하십시오.");
+      setAcpProfiles((profiles) => profiles.map((current) => current.id === profileId && current.revision === binding.profileRevision
+        ? { ...current, admission }
+        : current));
+      setProviderValidationError(null);
+      announce(result.state === "ready" ? "프로필 홈 attestation이 확인되었습니다. 기존 CLI 구독 인증 상태는 별도로 확인하십시오." : "프로필 실행 자격이 차단되었습니다. 표시된 사유를 확인하십시오.");
     } catch {
-      setAcpProfiles((profiles) => profiles.map((profile) => profile.id === profileId ? { ...profile, admission: { state: "not_checked" } } : profile));
+      setAcpProfiles((profiles) => profiles.map((current) => current.id === profileId && current.revision === binding.profileRevision
+        ? { ...current, admission: { state: "not_checked" } }
+        : current));
+      setProviderValidationError({ ...binding, code: "validation_command_failed" });
       announce("프로필 검증 결과를 받지 못했습니다. 이전 검증을 사용하지 않고 실행을 차단했습니다.");
     } finally {
-      setValidatingProfileId((current) => current === profileId ? null : current);
+      setValidatingProfile((current) => current?.profileId === binding.profileId && current.profileRevision === binding.profileRevision ? null : current);
     }
-  }, [announce]);
+  }, [acpProfiles, announce, selectedProviderProfile?.id]);
 
   const authenticateAcpProfile = useCallback(async (profileId: string) => {
     const profile = acpProfiles.find((item) => item.id === profileId);
-    if (profile?.authenticationMethod !== "local_subscription") {
-      announce("공식 ChatGPT 로그인은 구독 연결 프로필에서만 사용할 수 있습니다.");
+    if (!profile || !hasVerifiedProfileHome(profile)
+      || (validatingProfile?.profileId === profileId && validatingProfile.profileRevision === profile.revision)) {
+      announce("프로필 홈 검증을 통과한 뒤 기존 CLI 구독 인증을 확인하십시오.");
       return;
     }
+    if (profile.authenticationMethod !== "local_subscription") {
+      announce("기존 CLI 구독 인증 확인은 구독 연결 프로필에서만 사용할 수 있습니다.");
+      return;
+    }
+    if (activeProviderAuthentication.current) return;
+    const check = coreBindings.beginConnectionCheck(profile.id, profile.revision);
+    const binding = { profileId: profile.id, profileRevision: profile.revision };
+    activeProviderAuthentication.current = binding;
     setAuthenticatingProfileId(profileId);
+    setProviderAuthProgress({ ...binding, stage: "checking_status" });
+    setCancellingProviderAuth(null);
+    setAuthProfileError(null);
+    setAuthProfileErrorBinding(binding);
     try {
-      const result = await authenticateProviderProfile(profileId);
-      const admission = mapProviderAdmission(result);
-      setAcpProfiles((profiles) => profiles.map((profile) => profile.id === profileId ? { ...profile, admission } : profile));
-      announce(result.state === "ready" ? "공식 로그인과 프로필 실행 검증이 완료되었습니다." : result.state === "needs_auth" ? "공식 로그인이 아직 확인되지 않았습니다. 연결은 차단 상태입니다." : "공식 인증 경로가 실행 자격을 확인하지 못했습니다. 표시된 사유를 확인하십시오.");
-    } catch {
-      setAcpProfiles((profiles) => profiles.map((item) => item.id === profileId ? { ...item, admission: { state: "not_checked" } } : item));
-      announce("공식 로그인 결과를 확인하지 못했습니다. 이전 검증을 사용하지 않고 실행을 차단했습니다.");
+      const result = await authenticateProviderProfile(profileId, profile.revision);
+      if (result.profileId !== profile.id || result.profileRevision !== profile.revision || result.providerId !== profile.adapterId) {
+        throw { code: "profile_revision_mismatch", message: "프로필 버전이 바뀌었습니다. 최신 프로필에서 인증 상태를 다시 확인하십시오.", retryable: false };
+      }
+      setAuthProfileError(null);
+      setAuthProfileErrorBinding(null);
+      coreBindings.finishConnectionCheck(check, false);
+      setProviderAuthProgress((current) => current?.profileId === profile.id && current.profileRevision === profile.revision
+        ? { ...binding, stage: result.state === "authenticated" ? "callback_complete" : "failed" }
+        : current);
+      announce(result.state === "authenticated" ? "선택한 CLI 홈의 기존 구독 인증 상태가 확인되었습니다." : result.state === "unauthenticated" ? "선택한 CLI 홈에서 기존 구독 인증을 확인하지 못했습니다. 저장한 인증 홈 경로와 CLI 인증 상태를 확인하십시오." : "이 프로필은 기존 CLI 구독 인증 상태 확인을 지원하지 않습니다.");
+    } catch (error) {
+      coreBindings.finishConnectionCheck(check, false);
+      const normalizedError = normalizeLiveRunError(error);
+      setAuthProfileError(normalizedError);
+      setAuthProfileErrorBinding(binding);
+      setProviderAuthProgress((current) => current?.profileId === profile.id && current.profileRevision === profile.revision
+        ? { ...binding, stage: normalizedError.code === "authentication_cancelled" ? "cancelled" : "failed" }
+        : current);
+      announce("기존 CLI 구독 인증 상태를 확인하지 못했습니다. 이전 결과로 실행을 허용하지 않습니다.");
     } finally {
+      if (activeProviderAuthentication.current?.profileId === binding.profileId
+        && activeProviderAuthentication.current.profileRevision === binding.profileRevision) {
+        activeProviderAuthentication.current = null;
+      }
+      setCancellingProviderAuth((current) => current?.profileId === binding.profileId && current.profileRevision === binding.profileRevision ? null : current);
       setAuthenticatingProfileId((current) => current === profileId ? null : current);
     }
-  }, [acpProfiles, announce]);
+  }, [acpProfiles, announce, validatingProfile, coreBindings.beginConnectionCheck, coreBindings.finishConnectionCheck]);
+
+  const cancelAcpAuthentication = useCallback(async (profileId: string, profileRevision: number) => {
+    const active = activeProviderAuthentication.current;
+    if (!active || active.profileId !== profileId || active.profileRevision !== profileRevision) return;
+    setCancellingProviderAuth({ profileId, profileRevision });
+    try {
+      const cancelled = await cancelProviderAuthentication(profileId, profileRevision);
+      if (!cancelled) {
+        setCancellingProviderAuth((current) => current?.profileId === profileId && current.profileRevision === profileRevision ? null : current);
+        setAuthProfileError({ code: "authentication_not_active", message: "인증 확인 작업이 이미 종료되어 취소할 수 없습니다. 현재 상태를 다시 확인하십시오.", retryable: true });
+        setAuthProfileErrorBinding({ profileId, profileRevision });
+      }
+    } catch (error) {
+      setCancellingProviderAuth((current) => current?.profileId === profileId && current.profileRevision === profileRevision ? null : current);
+      setAuthProfileError(normalizeLiveRunError(error));
+      setAuthProfileErrorBinding({ profileId, profileRevision });
+    }
+  }, []);
+
+  const refreshLiveCatalog = useCallback(async () => {
+    const profile = selectedProviderProfile;
+    const auth = selectedAuthProfileResult;
+    const check = profile ? coreBindings.beginConnectionCheck(profile.id, profile.revision) : null;
+    if (!hasVerifiedProfileHome(profile)
+      || (validatingProfile?.profileId === profile.id && validatingProfile.profileRevision === profile.revision)) {
+      setLiveCatalog(null);
+      setLiveCatalogState("error");
+      if (check) coreBindings.finishConnectionCheck(check, false);
+      setLiveCatalogError({ code: "profile_not_ready", message: "프로필별 전용 홈 검증을 마친 뒤 모델 목록을 가져올 수 있습니다.", retryable: false });
+      return;
+    }
+    if (profile.authenticationMethod !== "local_subscription") {
+      setLiveCatalog(null);
+      setLiveCatalogState("error");
+      if (check) coreBindings.finishConnectionCheck(check, false);
+      setLiveCatalogError({ code: "acp_profile_unsupported", message: "BYOK API 프로필은 공식 Codex App Server ACP 모델 요청을 지원하지 않습니다. 이 경로는 ChatGPT 구독 프로필만 사용합니다.", retryable: false });
+      setSelectedLiveModelId("");
+      setLiveRequestError(null);
+      setLiveRequestState("idle");
+      pendingLiveRunCommand.current = null;
+      return;
+    }
+    if (!auth || auth.profileId !== profile.id || auth.profileRevision !== profile.revision
+      || auth.providerId !== profile.adapterId || auth.state !== "authenticated" || auth.method !== "chat_gpt") {
+      setLiveCatalog(null);
+      setLiveCatalogState("error");
+      if (check) coreBindings.finishConnectionCheck(check, false);
+      setLiveCatalogError({ code: "authentication_required", message: "선택한 CLI 홈의 기존 구독 인증 상태를 확인한 뒤 모델 목록을 가져오십시오.", retryable: false });
+      return;
+    }
+    setLiveCatalogState("loading");
+    setLiveCatalogError(null);
+    setLiveCatalog(null);
+    setSelectedLiveModelId("");
+    setLiveRequestError(null);
+    setLiveRequestState("idle");
+    pendingLiveRunCommand.current = null;
+    try {
+      const state = await refreshProviderCatalog(profile.id, profile.revision);
+      const catalog = state.catalog;
+      if (!catalogHasExecutionAuthority(catalog)) throw new Error("catalog_missing_runtime_authority");
+      if (catalog.providerProfileId !== profile.id
+        || catalog.profileRevision !== profile.revision
+        || catalog.adapterId !== profile.adapterId
+        || catalog.providerId !== profile.adapterId
+        || catalog.acpMode !== "acp") {
+        throw { code: "catalog_binding_mismatch", message: "새 모델 목록이 선택한 프로필 버전과 일치하지 않습니다. 목록을 다시 가져오십시오.", retryable: true };
+      }
+      setLiveCatalog(catalog);
+      setLiveCatalogState("ready");
+      await coreBindings.reload();
+      if (check) coreBindings.finishConnectionCheck(check, true, auth, catalog);
+    } catch (error) {
+      if (check) coreBindings.finishConnectionCheck(check, false);
+      setLiveCatalog(null);
+      setLiveCatalogState("error");
+      setLiveCatalogError(normalizeLiveRunError(error));
+    }
+  }, [selectedAuthProfileResult, selectedProviderProfile, validatingProfile, coreBindings.reload, coreBindings.beginConnectionCheck, coreBindings.finishConnectionCheck]);
+
+  const checkConnection = useCallback(async (profileId: string) => {
+    const profile = profileRevisionsRef.current.find(item => item.id === profileId);
+    if (!profile || profile.authenticationMethod !== "local_subscription" || activeProviderAuthentication.current) return;
+    const check = coreBindings.beginConnectionCheck(profileId, profile.revision);
+    const request = ++connectionCheckSequence.current;
+    const binding = { profileId, profileRevision: profile.revision };
+    const current = () => connectionCheckSequence.current === request && profileRevisionsRef.current.some(item => item.id === profileId && item.revision === profile.revision);
+    activeProviderAuthentication.current = binding;
+    setAuthenticatingProfileId(profileId);
+    setValidatingProfile(binding);
+    setProviderValidationError(null);
+    setAcpProfiles(previous => previous.map(item => item.id === profileId && item.revision === profile.revision ? { ...item, admission: { state: "not_checked" } } : item));
+    setAuthProfileError(null);
+    setAuthProfileErrorBinding(binding);
+    setLiveCatalog(null);
+    setLiveCatalogState("idle");
+    setLiveCatalogError(null);
+    setSelectedLiveModelId("");
+    try {
+      const validated = await validateProviderProfile(profileId);
+      if (!current()) return;
+      if (validated.profileId !== profileId || validated.profileRevision !== profile.revision || validated.adapterId !== profile.adapterId || validated.state !== "ready") throw new Error("profile_validation_failed");
+      setAcpProfiles(previous => previous.map(item => item.id === profileId && item.revision === profile.revision ? { ...item, admission: mapProviderAdmission(validated) } : item));
+      setValidatingProfile(null);
+      setProviderAuthProgress({ ...binding, stage: "checking_status" });
+      const auth = await authenticateProviderProfile(profileId, profile.revision);
+      if (!current()) return;
+      if (auth.profileId !== profileId || auth.profileRevision !== profile.revision || auth.providerId !== profile.adapterId || auth.state !== "authenticated" || auth.method !== "chat_gpt") throw new Error("subscription_authentication_failed");
+      setProviderAuthProgress({ ...binding, stage: "callback_complete" });
+      setLiveCatalogState("loading");
+      const result = await refreshProviderCatalog(profileId, profile.revision);
+      const catalog = result.catalog;
+      if (!catalogHasExecutionAuthority(catalog)) throw new Error("catalog_missing_runtime_authority");
+      if (!current()) return;
+      if (catalog.providerProfileId !== profileId || catalog.profileRevision !== profile.revision || catalog.adapterId !== profile.adapterId || catalog.providerId !== profile.adapterId || catalog.acpMode !== "acp") throw new Error("catalog_binding_mismatch");
+      setLiveCatalog(catalog);
+      setLiveCatalogState("ready");
+      setAuthProfileErrorBinding(null);
+      await coreBindings.reload();
+      if (!current()) return;
+      coreBindings.finishConnectionCheck(check, true, auth, catalog);
+      announce("기존 구독 인증과 실제 모델 목록을 확인했습니다.");
+    } catch (error) {
+      if (!current()) return;
+      coreBindings.finishConnectionCheck(check, false);
+      const failure = normalizeLiveRunError(error);
+      setAuthProfileError(failure);
+      setAuthProfileErrorBinding(binding);
+      setProviderAuthProgress({ ...binding, stage: "failed" });
+      setLiveCatalog(null);
+      setLiveCatalogState("error");
+      setLiveCatalogError(failure);
+      announce("연결 확인에 실패했습니다. 프로필 경로와 표시된 오류를 확인하십시오.");
+    } finally {
+      if (connectionCheckSequence.current === request) {
+        activeProviderAuthentication.current = null;
+        setAuthenticatingProfileId(null);
+        setValidatingProfile(null);
+      }
+    }
+  }, [announce, coreBindings.reload, coreBindings.beginConnectionCheck, coreBindings.finishConnectionCheck]);
+
+  useEffect(() => {
+    if (acpProfilesState !== "ready" || activeProviderAuthentication.current) return;
+    const profile = coreBindings.cores
+      .map(core => profileRevisionsRef.current.find(item => item.id === core.selection?.providerProfileId))
+      .find(item => item?.authenticationMethod === "local_subscription" && !automaticConnectionChecks.current.has(`${item.id}:${item.revision}`));
+    if (!profile) return;
+    automaticConnectionChecks.current.add(`${profile.id}:${profile.revision}`);
+    void checkConnection(profile.id).finally(() => setAutomaticCheckStep(step => step + 1));
+  }, [acpProfilesState, acpProfiles, coreBindings.cores, checkConnection, authenticatingProfileId, automaticCheckStep]);
+
+  const changeSelectedLiveModelId = useCallback((modelId: string) => {
+    setSelectedLiveModelId(modelId);
+    setLiveRequestError(null);
+    setLiveRequestState((current) => current === "starting" ? current : "idle");
+  }, []);
+
+  const changeLiveQuestion = useCallback((question: string) => {
+    setLiveQuestion(question);
+    setLiveRequestError(null);
+    setLiveRequestState((current) => current === "starting" ? current : "idle");
+  }, []);
+
+  const startLiveProviderRun = useCallback(async () => {
+    const profile = selectedProviderProfile;
+    const catalog = liveCatalog;
+    const auth = selectedAuthProfileResult;
+    const prompt = liveQuestion.trim();
+    const model = catalog?.models.find((entry) => entry.modelId === selectedLiveModelId);
+    if (profile?.authenticationMethod === "byok_api") {
+      pendingLiveRunCommand.current = null;
+      setLiveRequestError({ code: "acp_profile_unsupported", message: "이 요청은 기존 CLI 구독 인증 홈을 가진 ACP 프로필을 요구합니다. 구독 연결 프로필을 선택하십시오.", retryable: false });
+      setLiveRequestState("error");
+      return;
+    }
+    const admitted = hasVerifiedProfileHome(profile)
+      && !(profile && validatingProfile?.profileId === profile.id && validatingProfile.profileRevision === profile.revision);
+    const catalogMatches = Boolean(profile && catalog
+      && catalog.providerProfileId === profile.id
+      && catalog.profileRevision === profile.revision
+      && catalog.providerId === profile.adapterId
+      && catalog.adapterId === profile.adapterId
+      && catalog.acpMode === "acp");
+    const authMatches = Boolean(profile && auth
+      && auth.profileId === profile.id
+      && auth.profileRevision === profile.revision
+      && auth.providerId === profile.adapterId
+      && auth.state === "authenticated"
+      && auth.method === "chat_gpt");
+
+    const savedBinding = profile ? coreBindings.catalogs[profile.id]?.modelSelection?.binding : undefined;
+    const selectedMode = savedBinding?.catalogSnapshotId === catalog?.catalogSnapshotId
+      && savedBinding?.catalogDigest === catalog?.catalogDigest
+      && savedBinding?.artifactSetDigest === catalog?.artifactSetDigest
+      && savedBinding?.modelId === model?.modelId ? savedBinding?.modeId : undefined;
+    const modeReady = catalog?.negotiatedModes && (catalog.negotiatedModes.modes.length
+      ? catalog.negotiatedModes.modes.some(mode => mode.modeId === selectedMode)
+      : catalog.negotiatedModes.currentModeId === null && selectedMode == null);
+    if (!profile || !catalogHasExecutionAuthority(catalog) || !admitted || !catalogMatches || !authMatches || !model || !prompt || !modeReady) {
+      setLiveRequestError({ code: "request_precondition_failed", message: "인증 상태, 프로필 검증, 최신 모델 선택, 질문을 확인하십시오.", retryable: false });
+      setLiveRequestState("error");
+      return;
+    }
+
+    const modelBinding: AcpModelBindingInput = {
+      schemaVersion: catalog.schemaVersion,
+      catalogSnapshotId: catalog.catalogSnapshotId,
+      catalogDigest: catalog.catalogDigest,
+      providerId: catalog.providerId,
+      acpMode: catalog.acpMode,
+      providerProfileId: catalog.providerProfileId,
+      profileRevision: catalog.profileRevision,
+      adapterId: catalog.adapterId,
+      adapterVersion: catalog.adapterVersion,
+      adapterDigest: catalog.adapterDigest,
+      artifactSetDigest: catalog.artifactSetDigest,
+      modelId: model.modelId,
+      modeId: selectedMode ?? null,
+    };
+    const previousCommand = pendingLiveRunCommand.current;
+    const canReplay = previousCommand
+      && previousCommand.question === prompt
+      && previousCommand.modelBinding.catalogSnapshotId === modelBinding.catalogSnapshotId
+      && previousCommand.modelBinding.catalogDigest === modelBinding.catalogDigest
+      && previousCommand.modelBinding.artifactSetDigest === modelBinding.artifactSetDigest
+      && previousCommand.modelBinding.modeId === modelBinding.modeId
+      && previousCommand.modelBinding.modelId === modelBinding.modelId;
+    const command: StartLiveRunInput = canReplay ? previousCommand : {
+      commandId: crypto.randomUUID(),
+      idempotencyKey: crypto.randomUUID(),
+      question: prompt,
+      modelBinding,
+    };
+    pendingLiveRunCommand.current = command;
+    setLiveRequestState("starting");
+    setLiveRequestError(null);
+    try {
+      const receipt = await startLiveRun(command);
+      pendingLiveRunCommand.current = null;
+      pendingLiveCancellation.current = null;
+      liveCancelFence.current = null;
+      setLiveCancelRequest(null);
+      activeLiveRunIdRef.current = receipt.runId;
+      liveRunCursor.current = { runId: receipt.runId, storeId: null, storeGeneration: null, afterSequence: 0, revision: -1 };
+      setLiveRunId(receipt.runId);
+      setLiveRunSnapshot(null);
+      setLiveRunTextDeltas([]);
+      setLiveSnapshotError(null);
+      setLiveRequestState("accepted");
+      setLiveRequestError(null);
+      try {
+        window.localStorage.setItem(liveRunStorageKey, receipt.runId);
+      } catch {
+        // The durable run remains available through its returned ID and the CLI query command.
+      }
+      void refreshLiveRunSnapshot(receipt.runId);
+    } catch (error) {
+      const safeError = normalizeLiveRunError(error);
+      if (!safeError.retryable) pendingLiveRunCommand.current = null;
+      setLiveRequestError(safeError);
+      setLiveRequestState("error");
+    }
+  }, [coreBindings.catalogs, selectedAuthProfileResult, liveCatalog, liveQuestion, refreshLiveRunSnapshot, selectedLiveModelId, selectedProviderProfile, validatingProfile]);
+
+  const cancelLiveProviderRun = useCallback(async (runId: string) => {
+    if (liveCancellationInFlight.current === runId
+      || (liveCancelRequest?.runId === runId && liveCancelRequest.state !== "error")) return;
+
+    liveCancellationInFlight.current = runId;
+    setLiveCancelRequest({ runId, state: "sending" });
+    try {
+      const snapshot = liveRunSnapshot?.runId === runId
+        ? liveRunSnapshot
+        : await getLiveRunSnapshot(runId, 0);
+      if (snapshot.runId !== runId) {
+        throw { code: "live_run_id_mismatch", message: "저장된 요청 상태가 선택한 실행과 일치하지 않습니다.", retryable: true };
+      }
+      if (!isLiveRunCancelable(snapshot.status)) {
+        setLiveCancelRequest({
+          runId,
+          state: "error",
+          error: { code: "live_run_not_cancelable", message: "저장된 실행 상태가 이미 취소 요청을 받았거나 종료되었습니다. 최신 상태를 확인하십시오.", retryable: false },
+        });
+        void refreshLiveRunSnapshot(runId);
+        return;
+      }
+
+      const existing = pendingLiveCancellation.current;
+      const command: CancelLiveRunInput = existing?.runId === runId ? existing : {
+        commandId: crypto.randomUUID(),
+        idempotencyKey: crypto.randomUUID(),
+        runId,
+        expectedRevision: snapshot.revision,
+      };
+      pendingLiveCancellation.current = command;
+      const receipt = await cancelLiveRun(command);
+      if (receipt.runId !== runId || receipt.eventCursor.runId !== runId) {
+        throw { code: "live_run_cancel_receipt_mismatch", message: "취소 접수 결과가 선택한 실행과 일치하지 않습니다. 저장 상태를 다시 확인하십시오.", retryable: true };
+      }
+      liveCancelFence.current = {
+        runId,
+        storeId: receipt.eventCursor.storeId,
+        storeGeneration: receipt.eventCursor.storeGeneration,
+        afterSequence: receipt.eventCursor.highWaterSequence,
+      };
+      setLiveCancelRequest({ runId, state: "accepted" });
+      announce(receipt.status === "completed"
+        ? "취소보다 먼저 실행이 완료되었습니다. 저장된 결과를 다시 확인합니다."
+        : `취소 명령을 저장했습니다. provider 상태 · ${receipt.providerOutcome === "confirmed" ? "정지 확인됨" : receipt.providerOutcome === "pending" ? "정지 확인 중" : receipt.providerOutcome === "not_started" ? "provider 요청 전 취소" : "미확인"}.`);
+      void refreshLiveRunSnapshot(runId);
+    } catch (error) {
+      setLiveCancelRequest({ runId, state: "error", error: normalizeLiveRunError(error) });
+    } finally {
+      if (liveCancellationInFlight.current === runId) liveCancellationInFlight.current = null;
+    }
+  }, [announce, liveCancelRequest, liveRunSnapshot, refreshLiveRunSnapshot]);
 
   const selectRolePreset = useCallback(async (presetId: string) => {
     try {
@@ -738,36 +1581,67 @@ export default function App() {
   const queuePreferenceSave = useCallback((preferences: ConsolePreferences) => {
     preferenceSaveQueue.current = preferenceSaveQueue.current
       .catch(() => undefined)
-      .then(() => saveConsolePreferences(preferences))
+      .then(async () => {
+        await saveConsolePreferences(preferences);
+        for (const field of changedPreferenceFields.current) {
+          if (preferencesRef.current[field] === preferences[field]) changedPreferenceFields.current.delete(field);
+        }
+        preferenceReadGeneration.current++;
+        await reloadPreferences.current?.();
+      })
       .catch(() => announce("콘솔 설정을 저장하지 못했습니다. 현재 화면의 선택은 유지됩니다."));
   }, [announce]);
 
   useEffect(() => {
     let disposed = false;
-    void getConsolePreferences().then((saved) => {
-      if (disposed) return;
-      const current = preferencesRef.current;
-      const resolved: ConsolePreferences = { ...preferenceDefaults, ...saved };
-      if (resolved.language !== "ko") changedPreferenceFields.current.add("language");
-      resolved.language = "ko";
-      if (changedPreferenceFields.current.has("motion")) resolved.motion = current.motion;
-      if (changedPreferenceFields.current.has("sound")) resolved.sound = current.sound;
-      if (changedPreferenceFields.current.has("theme")) resolved.theme = current.theme;
-      if (changedPreferenceFields.current.has("fontScale")) resolved.fontScale = current.fontScale;
-      preferencesRef.current = resolved;
-      setMotion(resolved.motion);
-      setSound(resolved.sound);
-      setTheme(resolved.theme);
-      setFontScale(resolved.fontScale);
-      preferencesReady.current = true;
-      if (changedPreferenceFields.current.size > 0 || saved?.language !== "ko") queuePreferenceSave(resolved);
-    }).catch(() => {
-      if (disposed) return;
-      preferencesReady.current = true;
-      announce("저장된 콘솔 설정을 읽지 못했습니다. OS 동작 설정과 기본 테마를 사용합니다.");
-      if (changedPreferenceFields.current.size > 0) queuePreferenceSave(preferencesRef.current);
-    });
-    return () => { disposed = true; };
+    let unlisten: (() => void) | undefined;
+    async function reload() {
+      const generation = ++preferenceReadGeneration.current;
+      const initial = !preferencesReady.current;
+      try {
+        const saved = await getConsolePreferences();
+        if (saved !== null && (!saved || !["full", "reduced", "off"].includes(saved.motion)
+          || typeof saved.sound !== "boolean" || !["command", "clear"].includes(saved.theme)
+          || ![100, 125, 150, 200].includes(saved.fontScale) || !["ko", "en"].includes(saved.language))) {
+          throw new Error("Invalid console preferences.");
+        }
+        if (disposed || generation !== preferenceReadGeneration.current) return;
+        const current = preferencesRef.current;
+        const resolved: ConsolePreferences = { ...preferenceDefaults, ...saved };
+        if (resolved.language !== "ko") changedPreferenceFields.current.add("language");
+        resolved.language = "ko";
+        if (changedPreferenceFields.current.has("motion")) resolved.motion = current.motion;
+        if (changedPreferenceFields.current.has("sound")) resolved.sound = current.sound;
+        if (changedPreferenceFields.current.has("theme")) resolved.theme = current.theme;
+        if (changedPreferenceFields.current.has("fontScale")) resolved.fontScale = current.fontScale;
+        preferencesRef.current = resolved;
+        setMotion(resolved.motion);
+        setSound(resolved.sound);
+        setTheme(resolved.theme);
+        setFontScale(resolved.fontScale);
+        preferencesReady.current = true;
+        if (initial && (changedPreferenceFields.current.size > 0 || saved?.language !== "ko")) queuePreferenceSave(resolved);
+      } catch {
+        if (disposed || generation !== preferenceReadGeneration.current) return;
+        preferencesReady.current = true;
+        announce("저장된 콘솔 설정을 읽지 못했습니다. 현재 화면의 선택은 유지됩니다.");
+        if (initial && changedPreferenceFields.current.size > 0) queuePreferenceSave(preferencesRef.current);
+      }
+    }
+    reloadPreferences.current = reload;
+    void (async () => {
+      try {
+        const stop = await listenShellEvent("magi:preferences-changed", () => { if (!disposed) void reload(); });
+        if (disposed) stop(); else unlisten = stop;
+      } catch { if (!disposed) announce("다른 창의 설정 변경을 확인하지 못했습니다."); }
+      if (!disposed) await reload();
+    })();
+    return () => {
+      disposed = true;
+      preferenceReadGeneration.current++;
+      if (reloadPreferences.current === reload) reloadPreferences.current = null;
+      unlisten?.();
+    };
   }, [announce, preferenceDefaults, queuePreferenceSave]);
 
   const changeMotion = useCallback((value: MotionSetting) => {
@@ -815,8 +1689,73 @@ export default function App() {
     navigate("confirmation");
   };
 
+  const sendAdmissionCancellation = async (flow: NonNullable<typeof admissionFlow.current>): Promise<void> => {
+    if (!flow.cancellation || flow.receipt) return;
+    if (flow.cancellationInFlight) {
+      const pending = flow.cancellationInFlight;
+      await pending;
+      if (flow.receipt) return;
+      if (flow.cancellationInFlight === pending) flow.cancellationInFlight = null;
+      if (flow.cancellationInFlight) return sendAdmissionCancellation(flow);
+    }
+    const authority = flow.authority;
+    const input = { ...flow.cancellation, ...(authority ? { admissionAuthority: authority } : {}) };
+    const operation = (async () => {
+      try {
+        const receipt = flow.clarification ? await cancelClarificationRequest({ ...input, request: flow.clarification }) : await cancelDeliberationRequest(input);
+        const fence = receipt.requestCancellation;
+        if (fence.schemaVersion !== 1 || fence.commandId !== input.commandId || fence.idempotencyKey !== input.idempotencyKey
+          || fence.request.commandId !== flow.request.commandId || fence.request.idempotencyKey !== flow.request.idempotencyKey
+          || !/^[0-9a-f]{64}$/i.test(fence.request.intentDigest) || !Number.isFinite(Date.parse(fence.acceptedAt))
+          || (receipt.runCancellation && receipt.runCancellation.runId !== fence.admittedRunId)) {
+          throw new Error("Cancellation receipt does not match the original request.");
+        }
+        flow.receipt = receipt;
+        if (admissionFlow.current !== flow) return;
+        setAdmissionCancellation("accepted");
+        setRunStartState("idle");
+        announce("취소 의도가 저장되었습니다. 이미 시작된 심의의 종료 여부는 저장 상태로 확인합니다.");
+        if (receipt.runCancellation) setCancelRequest({ runId: receipt.runCancellation.runId, state: "sent" });
+      } catch {
+        if (admissionFlow.current !== flow) return;
+        setAdmissionCancellation(flow.registrationPending ? "pending" : "error");
+        announce(flow.registrationPending ? "취소 의도를 유지하고 있습니다. 등록 결과와 실제 저장 응답을 기다립니다." : "취소 저장 응답을 확인하지 못했습니다. 같은 요청으로 다시 확인하십시오.");
+      }
+    })();
+    flow.cancellationInFlight = operation;
+    await operation;
+    if (flow.cancellationInFlight === operation) flow.cancellationInFlight = null;
+  };
+
+  const requestAdmissionCancellation = () => {
+    const flow = admissionFlow.current;
+    if (!flow || flow.receipt) return;
+    setDialog({
+      title: "심의 시작 요청 취소",
+      body: "이 시작 요청의 취소 의도를 저장합니다. 이미 시작된 코어 작업의 중단 여부는 실제 실행 상태로 확인합니다.",
+      confirm: { label: "취소 의도 저장", danger: true, action: () => {
+        if (admissionFlow.current !== flow) return;
+        flow.cancellation ??= { request: flow.request, commandId: crypto.randomUUID(), idempotencyKey: crypto.randomUUID() };
+        setAdmissionCancellation("pending");
+        void sendAdmissionCancellation(flow);
+      } },
+    });
+  };
+
   const askToStart = async () => {
-    if (runStartState === "starting") return;
+    if (runStartState === "starting" || admissionFlow.current?.inFlight) return;
+    if (admissionFlow.current?.cancellation && !admissionFlow.current.receipt) {
+      setRunStartError("원래 요청의 취소 저장 응답을 먼저 확인하십시오. 취소 의도를 새 요청으로 덮어쓰지 않습니다.");
+      return;
+    }
+    if (clarificationDraft && !currentClarificationDraft) {
+      setRunStartError("자식 초안의 정확한 일시정지 부모 상태를 다시 확인하십시오.");
+      return;
+    }
+    if (currentClarificationDraft && (question !== currentClarificationDraft.question || contextSelection?.draftId !== currentClarificationDraft.context.draftId || contextSelection.revision !== currentClarificationDraft.context.revision)) {
+      setRunStartError("자식 질문과 자료의 같은 저장 revision을 다시 확인하십시오.");
+      return;
+    }
     if (!question.trim()) {
       setRunStartError("심의할 질문을 입력하십시오.");
       setRunStartState("error");
@@ -827,22 +1766,10 @@ export default function App() {
       setRunStartState("error");
       return;
     }
-    if (!selectedProviderProfile) {
-      setRunStartError("먼저 ACP 연결 프로필을 선택하십시오.");
+    if (!coreBindings.canStart()) {
+      setRunStartError("세 코어의 저장된 프로필·모델 연결을 확인하십시오.");
       setRunStartState("error");
-      navigate("provider");
-      return;
-    }
-    const selectedAdmission = selectedProviderProfile.admission;
-    const selectedAdapter = acpAdapters.find((adapter) => adapter.id === selectedProviderProfile.adapterId);
-    if (selectedAdmission.state !== "admitted"
-      || selectedAdmission.profileId !== selectedProviderProfile.id
-      || selectedAdmission.adapterId !== selectedProviderProfile.adapterId
-      || selectedAdmission.rootBinding !== "verified"
-      || selectedAdapter?.state !== "supported") {
-      setRunStartError(selectedAdmission.state === "needs_auth" ? "선택한 프로필에서 공식 로그인을 완료하십시오." : "선택한 프로필의 런타임 검증을 완료하십시오.");
-      setRunStartState("error");
-      navigate("provider");
+      navigate("connections");
       return;
     }
     if (!selectedRolePreset || rolePresetsState !== "ready") {
@@ -856,7 +1783,7 @@ export default function App() {
       (activeRun && !["completed", "cancelled", "failed"].includes(activeRun.status))
         || (currentRunId && !currentRunTerminal),
     );
-    if (existingRunActive) {
+    if (existingRunActive && !currentClarificationDraft) {
       setRunStartError("이미 진행 중인 심의가 있습니다. 해당 심의 상태를 확인하십시오.");
       setRunStartState("error");
       return;
@@ -867,32 +1794,88 @@ export default function App() {
       return;
     }
 
+    const bindings = coreBindings.destinations.flatMap(item => item.reference ? [item.reference] : []);
+    const previousCommand = pendingDeliberationCommand.current;
+    const reusableCommand = previousCommand
+      && previousCommand.question === question
+      && previousCommand.contextDraftId === (contextSelection?.draftId ?? null)
+      && previousCommand.contextRevision === (contextSelection?.revision ?? null)
+      && previousCommand.rolePresetId === selectedRolePreset.id
+      && previousCommand.roleRevision === selectedRolePreset.revision
+      && JSON.stringify(previousCommand.coreBindings) === JSON.stringify(bindings);
+    const command: StartDeliberationInput = reusableCommand ? previousCommand : {
+      commandId: crypto.randomUUID(), idempotencyKey: crypto.randomUUID(), question,
+      contextDraftId: contextSelection?.draftId ?? null, contextRevision: contextSelection?.revision ?? null,
+      rolePresetId: selectedRolePreset.id, roleRevision: selectedRolePreset.revision,
+      coreBindings: bindings, disclosureConfirmed: true,
+    };
+    if (admissionFlow.current?.request === command && admissionFlow.current.cancellation) {
+      setRunStartError("이 시작 요청의 취소 의도가 유지되고 있습니다. 취소 응답과 저장 상태를 확인하십시오.");
+      return;
+    }
+    pendingDeliberationCommand.current = command;
+    const clarification: ClarificationStartInput | null = currentClarificationDraft ? { parent: currentClarificationDraft.parent, contextDraftId: currentClarificationDraft.context.draftId, contextDraftRevision: currentClarificationDraft.context.revision, request: command } : null;
+    const flow = { request: command, clarification, authority: null as AdmissionAuthority | null, cancellation: null as CancelDeliberationRequestInput | null, receipt: null as CancelDeliberationRequestReceipt | null, cancellationInFlight: null as Promise<void> | null, registrationPending: true, inFlight: true };
+    admissionFlow.current = flow;
+    setAdmissionCancellation("idle");
     setRunStartState("starting");
     setRunStartError("");
     try {
-      const started = await startDeliberation({
-        question,
-        contextDraftId: contextSelection?.draftId ?? null,
-        contextRevision: contextSelection?.revision ?? null,
-        providerProfileId: selectedProviderProfile.id,
-        rolePresetId: selectedRolePreset.id,
-        roleRevision: selectedRolePreset.revision,
-        disclosureConfirmed: true,
-      });
+      const registration = clarification ? await registerClarificationRequest(clarification) : await registerDeliberationRequest(command);
+      flow.registrationPending = false;
+      if (registration.kind === "registered") {
+        flow.authority = { token: registration.admissionAuthority.token, processEpoch: registration.admissionAuthority.processEpoch };
+      }
+      if (admissionFlow.current !== flow) {
+        flow.cancellation ??= { request: flow.request, commandId: crypto.randomUUID(), idempotencyKey: crypto.randomUUID() };
+        await sendAdmissionCancellation(flow);
+        return;
+      }
+      if (flow.cancellation) {
+        await sendAdmissionCancellation(flow);
+        if (registration.kind !== "replayed") return;
+      }
+      if (admissionFlow.current !== flow) return;
+      const started = registration.kind === "replayed" ? registration.receipt
+        : clarification ? await startClarification(clarification, flow.authority!) : await startDeliberation({ ...command, admissionAuthority: flow.authority! });
+      if (flow.cancellation) await sendAdmissionCancellation(flow);
+      if (admissionFlow.current !== flow) return;
+      if (!flow.cancellation) pendingDeliberationCommand.current = null;
       activeRunIdRef.current = started.runId;
       selectedRunIdRef.current = started.runId;
+      if (clarification) setClarificationDraft(null);
       setAcceptedRunId(started.runId);
       setSelectedRunId(started.runId);
       setRunProgress(null);
       setRunDossier(null);
       setRunDossierState("loading");
-      setCancelRequest(null);
+      if (!flow.cancellation) setCancelRequest(null);
       setRunStartState("idle");
       setDisclosureConfirmed(false);
-      announce("심의 시작 요청이 접수되었습니다. 실제 실행 단계 이벤트를 기다립니다.");
-    } catch {
+      announce(flow.cancellation ? "실제 실행 기록이 확인되었습니다. 취소 저장 응답과 종료 상태를 확인합니다." : "심의 시작 요청이 접수되었습니다. 실제 실행 단계 이벤트를 기다립니다.");
+    } catch (error) {
+      flow.registrationPending = false;
+      if (admissionFlow.current !== flow) return;
+      if (flow.cancellation) {
+        await sendAdmissionCancellation(flow);
+        if (admissionFlow.current !== flow) return;
+        if (!flow.receipt) setRunStartState("error");
+        setRunStartError(flow.receipt ? "취소 의도가 저장되어 이 시작 요청은 다시 실행하지 않습니다." : "취소 의도를 유지하고 있습니다. 취소 저장 응답을 다시 확인하십시오.");
+        return;
+      }
+      const binding = authenticationFailureBinding(error);
+      if (binding) coreBindings.invalidateAuthentication(binding);
       setRunStartState("error");
-      setRunStartError("심의 시작 요청이 거부되었습니다. 연결·역할·입력 revision을 다시 확인하십시오.");
+      const code = normalizeLiveRunError(error).code;
+      const authorityErrors: Record<string, string> = {
+        admission_authority_expired: "시작 권한이 만료되었습니다. 원래 요청으로 등록 결과를 다시 확인하십시오.",
+        admission_authority_invalid: "시작 권한과 원래 요청이 일치하지 않습니다. 실행하지 않고 요청을 유지합니다.",
+        admission_request_cancelled: "취소 의도가 저장된 요청입니다. 이 요청은 다시 실행하지 않습니다.",
+      };
+      setRunStartError(authorityErrors[code] ?? "심의 시작 요청이 거부되었습니다. 연결·역할·입력 revision을 다시 확인하십시오.");
+    } finally {
+      flow.registrationPending = false;
+      flow.inFlight = false;
     }
   };
 
@@ -920,6 +1903,7 @@ export default function App() {
       const dossier = await loadRunDossier(runId);
       if (dossier.runId !== runId) throw new Error("Run dossier mismatch.");
       if (refreshCurrent) {
+        observeAuthenticationFailure(`deliberation:${dossier.runId}:${dossier.error?.code}`, dossier.error);
         setRunDossier(dossier);
         setRunDossierState("ready");
       }
@@ -960,6 +1944,12 @@ export default function App() {
   const toggleSound = () => {
     changeSound(!sound);
     announce(sound ? "콘솔 음향을 껐습니다." : "콘솔 음향을 켰습니다. 짧은 미리보기만 재생합니다.");
+  };
+
+  const acceptPdfCapture = (next: ContextSelectionSummary) => {
+    setContextSelection(next);
+    setDisclosureConfirmed(false);
+    announce("선택한 PDF 페이지를 접수했습니다. 모델 전송은 시작되지 않았습니다.");
   };
 
   const chooseContextFiles = async () => {
@@ -1060,11 +2050,11 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [shellContext?.windowLabel, closeStatusCompanion]);
 
-  const connectionLabel = snapshot.connection === "ready"
-    ? "연결 확인됨"
+  const connectionLabel = snapshot.connection === "runtime_available"
+    ? "실행 환경 확인됨"
     : snapshot.connection === "blocked"
-      ? "연결 차단됨"
-      : "연결 미확인";
+      ? "실행 환경 차단됨"
+      : "실행 환경 미확인";
   const storageLabel = snapshot.storage === "ready"
     ? "로컬 기록 준비됨"
     : snapshot.storage === "error"
@@ -1082,10 +2072,11 @@ export default function App() {
         본문으로 건너뛰기
       </a>
       <header className="console-header">
-        <div className="window-control-safe-area" aria-hidden="true" />
         <h1 className="console-title">
-          <span className="title-long">MAGI COMMAND CONSOLE</span>
-          <span className="title-short">MAGI CONSOLE</span>
+          <button type="button" className="console-brand-link" aria-label="MAGI COMMAND CONSOLE 홈으로 이동" onClick={() => navigate("home")}>
+            <span className="title-long">MAGI COMMAND CONSOLE</span>
+            <span className="title-short">MAGI CONSOLE</span>
+          </button>
         </h1>
         <div className="console-edition" aria-label="팬 창작 데스크톱 앱">
           <span>MACOS</span>
@@ -1096,6 +2087,7 @@ export default function App() {
           <button type="button" onClick={() => navigate("history")}>
             기록
           </button>
+          <button type="button" onClick={() => navigate("connections")}>모델 연결</button>
           <button type="button" onClick={() => navigate("settings")}>
             설정
           </button>
@@ -1158,14 +2150,23 @@ export default function App() {
           theme={theme}
           snapshot={snapshot}
           homeData={homeData}
+          evidenceReadingTarget={evidenceReadingTarget}
+          onEvidenceReadingTargetChange={setEvidenceReadingTarget}
           selectedRunId={selectedRunId}
           selectedRunDossier={selectedRunDossier}
           selectedRunDossierState={selectedRunDossierState}
           currentRunId={currentRunId}
           runProgress={currentRunProgress}
+          onClarificationParentVerified={setVerifiedClarificationParent}
+          onDiscardClarificationDraft={(action) => setDialog({ title: "자식 초안 삭제", body: "저장된 자식 질문과 초안을 삭제합니다. 부모 심의와 검토는 유지됩니다. 작성 중인 변경도 버립니다.", confirm: { label: "초안 삭제", danger: true, action } })}
+          clarificationDraft={currentClarificationDraft}
+          onClarificationDraftChanged={(draft) => { setClarificationDraft(draft); if (draft) { setQuestion(draft.question); setContextSelection(draft.context); } else { setQuestion(currentRunDossier?.question ?? ""); setContextSelection(null); } setDisclosureConfirmed(false); }}
+          onConfirmClarificationDraft={(draft) => { if (draft.parent.runId !== currentRunId || currentRunDossier?.status !== "paused") { setRunStartError("자식 초안의 부모 상태를 현재 저장 기록에서 확인하십시오."); return; } setClarificationDraft(draft); setQuestion(draft.question); setContextSelection(draft.context); setDisclosureConfirmed(false); navigate("confirmation"); }}
           runDossier={currentRunDossier}
           runDossierState={runDossierState}
           runStartState={runStartState}
+          admissionCancellation={admissionCancellation}
+          onCancelAdmission={requestAdmissionCancellation}
           runStartError={runStartError}
           disclosureConfirmed={disclosureConfirmed}
           cancelRequest={cancelRequest}
@@ -1175,12 +2176,37 @@ export default function App() {
           acpProfilesState={acpProfilesState}
           acpProfiles={acpProfiles}
           selectedAcpProfileId={selectedAcpProfileId}
+          providerSourceScopes={providerSourceScopes}
+          providerSourceScopesState={providerSourceScopesState}
+          providerSourceScopePathInput={providerSourceScopePathInput}
+          providerSourceScopeWriteState={providerSourceScopeWriteState}
+          providerSourceScopeError={providerSourceScopeError}
           selectedProviderProfile={selectedProviderProfile ?? null}
           authenticatingProfileId={authenticatingProfileId}
-          validatingProfileId={validatingProfileId}
+          providerAuthProgress={providerAuthProgress}
+          cancellingProviderAuth={cancellingProviderAuth}
+          validatingProfile={validatingProfile}
+          providerValidationError={providerValidationError}
+          authProfileResult={selectedAuthProfileResult}
+          authProfileError={authProfileError}
+          authProfileErrorBinding={authProfileErrorBinding}
+          liveCatalog={selectedLiveCatalog}
+          liveCatalogState={liveCatalogState}
+          liveCatalogError={liveCatalogError}
+          coreBindings={coreBindings}
+          selectedLiveModelId={selectedLiveModelId}
+          liveQuestion={liveQuestion}
+          liveRunId={liveRunId}
+          liveRunSnapshot={currentLiveRunSnapshot}
+          liveRunText={currentLiveRunText}
+          liveSnapshotError={liveSnapshotError}
+          liveRequestState={liveRequestState}
+          liveRequestError={liveRequestError}
+          liveCancelRequest={liveCancelRequest}
           acpProfileDraft={acpProfileDraft}
           acpProfileWriteState={acpProfileWriteState}
           rolePresetsState={rolePresetsState}
+          roleStoreDiagnostic={roleStoreDiagnostic}
           rolePresets={rolePresets}
           selectedRolePresetId={selectedRolePresetId}
           selectedRolePreset={selectedRolePreset ?? null}
@@ -1190,6 +2216,16 @@ export default function App() {
           onNavigate={navigate}
           onOpenCore={openCore}
           onOpenRecentRun={openRecentRun}
+          onRecordDeleted={(runId) => {
+            setEvidenceReadingTarget((target) => target?.runId === runId ? null : target);
+            setHomeData((previous) => ({ ...previous, recentRuns: previous.recentRuns.filter((run) => run.id !== runId) }));
+            if (selectedRunIdRef.current !== runId) return;
+            selectedRunIdRef.current = null;
+            setSelectedRunId(null);
+            setSelectedRunDossier(null);
+            setSelectedRunDossierState("idle");
+            announce("선택한 기록을 삭제했습니다.");
+          }}
           onBeginAcpProfileCreate={beginAcpProfileCreate}
           onBeginAcpProfileEdit={beginAcpProfileEdit}
           onAcpProfileDraftChange={setAcpProfileDraft}
@@ -1197,7 +2233,22 @@ export default function App() {
           onSelectAcpProfile={(profileId) => { void selectAcpProfile(profileId); }}
           onValidateAcpProfile={(profileId) => { void validateAcpProfile(profileId); }}
           onAuthenticateAcpProfile={(profileId) => { void authenticateAcpProfile(profileId); }}
+          onCancelProviderAuth={(profileId, profileRevision) => { void cancelAcpAuthentication(profileId, profileRevision); }}
+          onProviderSourceScopePathInputChange={setProviderSourceScopePathInput}
+          onPickProviderSourceDirectory={() => { void chooseProviderSourceDirectory(); }}
+          onAddProviderSourceScope={() => { void addProviderSourceRoot(); }}
+          onRevokeProviderSourceScope={(grantId) => { void revokeProviderSourceRoot(grantId); }}
+          onRefreshLiveCatalog={() => { void refreshLiveCatalog(); }}
+          onSelectedLiveModelIdChange={changeSelectedLiveModelId}
+          onLiveQuestionChange={changeLiveQuestion}
+          onStartLiveRun={() => { void startLiveProviderRun(); }}
+          onCancelLiveRun={(runId) => { void cancelLiveProviderRun(runId); }}
           onSelectRolePreset={(presetId) => { void selectRolePreset(presetId); }}
+          onRetryRolePresets={() => { void reloadRolePresets(); }}
+          onCheckConnection={(profileId) => { void checkConnection(profileId); }}
+          onReturnFromConnections={() => navigate(connectionReturnScreen.current, true)}
+          onReturnFromSettings={() => navigate(settingsReturnScreen.current, true)}
+          onReturnFromRoles={returnFromRoles}
           onBeginRolePresetEdit={beginRolePresetEdit}
           onCloneRolePreset={(presetId) => { void cloneRolePresetForEditing(presetId); }}
           onEditRoleDraft={setRoleDraft}
@@ -1212,6 +2263,7 @@ export default function App() {
           onThemeChange={changeTheme}
           onSelectContextFiles={chooseContextFiles}
           onSelectContextDirectory={chooseContextDirectory}
+          onPdfCaptured={acceptPdfCapture}
           fontScale={fontScale}
           onFontScaleChange={changeFontScale}
           onOpenConsole={openCompanionConsole}

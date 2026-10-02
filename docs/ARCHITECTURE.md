@@ -20,8 +20,7 @@ flowchart TB
   FILE --> OBJECT[("불변 원문·추출 객체")]
   CORE --> POLICY["권한·공개 범위 판정"]
   CORE --> ADAPTER["격리된 Provider Adapter"]
-  ADAPTER --> ACP["검증된 로컬 agent / ACP 또는 공식 연결"]
-  ADAPTER --> API["사용자 API 키 / 공급자 API"]
+  ADAPTER --> ACP["기존 CLI 구독 인증 / ACP"]
   CORE --> KEY["macOS Keychain / secret reference"]
 ```
 
@@ -142,9 +141,24 @@ terminal 이전 단계는 사용자의 취소로 `cancelling`, 회복 가능한 
 
 ## 5. 공급자와 모델 연결
 
-`ProviderProfile`은 공급자·계정 별칭·인증 방식·secret reference와 프로필별 격리 home/config 루트 및 revision을 소유한다. 각 프로필은 앱이 관리하는 독립 루트에서 공식 인증을 완료한다. 프로필은 OS의 `$HOME`이나 다른 계정 프로필을 암묵적으로 공유하지 않는다. `ModelBinding`은 provider profile ID와 revision, adapter 버전·digest, 선택 model ID, 지원되는 추론·출력 설정, 검증한 context 한도, 기능 manifest를 고정한다. 루트가 바뀌면 profile revision과 binding 검증을 갱신한다. 실행 snapshot에는 개인 절대 경로를 복제하지 않는다. 모델 이름을 임의로 최신 alias에 매핑하거나 슬롯 실행 중 교체하지 않는다.
+`ProviderProfile`은 공급자·계정 별칭·사용자가 선택한 기존 CLI 인증 홈 참조와 별도 실행 공간 및 revision을 소유한다. 인증 권위·선택·비밀 경계는 [공급자 인증 계약](SECURITY.md#provider-auth)을 따른다. `ModelBinding`은 provider profile ID와 revision, adapter 버전·digest, 선택 model ID, 지원되는 추론·출력 설정, 검증한 context 한도, 기능 manifest를 고정한다. 루트가 바뀌면 profile revision과 binding 검증을 갱신한다. 실행 snapshot에는 개인 절대 경로를 복제하지 않는다. 모델 이름을 임의로 최신 alias에 매핑하거나 슬롯 실행 중 교체하지 않는다.
 
-ACP 자체는 프로필 home 경로를 정하거나 attestation하지 않는다. Codex adapter는 선택 프로필의 격리 루트를 실행 환경의 `CODEX_HOME`과 `HOME`으로 지정한다. 앱은 adapter의 초기화 응답을 경로 증명으로 취급하지 않으며, 실행 파일·환경 구성·OS sandbox 정책을 검증한다. 프로필 환경을 지정할 수 없거나 sandbox를 적용할 수 없으면 인증·자료 전달을 차단한다. OS 기본 홈이나 다른 프로필로 fallback하지 않는다.
+<a id="provider-artifacts"></a>
+### 공급자 실행물과 binding 권위
+
+공급자 실행물의 정체성은 ACP 실행 파일 SHA와 전체 runtime artifact-set digest를 구분한다. artifact-set digest는 고정 manifest의 정규화된 내용을 도메인 구분자로 해시하며 adapter, Codex 실행 파일, 보조 실행 파일, public CA, 소스·패치·lockfile 출처를 함께 묶는다. manifest 순서나 공백은 정체성을 바꾸지 않지만 구성물 또는 출처의 변경은 바꾼다. 모든 파일 hash·서명·아키텍처·출처·CA 검증이 통과한 뒤에만 이 정체성을 발행한다.
+
+카탈로그는 실제 확인한 profile revision, 모델·mode 협상 결과와 전체 artifact-set 정체성을 소유한다. 저장한 모델 선택과 코어별 binding은 이 카탈로그 권위와 선택 revision을 참조한다. admission은 세 코어의 저장된 선택·profile·카탈로그·전체 실행물 정체성을 한 트랜잭션에서 재검증하고 고정 입력과 열 개 슬롯에 동결한다. dispatch는 현재 전역 선택 대신 해당 슬롯의 고정 binding과 generation을 검증한다. 고정된 artifact-set과 실제 검증한 실행물이 다르면 호출을 시작하지 않으며, ACP 실행 파일 SHA 하나가 같다는 이유로 허용하지 않는다. 실행 권위가 없는 기록의 조회는 새로운 실행 권한을 만들지 않는다.
+
+빌드 목적은 검증과 발행을 명시적으로 구분한다. 검사·테스트·lint의 검증 경로는 이미 발행한 공급자 실행물과 추출 helper를 읽기만 하며, resource의 inode·내용·권한을 변경하지 않는다. 기대한 source archive·patch·dependency lock·helper 입력과 전체 manifest 정체성을 대조하고, 모든 구성물의 content hash·엄격한 서명·아키텍처·출처·CA와 파일·상위 디렉터리 권위를 검증한다. 검증한 파일 descriptor를 보유하며 경로 교체·링크·소유권·쓰기 권한의 무효화 조건은 [검증 권위 계약](SECURITY.md#provider-verification)을 따른다. 구성물 누락·입력 변경·정체성 불일치·검증 불가는 검사 실패이며, 자동 발행·서명·권한 수정이나 metadata만으로 검증을 생략하는 근거가 아니다.
+
+실행물 전체의 사용·발행 권위는 생성된 resource와 복원 가능한 실행 저장소 밖의 안정된 제어 영역에 둔다. 앱은 OS·Tauri가 제공하는 실제 resource 경로와 앱 데이터의 제어 경로를 해석해 공급자에 전달하며, 공급자는 그 경로의 권위를 검증하고 보유한다. 설치된 서명 bundle은 읽기 전용으로 유지한다. 개발용 생성 resource 발행은 설치 bundle과 다른 제어 namespace에서 같은 generation·소유자 fence를 적용한다. 실행물 generation과 소유자·작업의 미해결 상태를 영속 기록하며, 소유자 프로세스가 종료되어도 해결된 것으로 바꾸지 않는다. 검증 worker, 보유 cache, 공급자 client와 추출 helper는 실제 작업·하위 프로세스·reader·proxy 정리가 끝날 때까지 읽기 권위를 유지한다. 발행은 새 작업 발급을 차단하고 취소·권위 회수 후 실제 정리 완료 증명을 확인한다. 그 증명과 배타적 권위를 발행 검증·전체 commit·rollback 동안 함께 보유한다. OS lock의 획득, 프로세스 부재, DB의 terminal 상태만으로 외부 효과 종료를 증명하지 않는다. lock 경로·inode가 교체되거나 generation·소유자 증명이 맞지 않으면 발행을 차단한다.
+
+별도의 명시적 발행 빌드는 변경한 입력을 source archive·patch·dependency lock과 함께 고정하고 기존 실행물을 덮어쓰지 않는 새 generation을 만든다. 서명·manifest·구성물 검증이 끝난 뒤 공급자 실행물과 helper resource를 함께 발행한다. 새 generation의 파일과 디렉터리는 쓰기 권한이 없으며, 복사본은 새 inode를 가지되 기존의 불변 실행물·cache·source candidate를 수정하지 않는다. 발행 후 검증 실패·대상 누락·파일 종류 불일치는 전체 발행을 복구하고 성공으로 반환하지 않는다. 발행은 정체성 변경에 따른 카탈로그·binding 재검증을 대신하지 않는다. TLS 신뢰와 네트워크 권한은 [보안 계약](SECURITY.md#provider-tls), backend 선택 근거는 [런타임 신뢰 결정](decisions/0004-provider-runtime-trust.md)을 따른다.
+
+실행물 검증 서비스는 전체 content hash·서명·아키텍처·manifest 출처·CA 검증을 UI event loop 밖의 제한된 blocking worker에서 수행한다. 같은 실행물 generation의 동시 요청은 single-flight 검증을 공유하며, 성공한 서비스는 검증한 파일 descriptor와 불변 정체성을 보유한다. 카탈로그·admission·dispatch는 이 보유 권위를 전달받아 사용하며 같은 요청 안에서 전체 검증을 중복 수행하지 않는다. 검증 중에는 연결 상태를 확인 중으로 표시하고 사용자 취소를 처리한다. 파일 권위의 무효화와 재검증은 [보안 계약](SECURITY.md#provider-verification), 선택 근거는 [검증 권위 결정](decisions/0005-provider-verification-authority.md)을 따른다.
+
+ACP 자체는 프로필 home 경로를 정하거나 attestation하지 않는다. Codex adapter는 프로필별 실행 공간을 구성하고 native broker의 메모리 인증 참조를 공식 런타임에 전달한다. 앱은 adapter의 초기화 응답을 경로 증명으로 취급하지 않으며, 실행 파일·환경 구성·OS sandbox 정책을 검증한다. 프로필 환경을 지정할 수 없거나 sandbox를 적용할 수 없으면 인증·자료 전달을 차단한다. OS 기본 홈이나 다른 프로필로 fallback하지 않는다.
 
 ACP 경로는 `adapter 실행 준비 → 실행 환경·sandbox 검증 → initialize → 인증 확인 → session/new → session/prompt → session/update → 결과 검증`을 따른다. Codex는 프로세스 환경의 `CODEX_HOME`을 통해 독립 설정 루트를 선택하며, 같은 adapter의 서로 다른 `ProviderProfile`은 서로 다른 루트를 사용한다([Codex home 설정 구현](https://github.com/openai/codex/blob/main/codex-rs/config/src/loader/mod.rs)). 프로토콜 버전, 입력 종류, 세션 기능, 인증 방법은 [ACP initialization](https://agentclientprotocol.com/protocol/v1/initialization)에서 협상한다. 이 협상은 프로필 경로의 attestation이 아니다. 광고되지 않은 기능은 미지원이며, [session/load·resume](https://agentclientprotocol.com/protocol/v1/session-setup)은 각각 지원이 확인된 경우에만 사용한다. history load를 살아있는 턴 재연결로 간주하지 않는다.
 
@@ -152,7 +166,10 @@ ACP 경로는 `adapter 실행 준비 → 실행 환경·sandbox 검증 → initi
 |---|---|
 | 검증된 로컬 agent + ACP | 사용자 소유 공식 인증, adapter 프로세스 관리, 제한된 세션·도구·문맥 |
 | 공급자의 공식 로컬 구조화 인터페이스 | ACP와 동일한 제품 요구사항을 adapter가 구현하고 적합성으로 증명 |
-| BYOK API | Keychain의 사용자 키, 공급자별 공식 요청·사용량·취소 의미, 키 소유자 과금 |
+
+ACP 응답 reader는 RPC 결과·취소·종료와 텍스트 fragment를 함께 처리하므로 느린 저장·화면 소비자를 기다리지 않는다. 텍스트 전달은 별도의 소비자가 유한한 byte buffer에서 순서를 보존해 인접 fragment를 합친다. 전달 queue가 가득 차면 보유한 텍스트를 잃지 않고 소비자 wake를 합치며, queue 압력을 출력 한도 초과로 판정하지 않는다. byte·누적 이벤트 상한과 메모리 소유권은 [실행 한도](OPERATIONS.md#limits)를 따른다.
+
+미리보기 fragment와 최종 응답은 같은 누적 텍스트 권위를 사용한다. 정상 완료는 승인한 텍스트 전체가 순서대로 전달·저장되고 최종 본문과 일치한 뒤 확정한다. 취소·한도 초과는 대기 소비자를 깨우고 terminal 상태와 구분해 관측하며, 잘린 본문을 정상 결과로 반환하지 않는다. RPC reader에서 소비자 완료를 기다리거나 소비자와 같은 lock을 잡은 채 blocking 저장을 수행하지 않는다.
 
 ACP는 인증 권리·무료 사용량·무제한 토큰을 부여하지 않는다. 무료 티어도 공급자가 설정한 한도를 따른다. Oh My MAGI!가 토큰을 수집해 다른 사용자에게 배분하거나 구독을 중개하지 않는다. 배포 형태별 공급자 조건과 인증 소유권은 [보안 계약](SECURITY.md#provider-auth)을 따른다.
 
@@ -163,7 +180,7 @@ ACP는 인증 권리·무료 사용량·무제한 토큰을 부여하지 않는�
 - 원래 파일 쓰기·임의 셸·무제한 파일 읽기 차단과 승인된 context만 노출하는 방법.
 - 전역 instruction·memory·plugin·hook·MCP 자동 로딩의 비활성화 또는 격리 증거.
 - model 설정·input 한도·usage 관측의 지원 여부와 unknown인 값.
-- 공급자 조건 검토 근거와 실제 로그인·취소·재연결·격리 적합성 기록.
+- 공급자 조건 검토 근거와 기존 인증 연결·취소·재연결·격리 적합성 기록.
 
 필수 기능을 검증하지 못하면 해당 binding의 시작을 차단한다. ACP 연결 성공이나 read-only라는 prompt만으로 합격시키지 않는다. native 도구·자격증명·OS 경계의 실제 한계는 [보안](SECURITY.md#agent-isolation)에 표시한다. 사용자는 호환되는 다른 연결을 선택할 수 있으며 앱은 자동 유료 전환·다른 계정 우회를 하지 않는다.
 
@@ -172,6 +189,17 @@ ACP는 인증 권리·무료 사용량·무제한 토큰을 부여하지 않는�
 모든 UI 변경 명령은 `command_id`, `idempotency_key`, 대상 ID, `expected_revision`, 정규화 payload digest를 갖는다. 메인 창과 Companion은 이 명령 경로를 공유한다. Coordinator는 현재 권한·CAS·상태 전제조건을 확인하고 의도·receipt·이벤트·필요한 dispatch outbox를 한 SQLite 트랜잭션으로 저장한다. commit 뒤에만 접수 성공을 반환한다. 외부 모델의 완료는 별도의 관측이다.
 
 같은 store·명령 종류·대상·멱등 키의 같은 payload는 최초 receipt를 반환한다. 같은 키의 다른 payload는 충돌이다. CAS 불일치는 최신 참조와 충돌을 반환하며 UI가 자동으로 revision만 바꿔 재실행하지 않는다. 명령과 receipt는 Run 삭제 전까지 유지하며 삭제된 Run은 tombstone으로 옛 명령의 재실행을 막는다.
+
+<a id="admission-requests"></a>
+### 실행 접수 요청의 권위와 보존
+
+Start의 영속 명령 정체성과 접수 권한 token은 별개다. Native는 Start를 기다리기 전에 명령 종류·대상·`command_id`·`idempotency_key`·직접 정규화한 의도 digest에 결합한 token을 등록한다. Token은 현재 프로세스 세대와 절대 만료 시각을 가진다. 미등록·만료·다른 프로세스 세대의 token은 새 실행 권한을 만들지 않는다. 저장된 같은 명령의 receipt 조회와 멱등 재생은 token을 재발급하거나 외부 효과를 다시 시작하지 않는다.
+
+접수 전 취소는 별도의 형식이 고정된 receipt와 변경 불가능한 명령 fence를 한 트랜잭션에 저장한 뒤 성공을 반환한다. Fence는 원래 Start 명령과 같은 멱등 의도를 사용하는 명령 별칭에 적용되며 재시작 뒤에도 유지된다. 등록 전 취소도 정확한 Start 의도와 멱등 binding을 고정한다. 명령 ID만 알고 별칭의 멱등 의도를 확인하지 못한 경우에는 취소 성공을 반환하지 않는다. 다른 payload와의 충돌은 성공이나 새로운 등록으로 바꾸지 않는다. 접수와 취소가 경합하면 commit 이전의 fence는 접수를 막고, commit이 먼저 완료되면 정확한 Run에 영속 취소를 접수한다.
+
+메모리에는 살아 있는 접수 권위와 worker 참조만 제한된 용량으로 보유한다. 만료 또는 terminal 상태와 worker 정리가 모두 확인되면 무거운 상태를 회수한다. 취소한 명령의 영속 fence는 이 회수와 독립적이다. 회수한 token을 재등록하여 같은 명령의 취소를 지우지 않는다. 접수 deadline은 commit 경계에서 평가하며 접수 후 전체 심의 수명으로 전이하지 않는다.
+
+영속 fence는 실행 계보에 결합한다. 정상 재시작은 계보와 취소 fence를 유지하고 프로세스 세대만 바꾼다. 백업 복원은 기록의 store 정체성을 보존하되 새 실행 계보와 store generation을 발급한다. 복원한 접수 binding과 receipt는 조회 권위이며 새 token이나 효과의 허가가 아니다. 새 실행에는 현재 계보의 새 명령 ID·멱등 키와 재검증한 입력이 필요하다. 복원한 과거 명령을 새 계보에 등록하여 실행하지 않는다. 보존·백업 경계는 [운영 계약](OPERATIONS.md#6-보존삭제백업), 선택 근거는 [영속 취소 결정](decisions/0006-durable-admission-cancellation.md)을 따른다.
 
 Conversation에는 동시에 하나의 활성 Run만 바인딩한다. 다른 Conversation의 Run은 같은 전역 공급자 큐를 공정하게 공유하며 호출 한도·계정 quota를 함께 소비한다. 한 대화의 pause가 다른 대화의 조회·정상 실행을 막지 않는다. 같은 대화에서 수정·자식 Run 시작 시 기존 활성 Run의 정지·세대 폐기를 먼저 확정한다.
 

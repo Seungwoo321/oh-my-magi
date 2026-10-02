@@ -39,7 +39,7 @@
   }) : evidenceView(ctx);
   const recovery = (title, intro, state, body, actions) => page({ kicker: `RUN / ${state.toUpperCase()}`, title, intro, body, aside: topology(state, true) + panel("보존된 입력", "<p>질문·자료 수집본·세 관점은 고정되어 있습니다. 완료되지 않은 심의에는 최종 표결 결과를 표시하지 않습니다.</p>"), actions });
   S.paused = { title: "일시정지와 재개", group: "복구", variants: variants([["auth", "인증 만료"], ["quota", "제공자 한도"], ["needs-input", "필수 정보 요청"]]), render: ctx => {
-    const map = { auth: ["인증을 다시 확인해 주세요", "연결 인증이 만료되어 다음 호출을 멈췄습니다.", "공식 인증 창에서 로그인 후 연결을 검사합니다.", go("연결 확인", "connections", "auth")], quota: ["사용 가능한 한도를 기다립니다", "제공자가 사용 한도에 도달했다고 응답했습니다.", "재개 가능 시점: 제공되지 않음. 다른 모델로 변경하면 새 심의가 필요합니다.", go("연결과 한도", "connections", "quota")], "needs-input": ["판단에 필요한 정보가 부족합니다", "공개 대상과 지원 종료 조건이 없어 질문의 의미를 확정할 수 없습니다.", "추가 정보는 현재 입력에 덮어쓰지 않고 부모와 연결된 새 심의에 포함됩니다.", action("정보를 보완해 새 심의", "followup")] };
+    const map = { auth: ["인증을 다시 확인해 주세요", "연결 인증이 만료되어 다음 호출을 멈췄습니다.", "저장한 CLI 인증 홈과 기존 구독 인증 상태를 확인한 뒤 연결을 다시 검사합니다.", go("연결 확인", "connections", "auth")], quota: ["사용 가능한 한도를 기다립니다", "제공자가 사용 한도에 도달했다고 응답했습니다.", "재개 가능 시점: 제공되지 않음. 다른 모델로 변경하면 새 심의가 필요합니다.", go("연결과 한도", "connections", "quota")], "needs-input": ["판단에 필요한 정보가 부족합니다", "공개 대상과 지원 종료 조건이 없어 질문의 의미를 확정할 수 없습니다.", "추가 정보는 현재 입력에 덮어쓰지 않고 부모와 연결된 새 심의에 포함됩니다.", action("정보를 보완해 새 심의", "followup")] };
     const [title, intro, detail, command] = map[ctx.variant] || map.auth;
     return recovery(title, intro, "paused", notice("새 호출 정지", detail, "warning") + panel("마지막 확정 단계", "<p>독립 검토 · BALTHASAR·2와 CASPER·3의 유효 의견 보존</p><p>MELCHIOR·1의 미완 응답은 표나 기권으로 집계하지 않습니다.</p>"), command + action("보존된 내용 보기", "run-details") + action("심의 취소", "cancel", "danger"));
   }};

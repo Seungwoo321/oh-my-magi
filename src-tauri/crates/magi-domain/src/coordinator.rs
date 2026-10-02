@@ -943,21 +943,25 @@ impl RunAggregate {
         expected_revision: u64,
         at: String,
     ) -> Result<(), DomainError> {
-        let resume_stage = self
-            .run
-            .status
-            .stage()
-            .ok_or_else(|| DomainError::Precondition {
-                required: "active run stage".to_owned(),
+        let resume_stage = self.run.status.stage();
+        if resume_stage.is_none()
+            && !matches!(
+                self.run.status,
+                RunStatus::Preparing | RunStatus::AwaitingConfirmation
+            )
+        {
+            return Err(DomainError::Precondition {
+                required: "active run stage or local preparation".to_owned(),
                 actual: super::model::status_name(&self.run.status).to_owned(),
-            })?;
+            });
+        }
         if self.run.revision != expected_revision {
             return Err(DomainError::RevisionConflict {
                 expected: expected_revision,
                 actual: self.run.revision,
             });
         }
-        self.cancel_resume_stage = Some(resume_stage);
+        self.cancel_resume_stage = resume_stage;
         self.fence_generation(at.clone());
         self.change_status(RunStatus::Cancelling, self.run.revision, at.clone())?;
         self.push(

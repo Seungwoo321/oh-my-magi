@@ -10,10 +10,23 @@ resolver = "2"
 
 [package]
 name = "magi-console"
+default-run = "magi-console"
 version = "0.1.0"
 description = "Local MAGI command console for macOS"
 edition = "2024"
 rust-version = "1.90"
+
+[[bin]]
+name = "magi-run-query"
+path = "src/bin/magi-run-query.rs"
+
+[features]
+native-live-probe = []
+
+[[bin]]
+name = "magi-native-live-probe"
+path = "src/native_live_tests.rs"
+required-features = ["native-live-probe"]
 
 [lib]
 name = "magi_console_lib"
@@ -21,8 +34,15 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+magi-provider = { path = "crates/magi-provider" }
+magi-domain = { path = "crates/magi-domain" }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "time", "sync"] }
+libc = "0.2"
 
 [dependencies]
+tokio = { version = "1", features = ["time"] }
+schemars = "=0.8.22"
 cap-std = "=3.4.6"
 libc = "0.2"
 magi-context = { path = "crates/magi-context" }

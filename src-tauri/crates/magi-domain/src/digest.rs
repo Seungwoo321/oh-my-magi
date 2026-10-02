@@ -3,7 +3,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::{DomainError, ValidationIssue};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(transparent)]
 pub struct Digest(String);
 

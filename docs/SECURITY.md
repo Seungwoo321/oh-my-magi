@@ -66,7 +66,27 @@ adapter는 각 조건의 집행 위치를 `host_enforced`, `provider_enforced`, 
 
 Tauri capability는 WebView의 native 명령 접근을 제한한다. [공식 capability 설명](https://v2.tauri.app/security/capabilities/)에 맞춰 창별 명령을 명시적으로 등록하고, 모든 창에 임의 fs·shell·HTTP 권한을 합쳐 주지 않는다. 이 설정이 외부 agent 프로세스에 sandbox를 씌운다고 설명하지 않는다.
 
-agent의 공식 인증 런타임이 provider credential store를 사용하는 것과 모델의 파일 도구가 비밀을 읽는 것은 구분한다. 모델 도구에서 credential store·환경 비밀·다른 앱 문맥 접근을 차단할 수 없는 조합은 사용할 수 없다. agent 또는 adapter 버전이 바뀌면 기존 호환성 근거를 자동 승계하지 않는다.
+macOS 공급자 sandbox는 `system.sb`의 플랫폼 기본 규칙 위에 TLS 인증서 신뢰 검증에 필요한 공급자 전용 추가 IPC로 정확한 `com.apple.SecurityServer`의 `mach-lookup`을 허용한다. 이 권한은 인증서 신뢰 서비스 접근이며 네트워크 목적지나 모델 도구 권한을 확장하지 않는다. 공급자 전용 wildcard Mach 서비스나 지정되지 않은 서비스 예외를 추가하지 않는다. 사용자 파일·credential store 읽기, 범위 밖 파일 쓰기, proxy를 우회한 외부 연결은 허용하지 않는다. 플랫폼 IPC와 네트워크·파일·도구 권한은 각각 독립된 allowlist로 집행하고 검증한다.
+
+<a id="provider-tls"></a>
+### 공급자 TLS 신뢰
+
+Codex의 HTTP 호출은 서명·출처가 검증된 고정 런타임의 호출자가 선택한 플랫폼 TLS backend를 사용한다. 검증된 public CA bundle의 모든 인증서를 기존 신뢰 설정에 추가하며, CA 설정을 이유로 HTTP backend를 자동 교체하지 않는다. WebSocket의 rustls 경로는 플랫폼의 native root와 같은 검증된 public CA 전체를 함께 사용한다. 두 경로 모두 인증서 체인과 hostname을 엄격히 검증하며 미확인 인증서 허용, 검증 해제, 실패 시 다른 TLS 경로로 자동 우회하지 않는다.
+
+CA bundle의 출처·digest·정규 파일 정체성·권한을 실행 전 검증한다. `CODEX_CA_CERTIFICATE`는 이 검증된 bundle만 가리킨다. TLS 신뢰 추가는 기존 proxy 목적지 allowlist와 모델 도구의 네트워크 권한을 넓히지 않는다. HTTP·WebSocket·인증 확인의 성공 여부는 별도로 관측하며 한 경로의 성공으로 다른 경로나 모델 추론의 성공을 표시하지 않는다. 실행물의 발행과 전체 정체성 검사는 [공급자 실행물 계약](ARCHITECTURE.md#provider-artifacts)을 따른다.
+
+agent의 공식 인증 런타임이 provider credential store를 사용하는 것과 모델의 파일 도구가 비밀을 읽는 것은 구분한다. 모델 도구에서 credential store·환경 비밀·다른 앱 문맥 접근을 차단할 수 없는 조합은 사용할 수 없다. agent·adapter 버전 또는 전체 artifact-set 정체성이 바뀌면 기존 카탈로그·binding·readiness와 호환성 근거를 자동 승계하지 않는다. 새 실행은 변경된 전체 실행물 정체성을 다시 검증한다.
+
+<a id="provider-verification"></a>
+### 실행물 검증 권위와 수명
+
+검증 권위는 완전한 파일 내용·서명·출처·CA 검증이 성공한 불변 generation과 열린 파일 descriptor에 결합한다. 경로·파일 종류·소유권·쓰기 권한·link 수·inode·파일 version을 사용 경계에서 확인한다. 경로 교체, link 또는 권한 변경, descriptor의 파일 version 변경은 보유 권위를 무효화하며 새로운 전체 검증이 끝날 때까지 외부 효과를 차단한다. 파일 크기·수정 시각 같은 metadata만으로 완전한 검증 결과를 만들거나 교체된 파일에 승계하지 않는다.
+
+검증 worker와 서명·아키텍처 검사 subprocess는 명시적 deadline을 가지며 만료된 subprocess는 종료하고 회수한다. deadline·취소·Run generation 변경은 결과 발행 전에 확인하고, admission과 dispatch는 외부 효과 직전에 같은 fencing 권위를 다시 확인한다. 늦게 끝난 검증은 취소된 요청을 Ready로 바꾸거나 새 요청의 권위를 덮어쓰지 않는다. deadline 또는 취소는 atomic admission의 commit 이전과 provider 효과 직전에 요청 권위를 철회한다. 이미 admission이 완료되었으면 durable cancellation을 접수하여 아직 시작하지 않은 슬롯을 해제하고 진행 중 효과의 결과를 기존 취소·generation 규칙으로 정리한다. blocking worker의 중단 요청만으로 admission 또는 외부 효과 취소가 완료되었다고 표시하지 않는다. 카탈로그·admission·dispatch의 전체 artifact-set 일치 검사와 엄격한 인증서·hostname 검증은 보유 권위를 재사용해도 유지한다.
+
+접수 권위의 등록·만료·영속 취소 fence는 [명령 수명 계약](ARCHITECTURE.md#admission-requests)을 따른다. 취소와 commit은 같은 guarded 권위로 순서를 결정하며 deadline은 guard 안에서 평가한다. Provider 실행·인증·session·prompt 전송도 취소와 효과 발행의 순서를 결정하는 경계를 공유한다. 검사 후 별도 호출 사이에 권위를 철회할 수 있는 check-then-send 구조를 허용하지 않는다. Commit 후 취소는 guard를 해제한 뒤 정확한 Run의 영속 취소를 접수하여 저장 lock과 효과 정리의 교착을 피한다.
+
+로컬 제어 연결은 소유 프로세스와 같은 UID, 제한된 메시지 크기, 연결 전체의 절대 deadline을 검증한다. 조각마다 갱신되는 read timeout만으로 연결 수명을 제한하지 않는다. 진단용 프로세스 제어는 그 프로세스가 등록한 현재 요청에만 적용되며 UI의 정확한 요청 token을 검증하는 취소 경로를 대신하지 않는다.
 
 ## 6. Host Context Reader
 
@@ -81,17 +101,17 @@ ACP permission 요청도 같은 정책에 연결한다. 이미 승인된 manifes
 <a id="provider-auth"></a>
 ## 7. 공급자 인증과 비밀
 
-사용자는 자기 공급자의 공식 인증 흐름으로 로그인하거나 자기 API 키를 등록한다. 구독 로그인은 지원되는 공식 agent가 소유하고 OAuth token의 저장·갱신도 그 런타임에 둔다. 앱이 브라우저 cookie·구독 access/refresh token을 추출·복제하거나 별도 API 호출에 전용하지 않는다.
+앱은 사용자가 지정한 기존 CLI·ACP 홈의 구독 인증만 사용한다. 각 프로필은 사용자 지정 이름과 사용자가 직접 입력한 기존 CLI 인증 홈 경로를 반드시 저장하며, 선택한 인증 권위와 revision을 고정한다. 기본·커스텀 경로 모드, 폴더 찾아보기, 자동 경로 설정을 제공하지 않는다. 경로는 절대 경로 또는 사용자 홈을 가리키는 `~/` 형식을 허용하며 native 경계에서 정규화·존재·권한·인증 구조를 검증한다. 다른 홈이나 계정으로 자동 fallback하지 않는다. 앱 내 OAuth·브라우저 로그인·API 키 연결을 제공하지 않는다.
 
-각 `ProviderProfile`은 앱이 관리하는 별도의 빈 home/config 루트에서 실행한다. 같은 공급자와 실행 파일도 계정 프로필마다 다른 루트를 사용한다. Codex ACP는 프로필 루트를 실행 환경의 `CODEX_HOME`과 `HOME`으로 지정한다. ACP 초기화 응답은 home 경로를 attestation하지 않으므로 경로 증거로 사용하지 않는다. 앱은 지정한 실행 환경과 OS sandbox 정책을 확인해 선택 프로필의 파일 경계를 강제한다. ACP가 일반 프로필 경로를 표준화한다고 가정하지 않는다.
+기존 인증 홈은 읽기 전용 권위다. 인증 확인과 갱신은 공급자 공식 런타임의 구독 계약을 따르고, native 인증 broker는 선택한 홈에 묶인 인증 참조를 제한된 로컬 IPC의 메모리로만 전달한다. adapter는 인증 파일을 쓰거나 토큰을 로그·argv·DB·백업·내보내기에 기록하지 않는다. 기존 홈의 인증 정보와 설정을 앱 실행 루트에 복사하지 않으며 다른 공급자 API 요청에 전용하지 않는다. renderer에는 인증 상태와 사용자가 선택한 경로 표시만 제공하고 비밀 원문은 제공하지 않는다.
 
-전역 `$HOME`·`~/.codex`·다른 `ProviderProfile`을 추론하거나 fallback으로 사용하지 않는다. 기존 전역 프로필 파일·인증 정보를 앱 루트로 복사하지 않는다. 루트가 없거나 접근 불가·adapter 미지원·실행 환경 또는 OS sandbox 검증 실패면 해당 프로필은 실행 불가다. profile revision에 루트 식별을 묶고, 경로 변경은 연결과 binding 재검증을 요구한다. UI·로그·진단·내보내기에 절대 경로와 인증 데이터를 포함하지 않는다.
+프로필의 실행·작업 공간은 인증 홈과 분리한다. 실행 환경과 OS sandbox는 선택된 인증 권위와 검증된 실행 파일 및 허용된 입력만 사용할 수 있게 제한한다. ACP 초기화 응답을 홈 경로 attestation으로 취급하지 않는다. 인증 없음·읽기 실패·만료·홈 변경·adapter 미지원·sandbox 검증 실패는 실행을 차단하고 기존 인증 연결 확인 조치를 표시한다. 앱이 새 로그인을 유도하거나 다른 계정으로 전환하지 않는다. 홈 변경은 profile revision과 모델 binding 및 반출 동의를 다시 검증하게 한다.
 
-BYOK 키와 앱이 발급한 내부 비밀은 macOS Keychain에 보관한다. DB·설정·로그·역할 preset에는 secret reference만 둔다. renderer는 저장한 키를 다시 읽을 수 없고 등록 화면의 일시 입력을 native 저장 경계로 전달한 뒤 제거한다. 키 원문을 URL·argv·Markdown export·오류 메시지에 넣지 않는다.
+인증 상태 RPC의 실패만으로 credential이 잘못되었다고 판정하지 않는다. workspace discovery·TLS·전송·상태 확인의 원인을 확정할 수 없는 오류는 연결 확인 실패로 표시하며 재로그인 조치를 붙이지 않는다. 실제 인증 없음·지원되지 않는 인증 권위가 확인된 경우에만 해당 고정 profile ID와 revision에 묶인 인증 실패를 전달한다. 다른 profile의 readiness나 저장한 모델 선택을 함께 폐기하지 않는다.
+
+인증 경로는 메인 창의 연결 설정에서 사용자가 선택한 값을 확인하는 용도로만 표시한다. 실행 snapshot·모델 입력·공유 기록에는 개인 절대 경로를 복제하지 않는다. 앱 내부 비밀은 OS secret store에서 관리하고 저장 산출물에는 참조만 둔다.
 
 공급자 profile은 개인·회사 등 사용자가 구분한 계정별로 분리한다. 프로세스에는 필요한 환경 변수 allowlist와 인증 설정만 전달하며 앱의 전체 환경을 상속하지 않는다. 인증 실패 시 다른 profile을 자동 선택하지 않는다. 앱 연결 해제는 앱의 세션·권한을 폐기하며 다른 앱이 사용하는 공급자 로그인 자체를 자동 삭제하지 않는다.
-
-BYOK 요청 목적지는 검증한 공급자 profile의 HTTPS endpoint로 고정하고 TLS 검증을 생략하지 않는다. model 출력·원문 URL이 endpoint나 인증 헤더를 바꿀 수 없다. 자격증명을 다른 origin으로 redirect해 보내지 않는다. local 추론 endpoint는 별도로 검증된 local binding만 사용할 수 있으며 화면에 cloud 연결과 구분한다.
 
 공급자 조건과 기술 호환성은 별도 확인이다. Claude의 공식 문서는 사용자 본인이 수정되지 않은 공식 binary에 로그인하는 경로와 제3자 앱의 로그인·credential 중개를 구분한다. 실제 배포 형태는 [Claude Code 조건](https://code.claude.com/docs/en/legal-and-compliance)과 [Agent SDK 인증 조건](https://code.claude.com/docs/en/agent-sdk/overview)을 함께 충족해야 한다. 특정 adapter가 작동한다는 사실만으로 제품 배포의 허용을 선언하지 않는다.
 

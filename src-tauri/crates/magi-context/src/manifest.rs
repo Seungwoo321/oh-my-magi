@@ -89,6 +89,9 @@ pub enum ManifestSourceState {
 #[serde(rename_all = "snake_case")]
 pub enum RepresentationKind {
     Utf8Text,
+    PdfText,
+    PdfRaster,
+    Image,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,6 +101,12 @@ pub struct EvidenceLocator {
     pub start_line: Option<u64>,
     pub end_line: Option<u64>,
     pub total_lines: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -224,13 +233,38 @@ pub enum DisclosureError {
     RunManifestFailure,
 }
 
+fn valid_dimensions(width: Option<u32>, height: Option<u32>) -> bool {
+    width.zip(height).is_some_and(|(width, height)| {
+        width > 0
+            && height > 0
+            && width <= 10000
+            && height <= 10000
+            && u64::from(width) * u64::from(height) <= 40_000_000
+    })
+}
+
+fn capture_schema_version(sources: &[ManifestSource]) -> u16 {
+    if sources.iter().any(|source| {
+        source
+            .representation_kind
+            .is_some_and(|kind| kind != RepresentationKind::Utf8Text)
+            || source.included_locators.iter().any(|locator| {
+                locator.page.is_some() || locator.width.is_some() || locator.height.is_some()
+            })
+    }) {
+        2
+    } else {
+        SOURCE_CAPTURE_SCHEMA_VERSION
+    }
+}
+
 impl SourceCaptureManifest {
     pub fn draft(
         sources: Vec<ManifestSource>,
         created_at_epoch_ms: u64,
     ) -> Result<Self, DisclosureError> {
         let mut manifest = Self {
-            schema_version: SOURCE_CAPTURE_SCHEMA_VERSION,
+            schema_version: capture_schema_version(&sources),
             manifest_id: Uuid::new_v4().to_string(),
             created_at_epoch_ms,
             content: SourceCaptureManifestContent {
@@ -346,7 +380,7 @@ impl SourceCaptureManifest {
 
     pub fn validate(&self) -> Result<(), DisclosureError> {
         let mut issues = Vec::new();
-        if self.schema_version != SOURCE_CAPTURE_SCHEMA_VERSION {
+        if self.schema_version != capture_schema_version(&self.content.sources) {
             issues.push(ValidationIssue::new(
                 "schema_version",
                 "unsupported_version",
@@ -436,6 +470,40 @@ impl SourceCaptureManifest {
                 ));
             }
             for locator in &source.included_locators {
+                let valid_shape = match source.representation_kind {
+                    Some(RepresentationKind::Utf8Text) => {
+                        locator.page.is_none()
+                            && locator.width.is_none()
+                            && locator.height.is_none()
+                    }
+                    Some(RepresentationKind::PdfText) => {
+                        locator.page.is_some_and(|page| (1..=1000).contains(&page))
+                            && locator.width.is_none()
+                            && locator.height.is_none()
+                            && locator.start_line.is_none()
+                            && locator.end_line.is_none()
+                            && locator.total_lines.is_none()
+                    }
+                    Some(RepresentationKind::PdfRaster) => {
+                        locator.page.is_some_and(|page| (1..=1000).contains(&page))
+                            && locator.start_line.is_none()
+                            && locator.end_line.is_none()
+                            && locator.total_lines.is_none()
+                            && (locator.width.is_none() && locator.height.is_none()
+                                || valid_dimensions(locator.width, locator.height))
+                    }
+                    Some(RepresentationKind::Image) => {
+                        locator.page.is_none()
+                            && locator.start_line.is_none()
+                            && locator.end_line.is_none()
+                            && locator.total_lines.is_none()
+                            && valid_dimensions(locator.width, locator.height)
+                    }
+                    None => false,
+                };
+                if !valid_shape {
+                    issues.push(ValidationIssue::new(format!("sources[{index}].included_locators"), "invalid_representation_locator", "locator must match its representation and bounded page or image dimensions"));
+                }
                 if locator.source_id != source.source_id
                     || locator.object_digest
                         != source
@@ -597,5 +665,57 @@ pub fn freshness_from_digests(
         status: resolved,
         observed_at_epoch_ms,
         observed_digest: observed.cloned(),
+    }
+}
+
+#[cfg(test)]
+mod representation_version_tests {
+    use super::*;
+    #[test]
+    fn historical_text_locator_bytes_and_manifest_version_remain_exact() {
+        let digest = Digest::from_bytes(b"fixture");
+        let old = serde_json::json!({"source_id":"s", "object_digest":digest,"start_line":null,"end_line":null,"total_lines":null});
+        let locator: EvidenceLocator = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&locator).unwrap(), old);
+        let mut source = ManifestSource {
+            source_id: "s".into(),
+            display_name: "fixture.txt".into(),
+            state: ManifestSourceState::Captured,
+            byte_length: Some(7),
+            mime_type: Some("text/plain".into()),
+            object_digest: Some(digest.clone()),
+            derived_digest: Some(digest),
+            representation_kind: Some(RepresentationKind::Utf8Text),
+            extractor_id: Some("utf8-text".into()),
+            extractor_version: Some("1".into()),
+            included_locators: vec![locator],
+            omission: None,
+            captured_at_epoch_ms: Some(1),
+            secret_pattern_findings: vec![],
+            secret_scan_incomplete: true,
+        };
+        let historical = SourceCaptureManifest::draft(vec![source.clone()], 1).unwrap();
+        assert_eq!(historical.schema_version, 1);
+        let wire = serde_json::to_vec(&historical).unwrap();
+        let roundtrip: SourceCaptureManifest = serde_json::from_slice(&wire).unwrap();
+        roundtrip.validate().unwrap();
+        assert_eq!(roundtrip.calculate_digest().unwrap(), historical.digest);
+        assert_eq!(serde_json::to_vec(&roundtrip).unwrap(), wire);
+        source.representation_kind = Some(RepresentationKind::PdfText);
+        source.included_locators[0].page = Some(1);
+        let binary = SourceCaptureManifest::draft(vec![source], 1).unwrap();
+        assert_eq!(binary.schema_version, 2);
+        let mut wrong = binary.clone();
+        wrong.schema_version = 1;
+        wrong.digest = wrong.calculate_digest().unwrap();
+        assert!(wrong.validate().is_err());
+        let mut wrong = historical;
+        wrong.schema_version = 2;
+        wrong.digest = wrong.calculate_digest().unwrap();
+        assert!(wrong.validate().is_err());
+        let mut wrong = binary;
+        wrong.content.sources[0].included_locators[0].page = Some(0);
+        wrong.digest = wrong.calculate_digest().unwrap();
+        assert!(wrong.validate().is_err());
     }
 }

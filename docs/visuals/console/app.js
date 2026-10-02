@@ -14,7 +14,7 @@
   const variantSelect = document.getElementById("atlas-variant");
   const formState = { theme: "command", motion: matchMedia("(prefers-reduced-motion: reduce)").matches ? "reduced" : "full", sound: false, density: "normal", textScale: "100", language: "ko", preferenceRevision: 0, outcome: "default", selectedSource: "02" };
   try { Object.assign(formState, JSON.parse(localStorage.getItem("magi-console-preferences") || "{}")); } catch (_) { /* Storage denial preserves the session defaults. */ }
-  let screen = screens[params.get("screen")] ? params.get("screen") : "input";
+  let screen = screens[params.get("screen") === "provider" ? "connections" : params.get("screen")] ? (params.get("screen") === "provider" ? "connections" : params.get("screen")) : "input";
   let variant = params.get("variant") || "default";
   let question = defaultQuestion;
   let frozenQuestion = defaultQuestion;
@@ -60,6 +60,9 @@
   }
   function storageBlockVariant() { return formState.storageBlocked === "migrating" ? "migrating" : "migration-error"; }
   function go(next, nextVariant = "default", options = {}) {
+    if (next === "provider") { next = "connections"; nextVariant = "default"; }
+    if (!options.returning && next === "connections" && screen !== "connections") formState.connectionReturn = { screen, variant };
+    if (!options.returning && next === "settings" && screen !== "settings") formState.settingsReturn = { screen, variant };
     if (next === "paused" && nextVariant === "timeout") { next = "interrupted"; }
     if (next === "independent" && formState.storageBlocked) { next = "maintenance"; nextVariant = storageBlockVariant(); }
     if (!screens[next]) { notify(`화면을 찾을 수 없습니다: ${next}`); return; }
@@ -317,6 +320,7 @@
     "confirm-overwrite": () => closeDialog(() => go("share", "saved")), "export-rename": () => closeDialog(() => go("share")),
   };
   function dispatch(name, event, target) {
+    if (name === "setup-profile-save") { screens.connections.actions[name](context(event, target)); return; }
     if (dialogCallbacks.has(name)) { const callback = dialogCallbacks.get(name); closeDialog(() => callback(context(event, target))); return; }
     const custom = screens[screen].actions?.[name];
     if (custom) custom(context(event, target));

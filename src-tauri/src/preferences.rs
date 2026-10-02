@@ -7,7 +7,7 @@ use std::{
     path::PathBuf,
     sync::Mutex,
 };
-use tauri::{AppHandle, Manager, State, WebviewWindow};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 
 use crate::commands::DesktopState;
 
@@ -101,7 +101,9 @@ pub fn save_console_preferences(
     let _guard = PREFERENCES_LOCK
         .lock()
         .map_err(|_| "Console preferences are temporarily unavailable.")?;
-    write_preferences(&app, preferences)
+    write_preferences(&app, preferences)?;
+    app.emit("magi:preferences-changed", preferences)
+        .map_err(|_| "Saved preferences could not be broadcast.".into())
 }
 
 fn ensure_console_window(window: &WebviewWindow) -> Result<(), String> {

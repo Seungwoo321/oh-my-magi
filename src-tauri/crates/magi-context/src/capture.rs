@@ -3,6 +3,7 @@ use std::ffi::OsString;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 
+use cap_std::ambient_authority;
 use cap_std::fs::{Dir, File, Metadata, MetadataExt, OpenOptions, OpenOptionsExt};
 use magi_domain::Digest;
 use serde::{Deserialize, Serialize};
@@ -10,8 +11,8 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::manifest::{
-    EvidenceLocator, ManifestSource, ManifestSourceState, RepresentationKind, SecretPatternFinding,
-    SecretPatternKind, SourceCaptureManifest, SourceOmission, SourceOmissionCode,
+    EvidenceLocator, ManifestSource, ManifestSourceState, RepresentationKind, SecretPatternKind,
+    SourceCaptureManifest, SourceOmission, SourceOmissionCode,
 };
 
 pub const DEFAULT_FILE_BYTES: u64 = 20 * 1024 * 1024;
@@ -22,6 +23,8 @@ pub const MAX_MANIFEST_BYTES: u64 = 500 * 1024 * 1024;
 pub const MAX_MANIFEST_ITEMS: usize = 1_000;
 const EXTRACTOR_ID: &str = "utf8-text";
 const EXTRACTOR_VERSION: &str = "1";
+const MAX_CONTEXT_READ_BYTES: u64 = 20 * 1024 * 1024;
+const MAX_CONTEXT_READ_RESPONSE_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CaptureLimits {
@@ -152,6 +155,12 @@ pub struct ContentRepresentation {
 pub enum CaptureError {
     #[error("source permission has been revoked")]
     RevokedGrant,
+    #[error("the path is not a valid approved source directory")]
+    InvalidSourceScope,
+    #[error("the requested file is outside the approved source scope or unavailable")]
+    SourceScopeDenied,
+    #[error("the requested source could not be read as bounded UTF-8 text")]
+    SourceTextUnavailable,
     #[error("capture limit is outside the supported range")]
     InvalidLimits,
     #[error("selection contains an unknown or duplicate source")]
@@ -162,6 +171,182 @@ pub enum CaptureError {
     FileMetadataFailed,
     #[error("context manifest could not be finalized")]
     ManifestFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceScopeRoot {
+    canonical_path: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+impl SourceScopeRoot {
+    pub fn from_user_input(input: &str, home: &Path) -> Result<Self, CaptureError> {
+        if input.is_empty() || input.len() > 4096 || input.contains('\0') {
+            return Err(CaptureError::InvalidSourceScope);
+        }
+        let canonical_home = home
+            .canonicalize()
+            .map_err(|_| CaptureError::InvalidSourceScope)?;
+        let path = if input == "~" {
+            canonical_home.clone()
+        } else if let Some(suffix) = input.strip_prefix("~/") {
+            canonical_home.join(suffix)
+        } else if input.starts_with('~') {
+            return Err(CaptureError::InvalidSourceScope);
+        } else {
+            PathBuf::from(input)
+        };
+        if !path.is_absolute() {
+            return Err(CaptureError::InvalidSourceScope);
+        }
+        let canonical_path = normalize_absolute_path(&path)?;
+        if input.starts_with('~') && !canonical_path.starts_with(&canonical_home) {
+            return Err(CaptureError::InvalidSourceScope);
+        }
+        if classify_selected_path(&canonical_path).is_some() {
+            return Err(CaptureError::InvalidSourceScope);
+        }
+        Self::open_verified(canonical_path, None)
+    }
+
+    pub fn from_persisted(
+        canonical_path: PathBuf,
+        device: u64,
+        inode: u64,
+    ) -> Result<Self, CaptureError> {
+        if !canonical_path.is_absolute()
+            || normalize_absolute_path(&canonical_path)? != canonical_path
+            || classify_selected_path(&canonical_path).is_some()
+        {
+            return Err(CaptureError::InvalidSourceScope);
+        }
+        Self::open_verified(canonical_path, Some((device, inode)))
+    }
+
+    fn open_verified(
+        canonical_path: PathBuf,
+        expected_identity: Option<(u64, u64)>,
+    ) -> Result<Self, CaptureError> {
+        let root = open_absolute_directory_nofollow(&canonical_path)
+            .map_err(|_| CaptureError::InvalidSourceScope)?;
+        let metadata = root
+            .dir_metadata()
+            .map_err(|_| CaptureError::InvalidSourceScope)?;
+        if !metadata.is_dir()
+            || canonical_path.canonicalize().ok().as_deref() != Some(canonical_path.as_path())
+            || expected_identity
+                .is_some_and(|(device, inode)| metadata.dev() != device || metadata.ino() != inode)
+        {
+            return Err(CaptureError::InvalidSourceScope);
+        }
+        Ok(Self {
+            canonical_path,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+
+    pub fn canonical_path(&self) -> &Path {
+        &self.canonical_path
+    }
+
+    pub fn device(&self) -> u64 {
+        self.device
+    }
+
+    pub fn inode(&self) -> u64 {
+        self.inode
+    }
+
+    pub fn read_text_file(
+        &self,
+        requested_path: &Path,
+        line: Option<u32>,
+        limit: Option<u32>,
+    ) -> Result<String, CaptureError> {
+        let relative = requested_path
+            .strip_prefix(&self.canonical_path)
+            .map_err(|_| CaptureError::SourceScopeDenied)?;
+        if relative.as_os_str().is_empty() || classify_selected_path(relative).is_some() {
+            return Err(CaptureError::SourceScopeDenied);
+        }
+        let components = safe_components(relative).map_err(|_| CaptureError::SourceScopeDenied)?;
+        if components.is_empty() {
+            return Err(CaptureError::SourceScopeDenied);
+        }
+        let root = open_absolute_directory_nofollow(&self.canonical_path)
+            .map_err(|_| CaptureError::SourceScopeDenied)?;
+        let root_metadata = root
+            .dir_metadata()
+            .map_err(|_| CaptureError::SourceScopeDenied)?;
+        if root_metadata.dev() != self.device || root_metadata.ino() != self.inode {
+            return Err(CaptureError::SourceScopeDenied);
+        }
+        let before = metadata_within_nofollow(&root, relative)
+            .map_err(|_| CaptureError::SourceScopeDenied)?;
+        if before.file_type().is_symlink()
+            || !before.is_file()
+            || before.dev() != self.device
+            || before.len() > MAX_CONTEXT_READ_BYTES
+        {
+            return Err(CaptureError::SourceScopeDenied);
+        }
+        let mut file = open_file_within_nofollow(&root, relative)
+            .map_err(|_| CaptureError::SourceScopeDenied)?;
+        let opened = file
+            .metadata()
+            .map_err(|_| CaptureError::SourceTextUnavailable)?;
+        let expected = FileIdentity::from_metadata(&before);
+        if !expected.same_file_and_version(FileIdentity::from_metadata(&opened)) {
+            return Err(CaptureError::SourceScopeDenied);
+        }
+        let mut bytes = Vec::with_capacity(opened.len() as usize);
+        (&mut file)
+            .take(MAX_CONTEXT_READ_BYTES.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|_| CaptureError::SourceTextUnavailable)?;
+        let after = file
+            .metadata()
+            .map_err(|_| CaptureError::SourceTextUnavailable)?;
+        let current = metadata_within_nofollow(&root, relative)
+            .map_err(|_| CaptureError::SourceScopeDenied)?;
+        if bytes.len() as u64 > MAX_CONTEXT_READ_BYTES
+            || !expected.same_file_and_version(FileIdentity::from_metadata(&after))
+            || !expected.same_file_and_version(FileIdentity::from_metadata(&current))
+        {
+            return Err(CaptureError::SourceScopeDenied);
+        }
+        let text = std::str::from_utf8(&bytes).map_err(|_| CaptureError::SourceTextUnavailable)?;
+        if text.as_bytes().contains(&0) {
+            return Err(CaptureError::SourceTextUnavailable);
+        }
+        let start = line.unwrap_or(1);
+        if start == 0 {
+            return Err(CaptureError::SourceTextUnavailable);
+        }
+        let count = limit.map_or(usize::MAX, |value| value as usize);
+        let start_index = start as usize;
+        let mut line_count = 0usize;
+        let mut selected = String::new();
+        for segment in text.split_inclusive('\n') {
+            line_count = line_count.saturating_add(1);
+            if count == 0 || line_count < start_index {
+                continue;
+            }
+            if selected.len().saturating_add(segment.len()) > MAX_CONTEXT_READ_RESPONSE_BYTES {
+                return Err(CaptureError::SourceTextUnavailable);
+            }
+            selected.push_str(segment);
+            if line_count.saturating_sub(start_index).saturating_add(1) >= count {
+                break;
+            }
+        }
+        if start_index > line_count.saturating_add(1) || contains_sensitive_content(&selected) {
+            return Err(CaptureError::SourceTextUnavailable);
+        }
+        Ok(selected)
+    }
 }
 
 pub struct SourceGrant {
@@ -386,12 +571,15 @@ impl SourceGrant {
                 display_name,
             } => {
                 let mut walked = 0usize;
-                walk_directory(
+                let policy = DirectoryWalkPolicy {
                     root,
+                    root_device: *root_device,
+                    root_label: display_name,
+                    max_items: limits.max_items,
+                };
+                walk_directory(
+                    &policy,
                     Path::new(""),
-                    *root_device,
-                    display_name,
-                    limits.max_items,
                     &mut walked,
                     &mut candidates,
                     &mut complete,
@@ -484,7 +672,7 @@ impl SourceGrant {
                     omission: reason.clone(),
                 });
                 manifest_sources.push(omitted_source(
-                    &candidate,
+                    candidate,
                     reason,
                     ManifestSourceState::Excluded,
                 ));
@@ -497,7 +685,7 @@ impl SourceGrant {
                     omission: reason.clone(),
                 });
                 manifest_sources.push(omitted_source(
-                    &candidate,
+                    candidate,
                     reason,
                     ManifestSourceState::Excluded,
                 ));
@@ -514,7 +702,7 @@ impl SourceGrant {
                     omission: reason.clone(),
                 });
                 manifest_sources.push(omitted_source(
-                    &candidate,
+                    candidate,
                     reason,
                     ManifestSourceState::Excluded,
                 ));
@@ -532,7 +720,7 @@ impl SourceGrant {
                     omission: reason.clone(),
                 });
                 manifest_sources.push(omitted_source(
-                    &candidate,
+                    candidate,
                     reason,
                     ManifestSourceState::Excluded,
                 ));
@@ -559,13 +747,13 @@ impl SourceGrant {
                     omission: reason.clone(),
                 });
                 manifest_sources.push(omitted_source(
-                    &candidate,
+                    candidate,
                     reason,
                     ManifestSourceState::Excluded,
                 ));
                 continue;
             }
-            let result = self.read_candidate(&candidate, expected_length, limits.max_file_bytes);
+            let result = self.read_candidate(candidate, expected_length, limits.max_file_bytes);
             let (raw_bytes, actual_identity) = match result {
                 Ok(value) => value,
                 Err(code) => {
@@ -576,7 +764,7 @@ impl SourceGrant {
                         omission: reason.clone(),
                     });
                     manifest_sources.push(omitted_source(
-                        &candidate,
+                        candidate,
                         reason,
                         ManifestSourceState::Failed,
                     ));
@@ -598,13 +786,140 @@ impl SourceGrant {
                     omission: reason.clone(),
                 });
                 manifest_sources.push(omitted_source(
-                    &candidate,
+                    candidate,
                     reason,
                     ManifestSourceState::Failed,
                 ));
                 continue;
             }
             let object_digest = Digest::from_bytes(&raw_bytes);
+            if matches!(
+                mime.as_str(),
+                "application/pdf" | "image/png" | "image/jpeg"
+            ) {
+                if line_range.is_some() {
+                    let reason = omission(
+                        SourceOmissionCode::InvalidRange,
+                        "binary documents require page or image selection rather than text line ranges",
+                    );
+                    manifest_sources.push(omitted_source(
+                        candidate,
+                        reason.clone(),
+                        ManifestSourceState::Failed,
+                    ));
+                    problems.push(CaptureProblem {
+                        source_id: source_id.clone(),
+                        state: ManifestSourceState::Failed,
+                        omission: reason,
+                    });
+                    continue;
+                }
+                match crate::extraction::extract_native(&raw_bytes, &mime) {
+                    Ok(extracted) => {
+                        if extracted
+                            .pages
+                            .iter()
+                            .filter_map(|page| page.text.as_deref())
+                            .any(contains_sensitive_content)
+                        {
+                            let reason = omission(
+                                SourceOmissionCode::AccessDenied,
+                                "selected content matches a credential pattern and is not sent to a provider",
+                            );
+                            manifest_sources.push(omitted_source(
+                                candidate,
+                                reason.clone(),
+                                ManifestSourceState::Excluded,
+                            ));
+                            problems.push(CaptureProblem {
+                                source_id: source_id.clone(),
+                                state: ManifestSourceState::Excluded,
+                                omission: reason,
+                            });
+                            continue;
+                        }
+                        let representation_text = serde_json::to_string(&extracted)
+                            .map_err(|_| CaptureError::InvalidSelection)?;
+                        let derived_digest = Digest::from_bytes(representation_text.as_bytes());
+                        let mut locators: Vec<_> = extracted
+                            .pages
+                            .iter()
+                            .map(|p| EvidenceLocator {
+                                source_id: source_id.clone(),
+                                object_digest: object_digest.clone(),
+                                start_line: None,
+                                end_line: None,
+                                total_lines: None,
+                                page: Some(p.page),
+                                width: p.width,
+                                height: p.height,
+                            })
+                            .collect();
+                        if locators.is_empty() {
+                            locators.push(EvidenceLocator {
+                                source_id: source_id.clone(),
+                                object_digest: object_digest.clone(),
+                                start_line: None,
+                                end_line: None,
+                                total_lines: None,
+                                page: None,
+                                width: extracted.width,
+                                height: extracted.height,
+                            });
+                        }
+                        let locator = locators[0].clone();
+                        manifest_sources.push(ManifestSource {
+                            source_id: source_id.clone(),
+                            display_name: safe_manifest_display(&candidate.display_name),
+                            state: ManifestSourceState::Captured,
+                            byte_length: Some(raw_bytes.len() as u64),
+                            mime_type: Some(mime.clone()),
+                            object_digest: Some(object_digest.clone()),
+                            derived_digest: Some(derived_digest.clone()),
+                            representation_kind: Some(extracted.kind),
+                            extractor_id: Some("macos-native-bounded".into()),
+                            extractor_version: Some("1".into()),
+                            included_locators: locators,
+                            omission: None,
+                            captured_at_epoch_ms: Some(captured_at_epoch_ms),
+                            secret_pattern_findings: Vec::new(),
+                            secret_scan_incomplete: true,
+                        });
+                        objects.push(CapturedObject {
+                            source_id: source_id.clone(),
+                            object_digest,
+                            derived_digest,
+                            byte_length: raw_bytes.len() as u64,
+                            raw_bytes,
+                            representation: ContentRepresentation {
+                                kind: extracted.kind,
+                                text: representation_text,
+                                locator,
+                            },
+                        });
+                        used_bytes = used_bytes.saturating_add(expected_length);
+                        captured_source_ids.push(source_id);
+                        continue;
+                    }
+                    Err(error) => {
+                        let reason = omission(
+                            SourceOmissionCode::ReadFailure,
+                            &format!("bounded native extraction failed: {error}"),
+                        );
+                        manifest_sources.push(omitted_source(
+                            candidate,
+                            reason.clone(),
+                            ManifestSourceState::Failed,
+                        ));
+                        problems.push(CaptureProblem {
+                            source_id: source_id.clone(),
+                            state: ManifestSourceState::Failed,
+                            omission: reason,
+                        });
+                        continue;
+                    }
+                }
+            }
             let text = match std::str::from_utf8(&raw_bytes) {
                 Ok(value) if !value.as_bytes().contains(&0) => value,
                 Ok(_) => {
@@ -618,7 +933,7 @@ impl SourceGrant {
                         omission: reason.clone(),
                     });
                     manifest_sources.push(omitted_source(
-                        &candidate,
+                        candidate,
                         reason,
                         ManifestSourceState::Excluded,
                     ));
@@ -635,14 +950,14 @@ impl SourceGrant {
                         omission: reason.clone(),
                     });
                     manifest_sources.push(omitted_source(
-                        &candidate,
+                        candidate,
                         reason,
                         ManifestSourceState::Excluded,
                     ));
                     continue;
                 }
             };
-            let line_count = line_spans(text).len() as u64;
+            let line_count = text.split_inclusive('\n').count() as u64;
             let (start, end, included_text) = match select_lines(text, &line_range) {
                 Ok(value) => value,
                 Err(_) => {
@@ -656,13 +971,30 @@ impl SourceGrant {
                         omission: reason.clone(),
                     });
                     manifest_sources.push(omitted_source(
-                        &candidate,
+                        candidate,
                         reason,
                         ManifestSourceState::Failed,
                     ));
                     continue;
                 }
             };
+            if contains_sensitive_content(included_text) {
+                let reason = omission(
+                    SourceOmissionCode::AccessDenied,
+                    "selected content matches a credential pattern and is not sent to a provider",
+                );
+                problems.push(CaptureProblem {
+                    source_id: source_id.clone(),
+                    state: ManifestSourceState::Excluded,
+                    omission: reason.clone(),
+                });
+                manifest_sources.push(omitted_source(
+                    candidate,
+                    reason,
+                    ManifestSourceState::Excluded,
+                ));
+                continue;
+            }
             let derived_digest = Digest::from_bytes(included_text.as_bytes());
             let representation_text = included_text.to_owned();
             let locator = EvidenceLocator {
@@ -671,8 +1003,10 @@ impl SourceGrant {
                 start_line: start,
                 end_line: end,
                 total_lines: line_range.as_ref().map(|_| line_count),
+                page: None,
+                width: None,
+                height: None,
             };
-            let findings = find_secret_patterns(included_text);
             manifest_sources.push(ManifestSource {
                 source_id: source_id.clone(),
                 display_name: candidate.display_name.clone(),
@@ -687,7 +1021,7 @@ impl SourceGrant {
                 included_locators: vec![locator.clone()],
                 omission: None,
                 captured_at_epoch_ms: Some(captured_at_epoch_ms),
-                secret_pattern_findings: findings,
+                secret_pattern_findings: Vec::new(),
                 secret_scan_incomplete: true,
             });
             objects.push(CapturedObject {
@@ -841,7 +1175,6 @@ impl SourceGrant {
     }
 }
 
-#[cfg(unix)]
 fn safe_components(path: &Path) -> io::Result<Vec<OsString>> {
     path.components()
         .map(|component| match component {
@@ -852,6 +1185,57 @@ fn safe_components(path: &Path) -> io::Result<Vec<OsString>> {
             )),
         })
         .collect()
+}
+
+fn normalize_absolute_path(path: &Path) -> Result<PathBuf, CaptureError> {
+    if !path.is_absolute() {
+        return Err(CaptureError::InvalidSourceScope);
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir => normalized.push("/"),
+            Component::Normal(name) => normalized.push(name),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if normalized != Path::new("/") {
+                    normalized.pop();
+                }
+            }
+            Component::Prefix(_) => return Err(CaptureError::InvalidSourceScope),
+        }
+    }
+    if normalized == Path::new("/") {
+        return Err(CaptureError::InvalidSourceScope);
+    }
+    Ok(normalized)
+}
+
+#[cfg(unix)]
+fn open_absolute_directory_nofollow(path: &Path) -> io::Result<Dir> {
+    let relative = path.strip_prefix("/").map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "source scope root must be absolute",
+        )
+    })?;
+    let components = safe_components(relative)?;
+    if components.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "filesystem root cannot be granted as a source scope",
+        ));
+    }
+    let filesystem_root = Dir::open_ambient_dir("/", ambient_authority())?;
+    open_directory_chain(&filesystem_root, &components)
+}
+
+#[cfg(not(unix))]
+fn open_absolute_directory_nofollow(_path: &Path) -> io::Result<Dir> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "source scopes require no-follow directory handles",
+    ))
 }
 
 #[cfg(unix)]
@@ -920,16 +1304,26 @@ fn metadata_within_nofollow(_root: &Dir, _path: &Path) -> io::Result<Metadata> {
     ))
 }
 
-fn walk_directory(
-    root: &Dir,
-    prefix: &Path,
+struct DirectoryWalkPolicy<'a> {
+    root: &'a Dir,
     root_device: u64,
-    root_label: &str,
+    root_label: &'a str,
     max_items: usize,
+}
+
+fn walk_directory(
+    policy: &DirectoryWalkPolicy<'_>,
+    prefix: &Path,
     visited: &mut usize,
     candidates: &mut BTreeMap<String, Candidate>,
     complete: &mut bool,
 ) -> Result<(), CaptureError> {
+    let DirectoryWalkPolicy {
+        root,
+        root_device,
+        root_label,
+        max_items,
+    } = *policy;
     let directory = open_directory_within_nofollow(root, prefix)
         .map_err(|_| CaptureError::DirectoryReadFailed)?;
     let mut entries: Vec<cap_std::fs::DirEntry> = directory
@@ -1025,16 +1419,7 @@ fn walk_directory(
                 );
                 continue;
             }
-            walk_directory(
-                root,
-                &relative,
-                root_device,
-                root_label,
-                max_items,
-                visited,
-                candidates,
-                complete,
-            )?;
+            walk_directory(policy, &relative, visited, candidates, complete)?;
         } else if metadata.is_file() {
             let identity = FileIdentity::from_metadata(&metadata);
             let mut candidate = candidate_for(visible_name, Some(relative), identity, true, None);
@@ -1162,14 +1547,27 @@ fn select_lines<'a>(
     let Some(range) = range else {
         return Ok((None, None, text));
     };
-    let spans = line_spans(text);
-    let start = usize::try_from(range.start_line).map_err(|_| ())?;
-    let end = usize::try_from(range.end_line).map_err(|_| ())?;
-    if start == 0 || end < start || end > spans.len() {
+    if range.start_line == 0 || range.end_line < range.start_line {
         return Err(());
     }
-    let byte_start = spans[start - 1].0;
-    let byte_end = spans[end - 1].1;
+    let mut line_number = 0u64;
+    let mut offset = 0usize;
+    let mut byte_start = None;
+    let mut byte_end = None;
+    for segment in text.split_inclusive('\n') {
+        line_number = line_number.saturating_add(1);
+        if line_number == range.start_line {
+            byte_start = Some(offset);
+        }
+        offset = offset.saturating_add(segment.len());
+        if line_number == range.end_line {
+            byte_end = Some(offset);
+            break;
+        }
+    }
+    let (Some(byte_start), Some(byte_end)) = (byte_start, byte_end) else {
+        return Err(());
+    };
     Ok((
         Some(range.start_line),
         Some(range.end_line),
@@ -1177,56 +1575,122 @@ fn select_lines<'a>(
     ))
 }
 
-fn line_spans(text: &str) -> Vec<(usize, usize)> {
-    let mut spans = Vec::new();
-    let mut start = 0;
-    for (index, byte) in text.bytes().enumerate() {
-        if byte == b'\n' {
-            spans.push((start, index + 1));
-            start = index + 1;
-        }
-    }
-    if start < text.len() {
-        spans.push((start, text.len()));
-    }
-    spans
+pub fn contains_sensitive_content(text: &str) -> bool {
+    text.lines().any(|line| secret_pattern_kind(line).is_some())
 }
 
-fn find_secret_patterns(text: &str) -> Vec<SecretPatternFinding> {
-    let mut findings = Vec::new();
-    for (index, line) in text.lines().enumerate() {
-        let lower = line.to_ascii_lowercase();
-        let kind = if lower.contains("-----begin ") && lower.contains("private key-----") {
-            Some(SecretPatternKind::PrivateKeyBlock)
-        } else if ["sk-", "ghp_", "github_pat_", "xoxb-", "akia"]
-            .iter()
-            .any(|prefix| lower.contains(prefix))
-        {
-            Some(SecretPatternKind::TokenPrefix)
-        } else if [
-            "password",
-            "passwd",
-            "api_key",
-            "apikey",
-            "client_secret",
-            "access_token",
-            "refresh_token",
-        ]
-        .iter()
-        .any(|name| lower.contains(name) && (line.contains('=') || line.contains(':')))
-        {
-            Some(SecretPatternKind::CredentialAssignment)
-        } else {
-            None
-        };
-        if let Some(kind) = kind {
-            findings.push(SecretPatternFinding {
-                line: index as u64 + 1,
-                kind,
-            });
-        }
+fn secret_pattern_kind(line: &str) -> Option<SecretPatternKind> {
+    let lower = line.to_ascii_lowercase();
+    if lower.contains("-----begin ") && lower.contains("private key-----") {
+        Some(SecretPatternKind::PrivateKeyBlock)
+    } else if contains_credential_token(&lower, "sk-", 20)
+        || contains_credential_token(&lower, "ghp_", 20)
+        || contains_credential_token(&lower, "github_pat_", 20)
+        || contains_credential_token(&lower, "xoxb-", 20)
+        || contains_credential_token(&lower, "akia", 16)
+        || contains_credential_token(&lower, "authorization: bearer ", 8)
+    {
+        Some(SecretPatternKind::TokenPrefix)
+    } else if contains_credential_assignment(&lower) {
+        Some(SecretPatternKind::CredentialAssignment)
+    } else {
+        None
     }
-    findings
+}
+
+fn contains_credential_token(lower: &str, prefix: &str, minimum_length: usize) -> bool {
+    lower.match_indices(prefix).any(|(start, _)| {
+        let left_boundary = lower[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|character| !character.is_ascii_alphanumeric() && character != '_');
+        let token = lower[start + prefix.len()..]
+            .chars()
+            .take_while(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+            })
+            .count();
+        let full_token = &lower[start..start + prefix.len() + token];
+        left_boundary && token >= minimum_length && !is_known_placeholder_token(prefix, full_token)
+    })
+}
+
+fn is_known_placeholder_token(prefix: &str, full_token: &str) -> bool {
+    matches!(
+        full_token,
+        "authorization: bearer your-token-here"
+            | "authorization: bearer your-token"
+            | "authorization: bearer example-token"
+            | "authorization: bearer placeholder-token"
+            | "authorization: bearer redacted-token"
+            | "akiaiosfodnn7example"
+    ) || (prefix == "authorization: bearer "
+        && matches!(
+            full_token,
+            "authorization: bearer example"
+                | "authorization: bearer placeholder"
+                | "authorization: bearer redacted"
+        ))
+}
+
+fn contains_credential_assignment(lower: &str) -> bool {
+    [
+        "password",
+        "passwd",
+        "api_key",
+        "apikey",
+        "client_secret",
+        "access_token",
+        "refresh_token",
+    ]
+    .iter()
+    .any(|key| {
+        lower.match_indices(key).any(|(start, _)| {
+            let before_is_key = lower[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_');
+            let after_key = &lower[start + key.len()..];
+            let after_is_key = after_key
+                .chars()
+                .next()
+                .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_');
+            if before_is_key || after_is_key {
+                return false;
+            }
+            let separator = after_key.trim_start();
+            let Some(value) = separator
+                .strip_prefix('=')
+                .or_else(|| separator.strip_prefix(':'))
+            else {
+                return false;
+            };
+            let value = value
+                .trim_start()
+                .trim_matches(|character| matches!(character, '\'' | '"' | '`'));
+            let token = value
+                .chars()
+                .take_while(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '/')
+                })
+                .collect::<String>();
+            token.len() >= 8
+                && ![
+                    "placeholder",
+                    "redacted",
+                    "changeme",
+                    "example",
+                    "your_api_key",
+                    "your-api-key",
+                    "none",
+                    "null",
+                    "false",
+                    "true",
+                ]
+                .iter()
+                .any(|placeholder| token.starts_with(placeholder))
+        })
+    })
 }
 
 fn path_has_hidden_component(path: &Path) -> bool {
@@ -1307,6 +1771,9 @@ fn is_credential_name(value: &str) -> bool {
 fn mime_type(name: &str) -> Option<String> {
     let extension = Path::new(name).extension()?.to_str()?.to_ascii_lowercase();
     let mime = match extension.as_str() {
+        "pdf" => "application/pdf",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
         "txt" | "log" => "text/plain",
         "md" | "markdown" | "mdx" => "text/markdown",
         "json" | "jsonl" => "application/json",
@@ -1417,5 +1884,54 @@ fn omission_text(code: SourceOmissionCode) -> &'static str {
         SourceOmissionCode::RevokedGrant => "source permission has been revoked",
         SourceOmissionCode::InvalidRange => "selected line range is outside the captured text",
         SourceOmissionCode::ReadFailure => "the selected source could not be captured",
+    }
+}
+
+#[cfg(test)]
+mod traversal_policy_tests {
+    use super::*;
+
+    #[test]
+    fn recursive_enumeration_preserves_denials_and_shared_item_budget() {
+        let root = std::env::temp_dir().join(format!("magi-context-policy-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        std::fs::write(root.join("nested/allowed.txt"), "public fixture").unwrap();
+        std::fs::write(root.join(".hidden.txt"), "hidden fixture").unwrap();
+        std::fs::write(root.join("credentials.json"), "excluded fixture").unwrap();
+        std::os::unix::fs::symlink(root.join("nested/allowed.txt"), root.join("linked.txt"))
+            .unwrap();
+        let directory = Dir::open_ambient_dir(&root, ambient_authority()).unwrap();
+        let mut grant = SourceGrant::selected_directory(directory, "fixture").unwrap();
+        let report = grant.enumerate(CaptureLimits::default()).unwrap();
+        assert!(report.complete);
+        assert!(
+            report
+                .candidates
+                .iter()
+                .any(
+                    |candidate| candidate.display_name == "fixture/nested/allowed.txt"
+                        && candidate.omission.is_none()
+                )
+        );
+        for code in [
+            SourceOmissionCode::HiddenPath,
+            SourceOmissionCode::CredentialPath,
+            SourceOmissionCode::SymbolicLink,
+        ] {
+            assert!(report.candidates.iter().any(|candidate| {
+                candidate
+                    .omission
+                    .as_ref()
+                    .is_some_and(|omission| omission.code == code)
+            }));
+        }
+        let limited = grant
+            .enumerate(
+                CaptureLimits::user_confirmed(2, DEFAULT_FILE_BYTES, DEFAULT_MANIFEST_BYTES)
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(!limited.complete);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
