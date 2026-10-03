@@ -8,6 +8,9 @@ members = [
 ]
 resolver = "2"
 
+[patch.crates-io]
+tauri-plugin-updater = { path = "vendor/tauri-plugin-updater" }
+
 [package]
 name = "magi-console"
 default-run = "magi-console"
@@ -26,7 +29,7 @@ custom-protocol = ["tauri/custom-protocol"]
 
 [[bin]]
 name = "magi-native-live-probe"
-path = "src/native_live_tests.rs"
+path = "src/bin/magi-native-live-probe.rs"
 required-features = ["native-live-probe"]
 
 [lib]
@@ -56,3 +59,18 @@ serde_json = "1"
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-dialog = "2"
 uuid = { version = "1", features = ["v4"] }
+
+tauri-plugin-updater = "=2.11.0"
+reqwest = { version = "=0.13.5", default-features = false, features = ["json", "rustls"] }
+ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
+sha2 = "0.10"
+base64 = "0.22"
+semver = "1"
+minisign-verify = "0.2"
+
+[dev-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[[test]]
+name = "resource-build-contract"
+path = "tests/resource-build-contract.rs"

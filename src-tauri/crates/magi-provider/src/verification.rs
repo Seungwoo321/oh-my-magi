@@ -114,6 +114,49 @@ impl Drop for ActivityLease {
     }
 }
 
+pub(crate) struct PromptPublicationAuthorization {
+    expires_at_epoch_ms: u64,
+    deadline: std::time::Instant,
+    check_current: Arc<dyn Fn() -> Result<(), ProviderError> + Send + Sync>,
+}
+impl PromptPublicationAuthorization {
+    pub(crate) fn new(
+        expires_at_epoch_ms: u64,
+        check_current: Arc<dyn Fn() -> Result<(), ProviderError> + Send + Sync>,
+    ) -> Result<Self, ProviderError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| ProviderError::Cancelled)?
+            .as_millis();
+        let remaining = u128::from(expires_at_epoch_ms)
+            .checked_sub(now)
+            .filter(|n| *n > 0)
+            .ok_or(ProviderError::Cancelled)?;
+        let deadline = std::time::Instant::now()
+            .checked_add(std::time::Duration::from_millis(
+                u64::try_from(remaining).map_err(|_| ProviderError::Cancelled)?,
+            ))
+            .ok_or(ProviderError::Cancelled)?;
+        Ok(Self {
+            expires_at_epoch_ms,
+            deadline,
+            check_current,
+        })
+    }
+    pub(crate) fn check(&self) -> Result<(), ProviderError> {
+        (self.check_current)()?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| ProviderError::Cancelled)?
+            .as_millis();
+        if now >= u128::from(self.expires_at_epoch_ms) || std::time::Instant::now() >= self.deadline
+        {
+            return Err(ProviderError::Cancelled);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct EffectAuthority {
     revoked: Arc<AtomicBool>,

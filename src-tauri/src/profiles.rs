@@ -7,12 +7,12 @@ use magi_domain::{
     AcpMode, AcpModelBindingSnapshot, AssessmentStage, AuthFailureProfileBinding, Ballot,
     CONTRACT_SCHEMA_VERSION, Claim, ClaimKind, ClaimResponse, CommandEnvelope, CommandKind,
     ContextManifest, CoreId, CoreRoleDefinition, CoreRoleProfile, Counterargument, Digest,
-    EvidenceRef, InformationGap, InputSnapshot, LiveProviderUsage, LiveRunFailure,
-    LiveRunProviderOutcome, LiveRunSnapshot, LiveRunStatus, ModelBindingSnapshot, OpenObjection,
-    PositionChange, ProposalClaim, ProposalSnapshot, ProviderAuthenticationMethod,
-    ProviderCatalogModel, ProviderCatalogSnapshot, ProviderProfileInput, ProviderProfileRevision,
-    QuestionKind, QuestionSnapshot, RoleAssessment, RolePresetRevision, RoleSetSnapshot, Run,
-    RunAggregate, RunStatus, VoteValue,
+    EvidenceRef, InformationGap, InputSnapshot, LiveRunFailure, LiveRunProviderOutcome,
+    LiveRunSnapshot, LiveRunStatus, ModelBindingSnapshot, OpenObjection, PositionChange,
+    ProposalClaim, ProposalSnapshot, ProviderAuthenticationMethod, ProviderCatalogModel,
+    ProviderCatalogSnapshot, ProviderProfileInput, ProviderProfileRevision, QuestionKind,
+    QuestionSnapshot, RoleAssessment, RolePresetRevision, RoleSetSnapshot, Run, RunAggregate,
+    RunStatus, VoteValue,
 };
 use magi_provider::{
     AuthMethod, AuthProgressStage, AuthenticationStatus, AvailableModel, CODEX_ACP_GIT_COMMIT,
@@ -36,10 +36,7 @@ use std::{
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     pin::Pin,
-    sync::{
-        Arc, Condvar, Mutex, OnceLock,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Condvar, Mutex, OnceLock, atomic::Ordering},
     task::{Context, Poll, Waker},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -978,7 +975,10 @@ fn provider_catalog_state(
     let model_selection_revision = storage
         .provider_model_selection_revision(profile_id)
         .map_err(live_run_storage_error)?;
-    let (mut model_selection, mut selection_state) =
+    let model_selection = storage
+        .load_provider_model_selection_intent(profile_id)
+        .map_err(live_run_storage_error)?;
+    let (_, mut selection_state) =
         selection_state(storage.load_provider_model_selection(profile_id))?;
     let selection_matches = model_selection.as_ref().is_none_or(|selection| {
         Some(selection.selection_revision) == model_selection_revision
@@ -994,7 +994,6 @@ fn provider_catalog_state(
             })
     });
     if !selection_matches {
-        model_selection = None;
         selection_state = "stale";
     }
     load_profile_revision(storage, profile_id, expected_revision)?;
@@ -1097,13 +1096,15 @@ pub fn load_core_model_selections(
             let selection_revision = storage
                 .core_model_selection_revision(core_id)
                 .map_err(live_run_storage_error)?;
-            let (mut selection, mut selection_state) =
+            let selection = storage
+                .load_core_model_selection_intent(core_id)
+                .map_err(live_run_storage_error)?;
+            let (_, mut selection_state) =
                 selection_state(storage.load_core_model_selection(core_id))?;
             if selection
                 .as_ref()
                 .is_some_and(|selection| Some(selection.selection_revision) != selection_revision)
             {
-                selection = None;
                 selection_state = "stale";
             }
             Ok(CoreModelSelectionStateDto {
@@ -1161,7 +1162,7 @@ async fn refresh_provider_catalog_snapshot_inner(
     profile: &ProviderProfileRevision,
     lifecycle: Option<&crate::commands::AdmissionRequestLifecycle>,
 ) -> Result<ProviderCatalogSnapshot, LiveRunError> {
-    let launched = spawn_verified_client_for_authority(app, profile, None, lifecycle)
+    let launched = spawn_verified_client_for_authority(app, profile, None, lifecycle, None)
         .await
         .map_err(|error| {
             LiveRunError::provider(error)
@@ -1340,75 +1341,13 @@ pub async fn start_live_run(
         return Ok(receipt);
     }
 
-    let profile = load_profile_revision(
-        &storage,
-        &model_binding.provider_profile_id,
-        model_binding.profile_revision,
-    )?;
-    let _provider_operation = state
-        .provider_operation_for_home(&profile.runtime_home_id)
-        .lock_owned()
-        .await;
-    let refreshed_catalog = refresh_provider_catalog_snapshot(&app, &storage, &profile).await?;
-    drop(_provider_operation);
-    if refreshed_catalog.schema_version != selected_binding.schema_version
-        || refreshed_catalog.provider_id != selected_binding.provider_id
-        || refreshed_catalog.acp_mode != selected_binding.acp_mode
-        || refreshed_catalog.provider_profile_id != selected_binding.provider_profile_id
-        || refreshed_catalog.profile_revision != selected_binding.profile_revision
-        || refreshed_catalog.adapter_id != selected_binding.adapter_id
-        || refreshed_catalog.adapter_version != selected_binding.adapter_version
-        || refreshed_catalog.adapter_digest != selected_binding.adapter_digest
-        || refreshed_catalog.artifact_set_digest != selected_binding.artifact_set_digest
-    {
-        return Err(LiveRunError::new(
-            "model_binding_mismatch",
-            "The provider profile or adapter changed. Refresh the catalog and select a model again.",
-            false,
-            Some("refresh_catalog".to_owned()),
-        ));
-    }
-    let refreshed_binding = AcpModelBindingSnapshot::from_catalog_with_mode(
-        &refreshed_catalog,
-        &selected_binding.model_id,
-        selected_binding.mode_id.as_deref(),
-    )
-    .map_err(|_| {
-        LiveRunError::new(
-            "model_unavailable",
-            "The provider no longer lists the selected model. Refresh the catalog and select another model.",
-            false,
-            Some("refresh_catalog".to_owned()),
-        )
-    })?;
-    let outcome = storage
-        .admit_live_run(&LiveRunAdmissionRequest {
-            command_id,
-            idempotency_key,
-            question,
-            model_binding: refreshed_binding,
-        })
-        .map_err(live_run_storage_error)?;
-    match outcome {
-        LiveRunAdmissionOutcome::Accepted { receipt, duplicate } => {
-            if !duplicate {
-                emit_live_run_change(
-                    &app,
-                    LiveRunChange {
-                        run_id: receipt.run_id.clone(),
-                        revision: receipt.accepted_revision,
-                        event_cursor: receipt.event_cursor.clone(),
-                    },
-                );
-            }
-            state.wake_live_run_dispatcher();
-            Ok(receipt)
-        }
-        LiveRunAdmissionOutcome::QueueFull {
-            capacity,
-            admitted_count,
-        } => Err(LiveRunError::queue_full(capacity, admitted_count)),
-    }
+    let _ = app;
+    Err(LiveRunError::new(
+        "legacy_disclosure_unavailable",
+        "A new run requires the reviewed three-core deliberation and disclosure authority. Existing records remain readable.",
+        false,
+        None,
+    ))
 }
 
 #[tauri::command]
@@ -1437,6 +1376,8 @@ pub struct StartDeliberationInputDto {
     role_preset_id: String,
     role_revision: u64,
     disclosure_confirmed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_common_context_budget_revision: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     admission_authority: Option<crate::commands::AdmissionAuthorityDto>,
 }
@@ -1494,22 +1435,52 @@ pub async fn start_clarification(
     start_deliberation_for_parent(window, app, state, input.request, Some(parent)).await
 }
 
+fn resolved_admission_intent(
+    storage: &Storage,
+    input: &StartDeliberationInputDto,
+) -> Result<magi_storage::AdmissionRequestIntent, LiveRunError> {
+    let mut intent = admission_intent(input);
+    intent.common_context_budget = storage
+        .load_admission_request_budget(&input.command_id, &input.idempotency_key)
+        .map_err(live_run_storage_error)?;
+    if intent.common_context_budget.as_ref().is_some_and(|policy| {
+        policy.settings_field_revision != input.expected_common_context_budget_revision.unwrap_or(0)
+    }) {
+        return Err(common_budget_changed());
+    }
+    Ok(intent)
+}
+
 fn register_request_binding(
     storage: &Storage,
     input: &StartDeliberationInputDto,
     parent: Option<&magi_storage::ClarificationAdmissionIntent>,
 ) -> Result<magi_storage::AdmissionRequestBinding, LiveRunError> {
+    let intent = resolved_admission_intent(storage, input)?;
+    register_request_binding_with_budget(storage, input, parent, intent.common_context_budget)
+}
+
+fn register_request_binding_with_budget(
+    storage: &Storage,
+    input: &StartDeliberationInputDto,
+    parent: Option<&magi_storage::ClarificationAdmissionIntent>,
+    policy: Option<magi_domain::CommonContextBudgetPolicy>,
+) -> Result<magi_storage::AdmissionRequestBinding, LiveRunError> {
+    let mut intent = admission_intent(input);
+    intent.common_context_budget = policy;
     match parent {
         Some(parent) => {
+            let mut parent = parent.clone();
+            parent.request = intent;
             let expected = storage
                 .admission_execution_authority()
                 .map_err(live_run_storage_error)?;
             storage
-                .register_clarification_admission_request(&expected, parent, &now_rfc3339())
+                .register_clarification_admission_request(&expected, &parent, &now_rfc3339())
                 .map_err(live_run_storage_error)
         }
         None => storage
-            .register_admission_request(&admission_intent(input), &now_rfc3339())
+            .register_admission_request(&intent, &now_rfc3339())
             .map_err(live_run_storage_error),
     }
 }
@@ -1552,6 +1523,15 @@ pub enum RegisterDeliberationReceiptDto {
         receipt: StartDeliberationReceiptDto,
     },
 }
+fn common_budget_changed() -> LiveRunError {
+    LiveRunError::new(
+        "common_budget_changed",
+        "The native common context setting changed or could not be verified. Review the input again.",
+        false,
+        None,
+    )
+}
+
 fn admission_authority_error(error: ProviderError) -> LiveRunError {
     let (code, message) = match error {
         ProviderError::Cancelled => (
@@ -1582,6 +1562,7 @@ fn admission_intent(input: &StartDeliberationInputDto) -> magi_storage::Admissio
             role_revision: input.role_revision,
             disclosure_confirmed: input.disclosure_confirmed,
         },
+        common_context_budget: None,
     }
 }
 #[tauri::command]
@@ -1647,16 +1628,34 @@ async fn register_deliberation_request_for_parent(
         .resource_coordinator
         .enter(lifecycle.map(|lifecycle| lifecycle.verification.clone()))
         .map_err(LiveRunError::provider)?;
-    let admission_authority = _native_operation
-        .admit(|admission| {
-            let _coordination = state.live_run_controls.coordinate();
-            let binding = register_request_binding(&storage, &input, parent.as_ref())?;
-            state
-                .admission_requests
-                .issue_for_execution_admitted(admission, binding, lifecycle, storage.clone())
-                .map_err(LiveRunError::provider)
-        })
-        .map_err(LiveRunError::provider)??;
+    let admission_authority = crate::preferences::with_common_context_budget(
+        &app,
+        input.expected_common_context_budget_revision.unwrap_or(0),
+        |policy| {
+            _native_operation
+                .admit(|admission| {
+                    let _coordination = state.live_run_controls.coordinate();
+                    let binding = register_request_binding_with_budget(
+                        &storage,
+                        &input,
+                        parent.as_ref(),
+                        Some(policy.clone()),
+                    )?;
+                    state
+                        .admission_requests
+                        .issue_for_execution_admitted(
+                            admission,
+                            binding,
+                            lifecycle,
+                            storage.clone(),
+                            policy,
+                        )
+                        .map_err(LiveRunError::provider)
+                })
+                .map_err(LiveRunError::provider)?
+        },
+    )
+    .map_err(|_| common_budget_changed())??;
     Ok(RegisterDeliberationReceiptDto::Registered {
         admission_authority,
     })
@@ -1767,6 +1766,18 @@ fn replay_deliberation_start(
     if aggregate.run().parent_run_id.as_deref()
         != parent.map(|intent| intent.parent.run_id.as_str())
     {
+        return Err(live_run_storage_error(StorageError::IdempotencyConflict));
+    }
+    let stored_budget_revision = aggregate
+        .input()
+        .common_context_budget
+        .as_ref()
+        .map_or(0, |policy| policy.settings_field_revision);
+    if input.expected_common_context_budget_revision.unwrap_or(0) != stored_budget_revision {
+        return Err(live_run_storage_error(StorageError::IdempotencyConflict));
+    }
+    let pending = resolved_admission_intent(storage, input)?;
+    if pending.common_context_budget != aggregate.input().common_context_budget {
         return Err(live_run_storage_error(StorageError::IdempotencyConflict));
     }
     let frozen_input = frozen_deliberation_replay_input(
@@ -1895,6 +1906,10 @@ async fn start_deliberation_for_parent(
         .resource_coordinator
         .enter(None)
         .map_err(LiveRunError::provider)?;
+    let mut parent = parent;
+    if let Some(parent) = parent.as_mut() {
+        parent.request = resolved_admission_intent(&storage, &input)?;
+    }
     let binding = register_request_binding(&storage, &input, parent.as_ref())?;
     let capability = input
         .admission_authority
@@ -1904,6 +1919,15 @@ async fn start_deliberation_for_parent(
         .admission_requests
         .resolve(capability, &binding)
         .map_err(admission_authority_error)?;
+    let common_budget = crate::preferences::with_common_context_budget(
+        &app,
+        input.expected_common_context_budget_revision.unwrap_or(0),
+        |policy| policy,
+    )
+    .map_err(|_| common_budget_changed())?;
+    if authority.common_context_budget.as_ref() != Some(&common_budget) {
+        return Err(common_budget_changed());
+    }
     let mut future_guard = AdmissionFutureGuard {
         app: app.clone(),
         window: window.clone(),
@@ -1939,6 +1963,29 @@ async fn start_deliberation_for_parent(
             Some("refresh_catalog".to_owned()),
         ));
     }
+    let budget = preview_budget(
+        &storage,
+        &PreviewDeliberationBudgetInput {
+            question: input.question.clone(),
+            context_draft_id: input.context_draft_id.clone(),
+            context_revision: input.context_revision,
+            core_bindings: input.core_bindings.clone(),
+            role_preset_id: input.role_preset_id.clone(),
+            role_revision: input.role_revision,
+            expected_common_context_budget_revision: input.expected_common_context_budget_revision,
+        },
+        &common_budget,
+    )
+    .map_err(|reason| LiveRunError::new("deliberation_budget_blocked", &reason, false, None))?;
+    if !budget.ready {
+        return Err(LiveRunError::new(
+            "deliberation_budget_blocked",
+            "The frozen inputs do not have a verified complete base budget.",
+            false,
+            None,
+        ));
+    }
+    authority.check().map_err(LiveRunError::provider)?;
     let role_preset = storage
         .load_role_preset_revision(&input.role_preset_id, input.role_revision)
         .map_err(|_| LiveRunError::storage())?
@@ -2085,11 +2132,19 @@ async fn start_deliberation_for_parent(
             model_id: binding.model_id.clone(),
             context_window_tokens: model
                 .context_window_tokens
+                .or_else(|| {
+                    crate::runtime_budget::pinned_model_limits(&model.model_id)
+                        .map(|limits| limits.0)
+                })
                 .map(u32::try_from)
                 .transpose()
                 .map_err(|_| LiveRunError::storage())?,
             maximum_output_tokens: model
                 .max_output_tokens
+                .or_else(|| {
+                    crate::runtime_budget::pinned_model_limits(&model.model_id)
+                        .map(|limits| limits.1)
+                })
                 .map(u32::try_from)
                 .transpose()
                 .map_err(|_| LiveRunError::storage())?,
@@ -2155,12 +2210,13 @@ async fn start_deliberation_for_parent(
         )
     })?;
     let policy_digest = Digest::from_bytes(b"magi-three-role-deliberation-v1");
-    let input_snapshot = InputSnapshot::new_with_request_provenance(
+    let input_snapshot = InputSnapshot::new_with_request_provenance_and_budget(
         question,
         context_manifest,
         role_set,
         policy_digest,
         request_provenance,
+        common_budget.clone(),
     )
     .map_err(|_| {
         LiveRunError::new(
@@ -2219,75 +2275,89 @@ async fn start_deliberation_for_parent(
         question: input.question,
         model_binding,
     };
-    let _coordination = state.live_run_controls.coordinate();
-    let execution = authority.execution().map_err(admission_authority_error)?;
-    let mut permission = authority
-        .state
-        .lock()
-        .map_err(|_| LiveRunError::provider(ProviderError::Cancelled))?;
-    authority
-        .check_locked(&permission)
-        .map_err(LiveRunError::provider)?;
-    let publication = Storage::admission_publication_with_authority(
-        &accepted_at,
-        None,
-        &execution.expected,
-        || {
-            authority
-                .check_locked(&permission)
-                .map_err(|_| StorageError::DispatchFenced)
-        },
-    );
-    let outcome = match parent.as_ref() {
-        Some(parent) => storage.admit_clarification_deliberation_run_checked(
-            &command,
-            &mut aggregate,
-            &request,
-            &core_references,
-            parent,
-            publication,
-        ),
-        None => storage.admit_deliberation_run_checked(
-            &command,
-            &mut aggregate,
-            &request,
-            &core_references,
-            publication,
-        ),
-    };
-    match outcome.map_err(live_run_storage_error)? {
-        LiveRunAdmissionOutcome::Accepted { receipt, duplicate } => {
-            permission.admitted_run = Some(receipt.run_id.clone());
-            let control = state.live_run_controls.register(&receipt.run_id);
-            control
-                .bind_execution(execution.clone())
-                .map_err(admission_authority_error)?;
-            *control
-                .admission_request
-                .lock()
-                .map_err(|_| LiveRunError::provider(ProviderError::Cancelled))? =
-                Some(authority.clone());
-            if !duplicate {
-                emit_live_run_change(
-                    &app,
-                    LiveRunChange {
-                        run_id: receipt.run_id.clone(),
-                        revision: receipt.accepted_revision,
-                        event_cursor: receipt.event_cursor,
-                    },
-                );
+    crate::preferences::with_common_context_budget(
+        &app,
+        common_budget.settings_field_revision,
+        |current_policy| {
+            if current_policy != common_budget {
+                return Err(common_budget_changed());
             }
-            state.wake_live_run_dispatcher();
-            future_guard.completed = true;
-            Ok(StartDeliberationReceiptDto {
-                run_id: receipt.run_id,
-            })
-        }
-        LiveRunAdmissionOutcome::QueueFull {
-            capacity,
-            admitted_count,
-        } => Err(LiveRunError::queue_full(capacity, admitted_count)),
-    }
+            _native_operation
+                .admit(|_| {
+                    let _coordination = state.live_run_controls.coordinate();
+                    let execution = authority.execution().map_err(admission_authority_error)?;
+                    let mut permission = authority
+                        .state
+                        .lock()
+                        .map_err(|_| LiveRunError::provider(ProviderError::Cancelled))?;
+                    authority
+                        .check_locked(&permission)
+                        .map_err(LiveRunError::provider)?;
+                    let publication = Storage::admission_publication_with_authority(
+                        &accepted_at,
+                        None,
+                        &execution.expected,
+                        || {
+                            authority
+                                .check_locked(&permission)
+                                .map_err(|_| StorageError::DispatchFenced)
+                        },
+                    );
+                    let outcome = match parent.as_ref() {
+                        Some(parent) => storage.admit_clarification_deliberation_run_checked(
+                            &command,
+                            &mut aggregate,
+                            &request,
+                            &core_references,
+                            parent,
+                            publication,
+                        ),
+                        None => storage.admit_deliberation_run_checked(
+                            &command,
+                            &mut aggregate,
+                            &request,
+                            &core_references,
+                            publication,
+                        ),
+                    };
+                    match outcome.map_err(live_run_storage_error)? {
+                        LiveRunAdmissionOutcome::Accepted { receipt, duplicate } => {
+                            permission.admitted_run = Some(receipt.run_id.clone());
+                            let control = state.live_run_controls.register(&receipt.run_id);
+                            control
+                                .bind_execution(execution.clone())
+                                .map_err(admission_authority_error)?;
+                            *control
+                                .admission_request
+                                .lock()
+                                .map_err(|_| LiveRunError::provider(ProviderError::Cancelled))? =
+                                Some(authority.clone());
+                            if !duplicate {
+                                emit_live_run_change(
+                                    &app,
+                                    LiveRunChange {
+                                        run_id: receipt.run_id.clone(),
+                                        revision: receipt.accepted_revision,
+                                        event_cursor: receipt.event_cursor,
+                                    },
+                                );
+                            }
+                            state.wake_live_run_dispatcher();
+                            future_guard.completed = true;
+                            Ok(StartDeliberationReceiptDto {
+                                run_id: receipt.run_id,
+                            })
+                        }
+                        LiveRunAdmissionOutcome::QueueFull {
+                            capacity,
+                            admitted_count,
+                        } => Err(LiveRunError::queue_full(capacity, admitted_count)),
+                    }
+                })
+                .map_err(LiveRunError::provider)?
+        },
+    )
+    .map_err(|_| common_budget_changed())?
 }
 
 #[tauri::command]
@@ -2359,7 +2429,7 @@ fn commit_request_cancellation_for_parent(
     input: &CancelDeliberationRequestInputDto,
     parent: Option<&magi_storage::ClarificationAdmissionIntent>,
 ) -> Result<magi_storage::AdmissionRequestCancellationReceipt, LiveRunError> {
-    let intent = admission_intent(&input.request);
+    let intent = resolved_admission_intent(storage, &input.request)?;
     if input.request.admission_authority.is_some() {
         return Err(LiveRunError::provider(ProviderError::InvalidLaunch));
     }
@@ -2382,12 +2452,14 @@ fn commit_request_cancellation_for_parent(
             .collect::<Result<Vec<_>, _>>()?;
         let receipt = match parent {
             Some(parent) => {
+                let mut parent = parent.clone();
+                parent.request = intent.clone();
                 let expected = storage
                     .admission_execution_authority()
                     .map_err(live_run_storage_error)?;
                 storage.cancel_clarification_admission_request(
                     &expected,
-                    parent,
+                    &parent,
                     &input.command_id,
                     &input.idempotency_key,
                     &now_rfc3339(),
@@ -2690,31 +2762,29 @@ async fn cancel_run_inner(
             control.revoke_effects();
             let active_session = control.active_session();
             let client = control.client();
-            let cancel_request = if let Some((client, session_id)) = &active_session {
-                Some((client.clone(), client.begin_cancel(session_id).await))
-            } else {
-                None
-            };
             drop(operation);
 
-            if let Some((client, request)) = cancel_request {
-                match request {
+            if let Some((client, session_id)) = active_session {
+                match client.begin_cancel(&session_id).await {
                     Ok(pending) => {
                         let outcome = client.finish_cancel(pending).await;
-                        client.shutdown().await;
+                        let local_stop_confirmed = client.shutdown_local_stop_confirmed().await;
                         match outcome {
-                            Ok(CancelOutcome::ProviderTerminal { .. }) => {
+                            Ok(CancelOutcome::ProviderTerminal { .. }) if local_stop_confirmed => {
                                 LiveRunProviderOutcome::Confirmed
                             }
                             Ok(CancelOutcome::NoPromptInFlight)
-                                if matches!(
-                                    origin_status,
-                                    LiveRunStatus::Claimed | LiveRunStatus::SessionCreationIntent
-                                ) =>
+                                if local_stop_confirmed
+                                    && matches!(
+                                        origin_status,
+                                        LiveRunStatus::Claimed
+                                            | LiveRunStatus::SessionCreationIntent
+                                    ) =>
                             {
                                 LiveRunProviderOutcome::NotStarted
                             }
-                            Ok(CancelOutcome::NoPromptInFlight)
+                            Ok(CancelOutcome::ProviderTerminal { .. })
+                            | Ok(CancelOutcome::NoPromptInFlight)
                             | Ok(CancelOutcome::LocalProcessTerminatedWithoutConfirmation)
                             | Err(_) => LiveRunProviderOutcome::Unknown,
                         }
@@ -2725,10 +2795,13 @@ async fn cancel_run_inner(
                     }
                 }
             } else {
-                if let Some(client) = &client {
-                    client.shutdown().await;
-                }
-                let stop_unconfirmed = origin_status == LiveRunStatus::Running
+                let local_stop_confirmed = if let Some(client) = &client {
+                    client.shutdown_local_stop_confirmed().await
+                } else {
+                    !control.provider_startup_started()
+                };
+                let stop_unconfirmed = !local_stop_confirmed
+                    || origin_status == LiveRunStatus::Running
                     || (control.provider_startup_started() && client.is_none())
                     || (control.session_creation_started()
                         && control.session_creation_outcome_unknown());
@@ -2791,6 +2864,9 @@ fn deliberation_cancel_update(snapshot: &magi_domain::RunSnapshot) -> serde_json
 }
 
 fn emit_deliberation_cancel_change(app: &AppHandle, storage: &Storage, run_id: &str) {
+    if let Ok(projection) = crate::core_dispatch::load(storage, run_id) {
+        let _ = app.emit("magi:core-dispatches", projection);
+    }
     if let Ok(dossier) = storage.load_run_dossier(run_id) {
         let _ = app.emit_to(
             "main",
@@ -2801,12 +2877,19 @@ fn emit_deliberation_cancel_change(app: &AppHandle, storage: &Storage, run_id: &
 }
 
 fn provider_catalog_model(model: AvailableModel) -> ProviderCatalogModel {
+    let pinned = crate::runtime_budget::pinned_model_limits(&model.model_id);
     ProviderCatalogModel {
         model_id: model.model_id,
         name: model.name,
         description: model.description,
-        context_window_tokens: model.context_window_tokens,
-        max_output_tokens: model.max_output_tokens,
+        context_window_tokens: match (model.context_window_tokens, pinned) {
+            (Some(observed), Some(limits)) => Some(observed.min(limits.0)),
+            (observed, pinned) => observed.or(pinned.map(|limits| limits.0)),
+        },
+        max_output_tokens: match (model.max_output_tokens, pinned) {
+            (Some(observed), Some(limits)) => Some(observed.min(limits.1)),
+            (observed, pinned) => observed.or(pinned.map(|limits| limits.1)),
+        },
     }
 }
 
@@ -3163,7 +3246,29 @@ async fn spawn_verified_client_for_run(
     profile: &ProviderProfileRevision,
     control: Option<&Arc<LiveRunControl>>,
 ) -> Result<VerifiedClient, ProviderError> {
-    spawn_verified_client_for_authority(app, profile, control, None).await
+    spawn_verified_client_for_authority(app, profile, control, None, None).await
+}
+
+struct AuthenticationWaitContext<'a> {
+    storage: &'a Storage,
+    expected: &'a magi_storage::AdmissionExecutionAuthority,
+    claim: &'a LiveRunClaim,
+}
+
+async fn await_provider_rpc<T>(
+    control: Option<&Arc<LiveRunControl>>,
+    future: impl Future<Output = Result<T, ProviderError>>,
+) -> Result<T, ProviderError> {
+    if let Some(control) = control {
+        let _operation = control.operation.lock().await;
+        control.check_effect_authority()?;
+    }
+    let result = future.await?;
+    if let Some(control) = control {
+        let _operation = control.operation.lock().await;
+        control.check_effect_authority()?;
+    }
+    Ok(result)
 }
 
 async fn spawn_verified_client_for_authority(
@@ -3171,14 +3276,12 @@ async fn spawn_verified_client_for_authority(
     profile: &ProviderProfileRevision,
     control: Option<&Arc<LiveRunControl>>,
     lifecycle: Option<&crate::commands::AdmissionRequestLifecycle>,
+    authentication_clock: Option<&AuthenticationWaitContext<'_>>,
 ) -> Result<VerifiedClient, ProviderError> {
-    let _effect_operation = if let Some(control) = control {
-        let operation = control.operation.lock().await;
+    if let Some(control) = control {
+        let _operation = control.operation.lock().await;
         control.check_effect_authority()?;
-        Some(operation)
-    } else {
-        None
-    };
+    }
     profile
         .validate()
         .map_err(|_| ProviderError::InvalidLaunch)?;
@@ -3245,6 +3348,19 @@ async fn spawn_verified_client_for_authority(
         )
         .await?,
     );
+    if let Some(control) = control {
+        let operation = control.operation.lock().await;
+        control.install_client(client.clone(), workdir.clone());
+        if let Err(error) = control.check_effect_authority() {
+            drop(operation);
+            if client.shutdown_local_stop_confirmed().await {
+                control.clear_provider_turn(&client);
+            }
+            return Err(error);
+        }
+    }
+    let mut authentication_token = None;
+    let mut authentication_confirmed = false;
     let verification = CatchUnwindFuture::new(async {
         if !client.proves_profile_binding(
             &profile.provider_profile_id,
@@ -3256,7 +3372,7 @@ async fn spawn_verified_client_for_authority(
         if let Some(control) = control {
             control.check_effect_authority()?;
         }
-        let initialize = client.initialize().await?;
+        let initialize = await_provider_rpc(control, client.initialize()).await?;
         let proof = client.home_binding_proof();
         if initialize.home_binding != proof
             || proof.provider_profile_id != profile.provider_profile_id
@@ -3269,7 +3385,29 @@ async fn spawn_verified_client_for_authority(
         if let Some(control) = control {
             control.check_effect_authority()?;
         }
-        client.connect_existing_subscription(subscription).await?;
+        if let Some(clock) = authentication_clock {
+            authentication_token = Some(
+                clock
+                    .storage
+                    .begin_live_run_authentication_wait(clock.expected, clock.claim, &now_rfc3339())
+                    .map_err(|_| ProviderError::ArtifactVerification)?,
+            );
+        }
+        await_provider_rpc(control, client.connect_existing_subscription(subscription)).await?;
+        authentication_confirmed = true;
+        if let (Some(clock), Some(token)) = (authentication_clock, authentication_token.as_deref())
+        {
+            clock
+                .storage
+                .finish_live_run_authentication_wait(
+                    clock.expected,
+                    clock.claim,
+                    token,
+                    &now_rfc3339(),
+                )
+                .map_err(|_| ProviderError::ArtifactVerification)?;
+            authentication_token = None;
+        }
         Ok(())
     })
     .await;
@@ -3281,12 +3419,33 @@ async fn spawn_verified_client_for_authority(
         }),
         Ok(Err(error)) => {
             report_provider_rpc_failure(&client, ProviderDiagnosticPhase::Verification).await;
-            client.shutdown().await;
+            let stopped = client.shutdown_local_stop_confirmed().await;
+            if stopped {
+                if let (Some(clock), Some(token)) =
+                    (authentication_clock, authentication_token.as_deref())
+                    && !authentication_confirmed
+                {
+                    // An uncommitted end remains fenced instead of inventing a close.
+                    let _ = clock.storage.finish_failed_authentication_after_local_stop(
+                        clock.expected,
+                        clock.claim,
+                        token,
+                        &now_rfc3339(),
+                    );
+                }
+                if let Some(control) = control {
+                    control.clear_provider_turn(&client);
+                }
+            }
             drop(workdir);
             Err(error)
         }
         Err(payload) => {
-            client.shutdown().await;
+            if client.shutdown_local_stop_confirmed().await
+                && let Some(control) = control
+            {
+                control.clear_provider_turn(&client);
+            }
             drop(workdir);
             std::panic::resume_unwind(payload)
         }
@@ -3475,6 +3634,20 @@ fn admission_reason(error: &ProviderError) -> &'static str {
     }
 }
 
+fn unreviewed_live_failure() -> LiveRunFailure {
+    LiveRunDispatchFailure::new(
+        "legacy_disclosure_unavailable",
+        "The queued record has no reviewed immutable deliberation or disclosure authority.",
+        false,
+        false,
+    )
+    .failure
+}
+
+fn reject_unreviewed_live_claim(app: &AppHandle, storage: &Arc<Storage>, claim: &LiveRunClaim) {
+    persist_live_run_failure(app, storage, claim, unreviewed_live_failure(), false);
+}
+
 pub(crate) fn start_live_run_dispatcher(
     app: AppHandle,
     storage: Arc<Storage>,
@@ -3543,14 +3716,11 @@ pub(crate) fn start_live_run_dispatcher(
                                 .await;
                             }
                             Ok(false) => {
-                                dispatch_live_run(
+                                reject_unreviewed_live_claim(
                                     &app_for_run,
                                     &storage_for_run,
-                                    claim,
-                                    operations_for_run,
-                                    control,
-                                )
-                                .await;
+                                    &claim,
+                                );
                             }
                             Err(_) => persist_live_run_failure(
                                 &app_for_run,
@@ -3749,27 +3919,6 @@ fn persist_dispatcher_task_failure(app: &AppHandle, storage: &Arc<Storage>, clai
     }
 }
 
-fn persist_pre_session_dispatch_failure(
-    app: &AppHandle,
-    storage: &Arc<Storage>,
-    claim: &LiveRunClaim,
-    code: &str,
-    detail: &str,
-) {
-    persist_live_run_failure(
-        app,
-        storage,
-        claim,
-        LiveRunFailure {
-            profile_binding: None,
-            code: code.to_owned(),
-            detail: detail.to_owned(),
-            external_effect_unknown: false,
-        },
-        false,
-    );
-}
-
 struct CatchUnwindFuture<F: Future> {
     future: Pin<Box<F>>,
 }
@@ -3935,6 +4084,7 @@ struct DeliberationSource<'a> {
     object_digest: &'a str,
     allowed_locators: &'a [String],
     content: &'a str,
+    content_kinds: &'a std::collections::BTreeSet<magi_context::DisclosureContentKind>,
 }
 
 const MAX_AGGREGATE_TRANSITION_DIAGNOSTIC_BYTES: usize = 2_048;
@@ -4330,6 +4480,13 @@ fn accept_deliberation_output(
     turn: DeliberationTurn,
     output: &str,
 ) -> Result<(), LiveRunDispatchFailure> {
+    crate::strict_json::parse_provider_output(output).map_err(|_| {
+        deliberation_error(
+            "provider_output_invalid",
+            "The provider response exceeds the bounded strict JSON contract.",
+            false,
+        )
+    })?;
     let state = aggregate.persistence_state();
     let diagnostic_state = state.clone();
     let at = now_rfc3339();
@@ -4502,6 +4659,7 @@ fn accept_deliberation_output(
 
 fn emit_run_progress(
     app: &AppHandle,
+    storage: &Storage,
     run_id: &str,
     turn: DeliberationTurn,
     state: &'static str,
@@ -4517,6 +4675,12 @@ fn emit_run_progress(
         state: &'static str,
         #[serde(skip_serializing_if = "Option::is_none")]
         text: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        dispatch_projection: Option<crate::core_dispatch::CoreDispatchProjection>,
+    }
+    let dispatch_projection = crate::core_dispatch::load(storage, run_id).ok();
+    if let Some(projection) = &dispatch_projection {
+        let _ = app.emit("magi:core-dispatches", projection);
     }
     let _ = app.emit_to(
         "main",
@@ -4527,6 +4691,7 @@ fn emit_run_progress(
             core_id: turn.core(),
             state,
             text,
+            dispatch_projection,
         },
     );
 }
@@ -4536,6 +4701,8 @@ struct LoadedDeliberationSource {
     object_digest: String,
     allowed_locators: Vec<String>,
     content: String,
+    images: Vec<serde_json::Value>,
+    content_kinds: std::collections::BTreeSet<magi_context::DisclosureContentKind>,
 }
 
 struct ObservedNeedsInputStop {
@@ -4773,6 +4940,7 @@ async fn dispatch_deliberation_run(
         || state.input.role_set.roles[0].catalog_binding.as_ref() != Some(&claim.model_binding)
         || state.input.role_set.frozen_core_selections.is_none()
         || state.input.role_set.validate().is_err()
+        || state.input.validate().is_err()
     {
         persist_deliberation_failure(
             app,
@@ -4861,7 +5029,11 @@ async fn dispatch_deliberation_run(
             }
             return;
         }
-        emit_run_progress(app, &claim.run_id, turn, "started", None);
+        emit_run_progress(app, storage, &claim.run_id, turn, "started", None);
+        let images = sources
+            .iter()
+            .flat_map(|source| source.images.iter().cloned())
+            .collect::<Vec<_>>();
         let source_inputs = sources
             .iter()
             .map(|source| DeliberationSource {
@@ -4869,6 +5041,7 @@ async fn dispatch_deliberation_run(
                 object_digest: &source.object_digest,
                 allowed_locators: &source.allowed_locators,
                 content: &source.content,
+                content_kinds: &source.content_kinds,
             })
             .collect::<Vec<_>>();
         let prompt = match deliberation_turn_prompt(&aggregate, turn, &source_inputs) {
@@ -4882,10 +5055,32 @@ async fn dispatch_deliberation_run(
                     Some(slot_ordinal),
                     failure,
                 );
-                emit_run_progress(app, &claim.run_id, turn, "failed", None);
+                emit_run_progress(app, storage, &claim.run_id, turn, "failed", None);
                 return;
             }
         };
+        let common_text = serde_json::to_string(&serde_json::json!({
+            "question": aggregate.input().question, "approved_sources": source_inputs,
+        }))
+        .expect("validated frozen common projection is serializable");
+        let mut content_kinds = sources
+            .iter()
+            .flat_map(|s| s.content_kinds.iter().copied())
+            .collect::<std::collections::BTreeSet<_>>();
+        content_kinds.insert(magi_context::DisclosureContentKind::Question);
+        content_kinds.insert(magi_context::DisclosureContentKind::RoleProfile);
+        if !matches!(
+            turn,
+            DeliberationTurn::Assessment(AssessmentStage::IndependentReview, _)
+        ) && !aggregate.persistence_state().assessments.is_empty()
+        {
+            content_kinds.insert(magi_context::DisclosureContentKind::PriorAssessment);
+        }
+        if matches!(turn, DeliberationTurn::Ballot(_))
+            && aggregate.persistence_state().proposal.is_some()
+        {
+            content_kinds.insert(magi_context::DisclosureContentKind::Proposal);
+        }
         let mut turn_prompt = prompt;
         let mut correction_attempts = 0u8;
         let expected_revision = loop {
@@ -4903,18 +5098,22 @@ async fn dispatch_deliberation_run(
                     Some(slot_ordinal),
                     failure,
                 );
-                emit_run_progress(app, &claim.run_id, turn, "failed", None);
+                emit_run_progress(app, storage, &claim.run_id, turn, "failed", None);
                 return;
             }
             app_turn_requests += 1;
             let output = run_deliberation_provider_turn(
                 ProviderRunContext {
+                    common_text: &common_text,
+                    common_token_limit: aggregate.input().common_context_token_limit().unwrap_or(0),
+                    content_kinds: &content_kinds,
                     app,
                     storage,
                     claim: &claim,
                 },
                 turn,
                 &turn_prompt,
+                &images,
                 slot_ordinal == 0 && correction_attempts == 0,
                 &provider_operations,
                 &control,
@@ -4950,7 +5149,7 @@ async fn dispatch_deliberation_run(
                         Some(slot_ordinal),
                         failure,
                     );
-                    emit_run_progress(app, &claim.run_id, turn, "failed", None);
+                    emit_run_progress(app, storage, &claim.run_id, turn, "failed", None);
                     return;
                 }
             };
@@ -4976,7 +5175,7 @@ async fn dispatch_deliberation_run(
                         Some(slot_ordinal),
                         failure,
                     );
-                    emit_run_progress(app, &claim.run_id, turn, "failed", None);
+                    emit_run_progress(app, storage, &claim.run_id, turn, "failed", None);
                     return;
                 }
             }
@@ -5004,10 +5203,10 @@ async fn dispatch_deliberation_run(
                 },
                 false,
             );
-            emit_run_progress(app, &claim.run_id, turn, "failed", None);
+            emit_run_progress(app, storage, &claim.run_id, turn, "failed", None);
             return;
         }
-        emit_run_progress(app, &claim.run_id, turn, "completed", None);
+        emit_run_progress(app, storage, &claim.run_id, turn, "completed", None);
         if aggregate.persistence_state().essential_input_pending {
             let permission = match observe_needs_input_stop(&control, &claim).await {
                 Ok(permission) => permission,
@@ -5035,7 +5234,7 @@ async fn dispatch_deliberation_run(
                     eprintln!(
                         "native clarification publication remains fenced after observed provider stop"
                     );
-                    emit_run_progress(app, &claim.run_id, turn, "fenced", None);
+                    emit_run_progress(app, storage, &claim.run_id, turn, "fenced", None);
                 }
             }
             return;
@@ -5089,7 +5288,7 @@ async fn dispatch_deliberation_run(
             emit_live_run_change(app, change);
             let last_turn = DeliberationTurn::for_slot(LIVE_RUN_DISPATCH_CAPACITY - 1)
                 .expect("the fixed deliberation has ten turns");
-            emit_run_progress(app, &claim.run_id, last_turn, "completed", None);
+            emit_run_progress(app, storage, &claim.run_id, last_turn, "completed", None);
         }
         Err(_) => persist_live_run_failure(
             app,
@@ -5165,6 +5364,14 @@ fn load_deliberation_sources(
         )
     })?;
 
+    project_deliberation_sources(storage, context, &manifest)
+}
+
+fn project_deliberation_sources(
+    storage: &Storage,
+    context: &ContextManifest,
+    manifest: &magi_context::SourceCaptureManifest,
+) -> Result<Vec<LoadedDeliberationSource>, LiveRunDispatchFailure> {
     let mut loaded = Vec::with_capacity(context.sources.len());
     for source in &context.sources {
         let captured = manifest
@@ -5184,6 +5391,12 @@ fn load_deliberation_sources(
                     false,
                 )
             })?;
+        if captured.representation_kind != Some(magi_context::RepresentationKind::Utf8Text) {
+            loaded.push(project_native_deliberation_source(
+                storage, source, captured,
+            )?);
+            continue;
+        }
         if source.allowed_locators.len() != 1 || captured.included_locators.len() != 1 {
             return Err(deliberation_error(
                 "approved_source_locator_unsupported",
@@ -5259,6 +5472,14 @@ fn load_deliberation_sources(
             object_digest: source.object_digest.as_str().to_owned(),
             allowed_locators: source.allowed_locators.clone(),
             content: content.to_owned(),
+            content_kinds: [if content.as_bytes() == bytes.as_slice() {
+                magi_context::DisclosureContentKind::SourceOriginal
+            } else {
+                magi_context::DisclosureContentKind::SourceDerivedText
+            }]
+            .into_iter()
+            .collect(),
+            images: Vec::new(),
         });
     }
     Ok(loaded)
@@ -5268,6 +5489,20 @@ fn evidence_locator_identifier(
     locator: &magi_context::EvidenceLocator,
     derived_digest: &Digest,
 ) -> String {
+    if let Some(page) = locator.page {
+        return format!(
+            "pdf-page-v1:{}:page:{page}:width:{}:height:{}",
+            derived_digest.as_str(),
+            locator.width.map_or("text".into(), |v| v.to_string()),
+            locator.height.map_or("text".into(), |v| v.to_string())
+        );
+    }
+    if let (Some(width), Some(height)) = (locator.width, locator.height) {
+        return format!(
+            "image-v1:{}:width:{width}:height:{height}",
+            derived_digest.as_str()
+        );
+    }
     match (locator.start_line, locator.end_line, locator.total_lines) {
         (Some(start), Some(end), Some(total)) => format!(
             "utf8-text-v1:{}:lines:{start}-{end}:of-{total}",
@@ -5350,6 +5585,9 @@ fn persist_deliberation_failure(
 }
 
 struct ProviderRunContext<'a> {
+    common_token_limit: u32,
+    common_text: &'a str,
+    content_kinds: &'a std::collections::BTreeSet<magi_context::DisclosureContentKind>,
     app: &'a AppHandle,
     storage: &'a Arc<Storage>,
     claim: &'a LiveRunClaim,
@@ -5359,6 +5597,7 @@ async fn run_deliberation_provider_turn(
     context: ProviderRunContext<'_>,
     turn: DeliberationTurn,
     prompt: &str,
+    images: &[serde_json::Value],
     first_turn: bool,
     provider_operations: &ProviderOperationRegistry,
     control: &Arc<LiveRunControl>,
@@ -5367,8 +5606,47 @@ async fn run_deliberation_provider_turn(
         app,
         storage,
         claim,
+        common_text,
+        common_token_limit,
+        content_kinds,
     } = context;
     let role = load_aggregate_role(storage, claim, turn.slot(), control)?;
+    crate::runtime_budget::validate_common_context_with_limit(
+        common_text,
+        images.len() as u64,
+        crate::runtime_budget::high_detail_vision_bound(&role.binding, images.len() as u64),
+        common_token_limit,
+    )
+    .map_err(|_| {
+        deliberation_error(
+            "deliberation_common_budget_exhausted",
+            "The frozen common question and approved sources exceed their verified frozen budget.",
+            false,
+        )
+    })?;
+    crate::runtime_budget::evaluate_slot(
+        &role.binding,
+        prompt,
+        images.len() as u64,
+        crate::runtime_budget::high_detail_vision_bound(&role.binding, images.len() as u64),
+        0,
+    )
+    .map_err(|_| {
+        deliberation_error(
+            "deliberation_budget_exhausted",
+            "The actual next serialized input exceeds its verified frozen budget.",
+            false,
+        )
+    })?;
+    let mut prompt_blocks = vec![serde_json::json!({"type":"text","text":prompt})];
+    prompt_blocks.extend_from_slice(images);
+    CodexAcpClient::validate_prompt_blocks(&prompt_blocks).map_err(|_| {
+        deliberation_error(
+            "deliberation_wire_limit",
+            "The exact prompt blocks exceed the provider wire limit.",
+            false,
+        )
+    })?;
     let model_binding = role.catalog_binding.as_ref().ok_or_else(|| {
         deliberation_error(
             "role_binding_missing",
@@ -5396,13 +5674,52 @@ async fn run_deliberation_provider_turn(
         .for_runtime_home(&profile.runtime_home_id)
         .lock_owned()
         .await;
+    let execution = control
+        .execution()
+        .map_err(|error| LiveRunDispatchFailure::provider(error, false, false))?;
+    let clock = storage
+        .live_run_active_clock(&execution.expected, claim, &now_rfc3339())
+        .map_err(|_| {
+            deliberation_error(
+                "active_clock_unverified",
+                "The durable Run active-time budget cannot be verified.",
+                false,
+            )
+        })?;
+    if clock.remaining_millis == 0 {
+        return Err(deliberation_error(
+            "active_clock_exhausted",
+            "The Run reached its cumulative active-time budget.",
+            false,
+        ));
+    }
+    let startup_deadline = control
+        .set_provider_deadline(Instant::now() + Duration::from_secs(600))
+        .map_err(|error| LiveRunDispatchFailure::provider(error, false, false))?;
     control.mark_provider_startup_started();
     control
         .check_effect_authority()
         .map_err(|error| LiveRunDispatchFailure::provider(error, false, false))?;
-    let launched = spawn_verified_client_for_run(app, &profile, Some(control))
-        .await
-        .map_err(|error| LiveRunDispatchFailure::provider(error, false, false))?;
+    let authentication_clock = AuthenticationWaitContext {
+        storage,
+        expected: &execution.expected,
+        claim,
+    };
+    let launched = spawn_verified_client_for_authority(
+        app,
+        &profile,
+        Some(control),
+        None,
+        Some(&authentication_clock),
+    )
+    .await
+    .map_err(|error| {
+        let unresolved = control.client().is_some()
+            || storage
+                .live_run_active_clock(&execution.expected, claim, &now_rfc3339())
+                .is_err();
+        LiveRunDispatchFailure::provider(error, unresolved, false)
+    })?;
     {
         let operation = control.operation.lock().await;
         if control.check_effect_authority().is_err() {
@@ -5431,7 +5748,7 @@ async fn run_deliberation_provider_turn(
         .await
         .map_err(|error| LiveRunDispatchFailure::provider(error, false, false))?;
     let session_operation = async {
-        let _operation = control.operation.lock().await;
+        let operation = control.operation.lock().await;
         if control.check_effect_authority().is_err() {
             return Err(deliberation_error(
                 "dispatch_fenced",
@@ -5465,24 +5782,26 @@ async fn run_deliberation_provider_turn(
             emit_live_run_change(app, change);
         }
         control.mark_session_creation_started();
-        let pending = launched
-            .client
-            .begin_new_session(prepared)
+        control.set_session_creation_outcome_unknown(true);
+        drop(operation);
+        let pending = await_provider_rpc(Some(control), launched.client.begin_new_session(prepared))
             .await
             .map_err(|error| {
                 let unknown = session_creation_outcome_unknown(&error);
                 control.set_session_creation_outcome_unknown(unknown);
                 LiveRunDispatchFailure::provider(error, unknown, false)
             })?;
-        let session = launched
-            .client
-            .finish_new_session(pending)
+        let session = await_provider_rpc(Some(control), launched.client.finish_new_session(pending))
             .await
             .map_err(|error| {
                 let unknown = session_creation_outcome_unknown(&error);
                 control.set_session_creation_outcome_unknown(unknown);
                 LiveRunDispatchFailure::provider(error, unknown, false)
             })?;
+        let _operation = control.operation.lock().await;
+        control.check_effect_authority().map_err(|error| LiveRunDispatchFailure::provider(error, true, false))?;
+        load_aggregate_role(storage, claim, turn.slot(), control)?;
+        control.install_session(session.session_id.clone());
         control.set_session_creation_outcome_unknown(false);
         if first_turn {
             let change = storage
@@ -5556,15 +5875,38 @@ async fn run_deliberation_provider_turn(
         ));
     }
     load_aggregate_role(storage, claim, turn.slot(), control)?;
-    let mut handle = launched
-        .client
-        .prompt(&session.session_id, prompt.to_owned())
+    let model_clock = storage.live_run_active_clock(&execution.expected, claim, &now_rfc3339())
+        .map_err(|_| deliberation_error("active_clock_unverified", "The post-authentication Run budget cannot be verified.", false))?;
+    if model_clock.remaining_millis == 0 {
+        return Err(deliberation_error("active_clock_exhausted", "The Run reached its cumulative active-time budget.", false));
+    }
+    let model_deadline = Instant::now() + Duration::from_millis(model_clock.remaining_millis.min(600_000));
+    launched.client.begin_authenticated_model_phase(&confirmed, model_deadline).await
+        .map_err(|error| LiveRunDispatchFailure::provider(error, false, false))?;
+    drop(startup_deadline);
+    let _model_deadline = control.set_provider_deadline(model_deadline)
+        .map_err(|error| LiveRunDispatchFailure::provider(error, false, false))?;
+    drop(operation);
+    let request_digest = Digest::from_bytes(&serde_json::to_vec(&prompt_blocks).map_err(|_| deliberation_error("disclosure_request_invalid", "The actual prompt cannot be sealed.", false))?);
+    let attempt_id = Uuid::new_v4().simple().to_string();
+    let reservation = storage.reserve_disclosure_turn(&execution.expected, claim, magi_storage::DisclosureTurnRequest {
+        slot_ordinal: turn.slot(), attempt_id: &attempt_id, request_digest: &request_digest, content_kinds,
+    }, &now_rfc3339()).map_err(|_| deliberation_error("disclosure_grant_fenced", "The actual prompt has no current disclosure authorization.", false))?;
+    let expiry = reservation.expires_at_epoch_ms();
+    let check_storage = storage.clone();
+    let check_expected = execution.expected.clone();
+    let check_claim = claim.clone();
+    let check_kinds = content_kinds.clone();
+    let check_current = Arc::new(move || {
+        check_storage.authorize_reserved_disclosure_now(&check_expected, &check_claim, &reservation, &request_digest, &check_kinds)
+            .map_err(|_| magi_provider::ProviderError::Cancelled)
+    });
+    let mut handle = await_provider_rpc(Some(control), launched.client.prompt_blocks_authorized(&session.session_id, prompt_blocks, expiry, check_current))
         .await
         .map_err(|error| {
             let unknown = prompt_outcome_unknown(&error);
             LiveRunDispatchFailure::provider(error, unknown, false)
         })?;
-    drop(operation);
     let (_replacement_sender, replacement_receiver) = async_runtime::channel(1);
     let event_receiver = std::mem::replace(&mut handle.events, replacement_receiver);
     let app_for_events = app.clone();
@@ -5633,6 +5975,11 @@ async fn run_deliberation_provider_turn(
     let output = match provider_result {
         Ok(result) if !security_violation_seen => {
             require_durable_stream_equality(&result.final_text, &durable_text)?;
+            let public_tokens=CodexAcpClient::public_text_token_count(&role.binding.model_id,&result.final_text)
+                .map_err(|_|deliberation_error("public_output_token_count_unavailable","The public output encoding is not verified for the frozen model.",false))?;
+            if public_tokens>8192 {
+                return Err(deliberation_error("public_output_token_limit","The recorded provider output exceeds the accepted token limit.",false));
+            }
             result.final_text
         },
         Ok(_) => {
@@ -5691,269 +6038,6 @@ fn frozen_recipients_authorized(recipients: &[Recipient], roles: &[CoreRoleProfi
     })
 }
 
-async fn dispatch_live_run(
-    app: &AppHandle,
-    storage: &Arc<Storage>,
-    claim: LiveRunClaim,
-    provider_operations: ProviderOperationRegistry,
-    control: Arc<LiveRunControl>,
-) {
-    let profile = match load_execution_profile_revision(
-        storage,
-        &claim.model_binding.provider_profile_id,
-        claim.model_binding.profile_revision,
-    ) {
-        Ok(profile) => profile,
-        Err(error) => {
-            let operation = control.operation.lock().await;
-            if control.check_effect_authority().is_ok() {
-                persist_live_run_failure(
-                    app,
-                    storage,
-                    &claim,
-                    LiveRunFailure {
-                        profile_binding: None,
-                        code: error.code,
-                        detail: error.message,
-                        external_effect_unknown: false,
-                    },
-                    false,
-                );
-            }
-            drop(operation);
-            return;
-        }
-    };
-    let provider_operation = provider_operations
-        .for_runtime_home(&profile.runtime_home_id)
-        .lock_owned()
-        .await;
-    {
-        let operation = control.operation.lock().await;
-        if control.check_effect_authority().is_err() {
-            drop(operation);
-            drop(provider_operation);
-            return;
-        }
-        control.mark_provider_startup_started();
-    }
-    let startup_result =
-        CatchUnwindFuture::new(spawn_verified_client_for_run(app, &profile, Some(&control))).await;
-    let launched = match startup_result {
-        Ok(Ok(launched)) => launched,
-        Ok(Err(error)) => {
-            let operation = control.operation.lock().await;
-            if control.check_effect_authority().is_ok() {
-                persist_provider_failure(app, storage, &claim, error, false, false);
-            }
-            drop(operation);
-            drop(provider_operation);
-            return;
-        }
-        Err(_) => {
-            let operation = control.operation.lock().await;
-            if control.check_effect_authority().is_ok() {
-                persist_pre_session_dispatch_failure(
-                    app,
-                    storage,
-                    &claim,
-                    "provider_startup_panicked",
-                    "Provider startup stopped unexpectedly before creating a session.",
-                );
-            }
-            drop(operation);
-            drop(provider_operation);
-            return;
-        }
-    };
-    let operation = control.operation.lock().await;
-    control.install_client(launched.client.clone(), launched.workdir.clone());
-    let cancellation_requested = control.check_effect_authority().is_err();
-    drop(operation);
-    if cancellation_requested {
-        launched.client.shutdown().await;
-        drop(provider_operation);
-        return;
-    }
-
-    if !runtime_matches_model_binding(&claim.model_binding, &launched) {
-        let operation = control.operation.lock().await;
-        if control.check_effect_authority().is_err() {
-            drop(operation);
-            drop(provider_operation);
-            return;
-        }
-        drop(operation);
-        launched.client.shutdown().await;
-        let operation = control.operation.lock().await;
-        let cancellation_requested = control.check_effect_authority().is_err();
-        if !cancellation_requested {
-            persist_pre_session_dispatch_failure(
-                app,
-                storage,
-                &claim,
-                "provider_binding_changed",
-                "The verified provider runtime no longer matches the model binding saved for this request.",
-            );
-        }
-        drop(operation);
-        drop(provider_operation);
-        return;
-    }
-    let session_creation_intent_crossed = AtomicBool::new(false);
-
-    let session_result = CatchUnwindFuture::new(create_live_run_session(
-        ProviderRunContext {
-            app,
-            storage,
-            claim: &claim,
-        },
-        &launched,
-        &profile,
-        &provider_operations,
-        &session_creation_intent_crossed,
-        &control,
-    ))
-    .await;
-    let session_id = match session_result {
-        Ok(Ok(session_id)) => session_id,
-        Ok(Err(failure)) => {
-            if control.check_effect_authority().is_err()
-                || failure.failure.code == "dispatch_fenced"
-            {
-                drop(provider_operation);
-                return;
-            }
-            let control_operation = control.operation.lock().await;
-            if control.check_effect_authority().is_err() {
-                drop(control_operation);
-                drop(provider_operation);
-                return;
-            }
-            launched.client.shutdown().await;
-            if control.check_effect_authority().is_ok() {
-                persist_live_run_failure(
-                    app,
-                    storage,
-                    &claim,
-                    failure.failure,
-                    failure.security_violation,
-                );
-            }
-            drop(control_operation);
-            drop(provider_operation);
-            return;
-        }
-        Err(_) => {
-            let external_effect_unknown = session_creation_intent_crossed.load(Ordering::Acquire);
-            if external_effect_unknown {
-                control.set_session_creation_outcome_unknown(true);
-            }
-            if control.check_effect_authority().is_err() {
-                drop(provider_operation);
-                return;
-            }
-            let control_operation = control.operation.lock().await;
-            if control.check_effect_authority().is_err() {
-                drop(control_operation);
-                drop(provider_operation);
-                return;
-            }
-            let failure = LiveRunDispatchFailure::new(
-                "provider_dispatch_panicked",
-                "Provider dispatch stopped unexpectedly after session creation became possible.",
-                external_effect_unknown,
-                false,
-            );
-            launched.client.shutdown().await;
-            if control.check_effect_authority().is_ok() {
-                persist_live_run_failure(
-                    app,
-                    storage,
-                    &claim,
-                    failure.failure,
-                    failure.security_violation,
-                );
-            }
-            drop(control_operation);
-            drop(provider_operation);
-            return;
-        }
-    };
-
-    let dispatch_result = CatchUnwindFuture::new(run_claim_with_session(
-        app,
-        storage,
-        &claim,
-        &launched,
-        &session_id,
-        &control,
-    ))
-    .await;
-    let dispatch_result = match dispatch_result {
-        Ok(result) => result,
-        Err(_) => Err(LiveRunDispatchFailure::new(
-            "provider_dispatch_panicked",
-            "Provider dispatch stopped unexpectedly after session creation became possible.",
-            true,
-            false,
-        )),
-    };
-    if control.check_effect_authority().is_err()
-        || dispatch_result
-            .as_ref()
-            .is_err_and(|failure| failure.failure.code == "dispatch_fenced")
-    {
-        drop(provider_operation);
-        return;
-    }
-    let control_operation = control.operation.lock().await;
-    if control.check_effect_authority().is_err() {
-        drop(control_operation);
-        drop(provider_operation);
-        return;
-    }
-    match dispatch_result {
-        Ok(result) => match storage.finish_live_run(&claim, &result, &now_rfc3339()) {
-            Ok(change) => emit_live_run_change(app, change),
-            Err(StorageError::DispatchFenced) => {
-                drop(provider_operation);
-                return;
-            }
-            Err(_) => persist_live_run_failure(
-                app,
-                storage,
-                &claim,
-                LiveRunFailure {
-                    profile_binding: None,
-                    code: "result_persistence_failed".to_owned(),
-                    detail:
-                        "The provider completed but its final result could not be durably saved."
-                            .to_owned(),
-                    external_effect_unknown: true,
-                },
-                false,
-            ),
-        },
-        Err(failure) => {
-            let failure = failure.with_auth_profile(
-                &claim.model_binding.provider_profile_id,
-                claim.model_binding.profile_revision,
-            );
-            persist_live_run_failure(
-                app,
-                storage,
-                &claim,
-                failure.failure,
-                failure.security_violation,
-            );
-        }
-    }
-    drop(control_operation);
-    launched.client.shutdown().await;
-    drop(provider_operation);
-}
-
 fn runtime_matches_model_binding(
     binding: &AcpModelBindingSnapshot,
     launched: &VerifiedClient,
@@ -5975,362 +6059,6 @@ fn runtime_identity_matches_model_binding(
             .artifact_set_digest
             .as_ref()
             .is_some_and(|digest| identity.artifact_set_digest.as_deref() == Some(digest.as_str()))
-}
-
-async fn create_live_run_session(
-    context: ProviderRunContext<'_>,
-    launched: &VerifiedClient,
-    profile: &ProviderProfileRevision,
-    provider_operations: &ProviderOperationRegistry,
-    session_creation_intent_crossed: &AtomicBool,
-    control: &Arc<LiveRunControl>,
-) -> Result<String, LiveRunDispatchFailure> {
-    let ProviderRunContext {
-        app,
-        storage,
-        claim,
-    } = context;
-    let provider_profile_id = &claim.model_binding.provider_profile_id;
-    if profile.provider_profile_id != *provider_profile_id {
-        return Err(LiveRunDispatchFailure::new(
-            "profile_binding_changed",
-            "The provider profile binding changed before session creation.",
-            false,
-            false,
-        ));
-    }
-
-    let prepared = launched
-        .client
-        .prepare_new_session(&claim.model_binding.model_id)
-        .await
-        .map_err(|error| LiveRunDispatchFailure::provider(error, false, false))?;
-
-    let session_operation = async move {
-        let _operation = control.operation.lock().await;
-        if control.check_effect_authority().is_err() {
-            return Err(LiveRunDispatchFailure::new(
-                "dispatch_fenced",
-                "The live run was cancelled before provider session creation.",
-                false,
-                false,
-            ));
-        }
-        let current_profile = load_execution_profile_revision(
-            storage,
-            provider_profile_id,
-            claim.model_binding.profile_revision,
-        )
-        .map_err(|error| LiveRunDispatchFailure::new(&error.code, &error.message, false, false))?;
-        if current_profile.provider_profile_id != *provider_profile_id
-            || current_profile.runtime_home_id != profile.runtime_home_id
-        {
-            return Err(LiveRunDispatchFailure::new(
-                "profile_binding_changed",
-                "The provider profile home changed before session creation.",
-                false,
-                false,
-            ));
-        }
-
-        let change = storage
-            .mark_live_run_session_creation_intent(claim, &now_rfc3339())
-            .map_err(|_| {
-                LiveRunDispatchFailure::new(
-                    "session_intent_persistence_failed",
-                    "The provider request could not be safely recorded before creating its session.",
-                    false,
-                    false,
-                )
-            })?;
-        session_creation_intent_crossed.store(true, Ordering::Release);
-        emit_live_run_change(app, change);
-        control.mark_session_creation_started();
-        let pending = match launched.client.begin_new_session(prepared).await {
-            Ok(pending) => pending,
-            Err(error) => {
-                let external_effect_unknown = session_creation_outcome_unknown(&error);
-                control.set_session_creation_outcome_unknown(external_effect_unknown);
-                return Err(LiveRunDispatchFailure::provider(
-                    error,
-                    external_effect_unknown,
-                    false,
-                ));
-            }
-        };
-        match launched.client.finish_new_session(pending).await {
-            Ok(session) => Ok(session),
-            Err(error) => {
-                let external_effect_unknown = session_creation_outcome_unknown(&error);
-                control.set_session_creation_outcome_unknown(external_effect_unknown);
-                Err(LiveRunDispatchFailure::provider(
-                    error,
-                    external_effect_unknown,
-                    false,
-                ))
-            }
-        }
-    };
-
-    let session = match with_provider_profile_revision_gate(
-        app,
-        provider_operations,
-        provider_profile_id,
-        &profile.runtime_home_id,
-        session_operation,
-    )
-    .await
-    {
-        Ok(Ok(session)) => session,
-        Ok(Err(failure)) => return Err(failure),
-        Err(_) => {
-            return Err(LiveRunDispatchFailure::new(
-                "profile_revision_lock_failed",
-                "The provider profile could not be safely revalidated before creating a session.",
-                false,
-                false,
-            ));
-        }
-    };
-
-    let operation = control.operation.lock().await;
-    if control.check_effect_authority().is_err() {
-        return Err(LiveRunDispatchFailure::new(
-            "dispatch_fenced",
-            "The live run was cancelled while provider session creation was pending.",
-            false,
-            false,
-        ));
-    }
-    control.set_session_creation_outcome_unknown(false);
-    control.install_session(session.session_id.clone());
-    if !session.selected_model_available {
-        return Err(LiveRunDispatchFailure::provider(
-            ProviderError::ModelUnavailable,
-            false,
-            false,
-        ));
-    }
-    let pending_configuration = match launched
-        .client
-        .begin_model_configuration(&session.session_id, &claim.model_binding.model_id)
-        .await
-    {
-        Ok(pending) => pending,
-        Err(error) => {
-            return Err(LiveRunDispatchFailure::provider(error, false, false));
-        }
-    };
-    drop(operation);
-    launched
-        .client
-        .finish_model_configuration(pending_configuration)
-        .await
-        .map_err(|error| LiveRunDispatchFailure::provider(error, false, false))?;
-    match claim.model_binding.mode_id.as_deref() {
-        Some(mode_id) => launched
-            .client
-            .select_mode(&session.session_id, mode_id)
-            .await
-            .map_err(|error| LiveRunDispatchFailure::provider(error, false, false))?,
-        None if !session.available_modes.is_empty() => {
-            return Err(deliberation_error(
-                "mode_binding_changed",
-                "The provider now advertises modes but the frozen catalog attested absence.",
-                false,
-            ));
-        }
-        None => {}
-    }
-    let confirmed = launched
-        .client
-        .confirmed_session_info(&session.session_id)
-        .await
-        .map_err(|error| LiveRunDispatchFailure::provider(error, false, false))?;
-    if confirmed.current_model_id != claim.model_binding.model_id
-        || confirmed.current_mode_id != claim.model_binding.mode_id
-    {
-        return Err(deliberation_error(
-            "provider_configuration_changed",
-            "The provider did not confirm the frozen model and mode.",
-            false,
-        ));
-    }
-    if control.check_effect_authority().is_err() {
-        return Err(LiveRunDispatchFailure::new(
-            "dispatch_fenced",
-            "The live run was cancelled before its provider prompt was sent.",
-            false,
-            false,
-        ));
-    }
-    Ok(session.session_id)
-}
-
-async fn run_claim_with_session(
-    app: &AppHandle,
-    storage: &Arc<Storage>,
-    claim: &LiveRunClaim,
-    launched: &VerifiedClient,
-    session_id: &str,
-    control: &Arc<LiveRunControl>,
-) -> Result<LiveProviderResultInput, LiveRunDispatchFailure> {
-    let operation = control.operation.lock().await;
-    if control.check_effect_authority().is_err() {
-        return Err(LiveRunDispatchFailure::new(
-            "dispatch_fenced",
-            "The live run was cancelled before its provider prompt was sent.",
-            false,
-            false,
-        ));
-    }
-    let running_change = storage
-        .mark_live_run_running(claim, &now_rfc3339())
-        .map_err(|error| match error {
-            StorageError::DispatchFenced => LiveRunDispatchFailure::new(
-                "dispatch_fenced",
-                "The live run was fenced before its provider prompt was sent.",
-                false,
-                false,
-            ),
-            _ => LiveRunDispatchFailure::new(
-                "storage_transition_failed",
-                "The provider session was created but its run state could not be confirmed.",
-                true,
-                false,
-            ),
-        })?;
-    emit_live_run_change(app, running_change);
-    let mut prompt = match launched
-        .client
-        .prompt(session_id, claim.question.clone())
-        .await
-    {
-        Ok(prompt) => prompt,
-        Err(error) => {
-            let external_effect_unknown = prompt_outcome_unknown(&error);
-            drop(operation);
-            return Err(LiveRunDispatchFailure::provider(
-                error,
-                external_effect_unknown,
-                false,
-            ));
-        }
-    };
-    drop(operation);
-    let (_replacement_sender, replacement_receiver) = async_runtime::channel(1);
-    let event_receiver = std::mem::replace(&mut prompt.events, replacement_receiver);
-    let app_for_events = app.clone();
-    let storage_for_events = storage.clone();
-    let claim_for_events = claim.clone();
-    let control_for_events = control.clone();
-    let stream_activity = control
-        .effect_request()
-        .and_then(|request| request.track_stream_operation())
-        .map_err(|error| LiveRunDispatchFailure::provider(error, true, false))?;
-    let admission_activity = control
-        .admission_request
-        .lock()
-        .map_err(|_| LiveRunDispatchFailure::provider(ProviderError::Cancelled, true, false))?
-        .clone()
-        .map(|authority| authority.lease())
-        .transpose()
-        .map_err(|error| LiveRunDispatchFailure::provider(error, true, false))?;
-    let event_worker = async_runtime::spawn(async move {
-        let _stream_activity = stream_activity;
-        let _admission_activity = admission_activity;
-        let mut security_violation_seen = false;
-        let mut persistence_failed = false;
-        let mut durable_text = String::new();
-        let mut event_receiver = event_receiver;
-        while let Some(event) = event_receiver.recv().await {
-            if control_for_events
-                .cancellation_requested
-                .load(Ordering::Acquire)
-            {
-                continue;
-            }
-            if persistence_failed || security_violation_seen {
-                continue;
-            }
-            match event {
-                PromptEvent::TextDelta(text_delta) => {
-                    match storage_for_events.append_live_run_text_delta(
-                        &claim_for_events,
-                        &text_delta,
-                        &now_rfc3339(),
-                    ) {
-                        Ok(change) => {
-                            durable_text.push_str(&text_delta);
-                            emit_live_run_change(&app_for_events, change);
-                        }
-                        Err(StorageError::DispatchFenced) => {}
-                        Err(_) => persistence_failed = true,
-                    }
-                }
-                PromptEvent::SecurityViolation => {
-                    security_violation_seen = true;
-                }
-            }
-        }
-        if persistence_failed {
-            Err(())
-        } else {
-            Ok((security_violation_seen, durable_text))
-        }
-    });
-    let stream_diagnostic = prompt.stream_diagnostic();
-    let provider_result = prompt.finish().await;
-    eprintln!(
-        "provider stream diagnostic: {:?}",
-        stream_diagnostic.snapshot()
-    );
-    let event_result = event_worker.await;
-    let (security_violation_seen, durable_text) = match event_result {
-        Ok(Ok(security_violation_seen)) => security_violation_seen,
-        Ok(Err(())) | Err(_) => {
-            return Err(LiveRunDispatchFailure::new(
-                "event_persistence_failed",
-                "Provider output could not be durably recorded.",
-                true,
-                false,
-            ));
-        }
-    };
-    if security_violation_seen {
-        return Err(LiveRunDispatchFailure::new(
-            "provider_capability_denied",
-            "The provider attempted to use a disabled capability.",
-            false,
-            true,
-        ));
-    }
-    match provider_result {
-        Ok(result) => {
-            require_durable_stream_equality(&result.final_text, &durable_text)?;
-            let usage = result.usage.map(|usage| LiveProviderUsage {
-                total_tokens: usage.total_tokens,
-                input_tokens: usage.input_tokens,
-                cached_read_tokens: usage.cached_read_tokens,
-                output_tokens: usage.output_tokens,
-                thought_tokens: usage.thought_tokens,
-            });
-            Ok(LiveProviderResultInput {
-                final_text: result.final_text,
-                stop_reason: result.stop_reason,
-                usage,
-            })
-        }
-        Err(error) => {
-            let external_effect_unknown = prompt_outcome_unknown(&error);
-            let security_violation = matches!(&error, ProviderError::ToolDenied);
-            Err(LiveRunDispatchFailure::provider(
-                error,
-                external_effect_unknown,
-                security_violation,
-            ))
-        }
-    }
 }
 
 fn require_durable_stream_equality(
@@ -6426,32 +6154,6 @@ fn prompt_outcome_unknown(error: &ProviderError) -> bool {
     )
 }
 
-fn persist_provider_failure(
-    app: &AppHandle,
-    storage: &Arc<Storage>,
-    claim: &LiveRunClaim,
-    error: ProviderError,
-    external_effect_unknown: bool,
-    security_violation: bool,
-) {
-    let error = LiveRunError::provider(error).with_auth_profile(
-        &claim.model_binding.provider_profile_id,
-        claim.model_binding.profile_revision,
-    );
-    persist_live_run_failure(
-        app,
-        storage,
-        claim,
-        LiveRunFailure {
-            profile_binding: error.profile_binding,
-            code: error.code,
-            detail: error.message,
-            external_effect_unknown,
-        },
-        security_violation,
-    );
-}
-
 fn persist_live_run_failure(
     app: &AppHandle,
     storage: &Arc<Storage>,
@@ -6462,6 +6164,9 @@ fn persist_live_run_failure(
     match storage.fail_live_run(claim, &failure, security_violation, &now_rfc3339()) {
         Ok(change) => {
             emit_live_run_change(app, change);
+            if let Ok(projection) = crate::core_dispatch::load(storage, &claim.run_id) {
+                let _ = app.emit("magi:core-dispatches", projection);
+            }
             if let Ok((dossier, failure)) =
                 storage.load_run_dossier_with_live_failure(&claim.run_id)
             {
@@ -7463,6 +7168,7 @@ pub(crate) mod catalog_selection_ipc_tests {
                 role_preset_id: "native-child-preset".into(),
                 role_revision: aggregate.input().role_set.roles[0].revision,
                 disclosure_confirmed: true,
+                expected_common_context_budget_revision: None,
                 admission_authority: None,
             },
         };
@@ -7553,7 +7259,7 @@ pub(crate) mod catalog_selection_ipc_tests {
                     &rich.request.core_bindings,
                     &intent,
                     Storage::admission_publication_with_authority(
-                        "fixture",
+                        "2026-10-02T00:00:00Z",
                         None,
                         &expected,
                         || Ok(())
@@ -7670,6 +7376,7 @@ pub(crate) mod catalog_selection_ipc_tests {
                 role_preset_id: "native-child-preset".into(),
                 role_revision: aggregate.input().role_set.roles[0].revision,
                 disclosure_confirmed: true,
+                expected_common_context_budget_revision: None,
                 admission_authority: None,
             },
         };
@@ -7875,7 +7582,20 @@ pub(crate) mod catalog_selection_ipc_tests {
                 state.model_selection_revision,
                 Some(refs[0].model_selection_revision)
             );
-            assert!(state.model_selection.is_none());
+            let saved = state.model_selection.as_ref().unwrap();
+            assert_eq!(saved.selection_revision, refs[0].model_selection_revision);
+            assert_eq!(
+                saved.binding.provider_profile_id,
+                refs[0].provider_profile_id
+            );
+            assert_eq!(
+                storage
+                    .load_core_model_selection_intent(CoreId::Melchior1)
+                    .unwrap()
+                    .unwrap()
+                    .selection_revision,
+                refs[0].core_selection_revision
+            );
             assert!(core_execution_witnesses(&storage, &refs).is_err());
             assert!(
                 storage
@@ -9076,5 +8796,945 @@ mod stream_acceptance_tests {
             assert!(mapped.profile_binding.is_none());
             assert!(mapped.remediation_category.is_none());
         }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PreviewDeliberationBudgetInput {
+    question: String,
+    context_draft_id: Option<String>,
+    context_revision: Option<u64>,
+    core_bindings: Vec<magi_storage::CoreBindingReference>,
+    role_preset_id: String,
+    role_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_common_context_budget_revision: Option<u64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliberationBudgetSlot {
+    slot: u8,
+    core_id: CoreId,
+    stage: &'static str,
+    base_input_bytes: u64,
+    budget: Option<crate::runtime_budget::SlotBudget>,
+    blocked_reason: Option<String>,
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliberationBudgetPreview {
+    input_fingerprint: Digest,
+    common_context_budget: magi_domain::CommonContextBudgetPolicy,
+    ready: bool,
+    slots: Vec<DeliberationBudgetSlot>,
+    future_artifacts_known: bool,
+    scope: &'static str,
+    warnings: Vec<String>,
+}
+
+/// Builds local snapshots only. No admission, disclosure record, provider or run is created.
+fn preview_budget(
+    storage: &Storage,
+    input: &PreviewDeliberationBudgetInput,
+    policy: &magi_domain::CommonContextBudgetPolicy,
+) -> Result<DeliberationBudgetPreview, String> {
+    policy.validate().map_err(|_| "budget_policy_invalid")?;
+    if input.expected_common_context_budget_revision.unwrap_or(0) != policy.settings_field_revision
+    {
+        return Err("budget_policy_changed".into());
+    }
+    let fingerprint = Digest::from_bytes(
+        &magi_domain::canonical_json(
+            &serde_json::json!({"input":input,"commonContextBudget":policy}),
+        )
+        .map_err(|_| "budget_input_invalid")?,
+    );
+    let run_id = format!("run-{fingerprint}");
+    let mut references = input.core_bindings.clone();
+    references.sort_by_key(|reference| {
+        CoreId::ALL
+            .iter()
+            .position(|core| *core == reference.core_id)
+    });
+    let bindings = storage
+        .resolve_core_bindings(&references)
+        .map_err(|_| "budget_core_binding_changed")?;
+    let preset = storage
+        .load_role_preset_revision(&input.role_preset_id, input.role_revision)
+        .map_err(|_| "budget_role_unavailable")?
+        .ok_or("budget_role_unavailable")?;
+    let mut role_bindings = Vec::new();
+    for binding in &bindings {
+        let profile = load_profile_revision(
+            storage,
+            &binding.provider_profile_id,
+            binding.profile_revision,
+        )
+        .map_err(|_| "budget_profile_changed")?;
+        if profile.provider_id != binding.provider_id {
+            return Err("budget_profile_mismatch".into());
+        }
+        let catalog = storage
+            .load_provider_catalog_snapshot(&binding.catalog_snapshot_id)
+            .map_err(|_| "budget_catalog_unavailable")?
+            .ok_or("budget_catalog_unavailable")?;
+        binding
+            .validate_ready(&catalog)
+            .map_err(|_| "budget_catalog_changed")?;
+        let model = catalog
+            .models
+            .iter()
+            .find(|model| model.model_id == binding.model_id)
+            .ok_or("budget_model_unavailable")?;
+        role_bindings.push(ModelBindingSnapshot {
+            provider_profile_id: binding.provider_profile_id.clone(),
+            revision: binding.profile_revision,
+            adapter_id: binding.adapter_id.clone(),
+            adapter_version: binding.adapter_version.clone(),
+            adapter_digest: binding.adapter_digest.clone(),
+            model_id: binding.model_id.clone(),
+            context_window_tokens: model
+                .context_window_tokens
+                .or_else(|| {
+                    crate::runtime_budget::pinned_model_limits(&model.model_id)
+                        .map(|limits| limits.0)
+                })
+                .map(u32::try_from)
+                .transpose()
+                .map_err(|_| "budget_limit_invalid")?,
+            maximum_output_tokens: model
+                .max_output_tokens
+                .or_else(|| {
+                    crate::runtime_budget::pinned_model_limits(&model.model_id)
+                        .map(|limits| limits.1)
+                })
+                .map(u32::try_from)
+                .transpose()
+                .map_err(|_| "budget_limit_invalid")?,
+        });
+    }
+    let mut preview_capture = None;
+    let context = match (&input.context_draft_id, input.context_revision) {
+        (None, None) => ContextManifest::new(format!("context-{run_id}"), Vec::new())
+            .map_err(|_| "budget_context_invalid")?,
+        (Some(id), Some(revision)) => {
+            let draft = storage
+                .load_context_draft(id)
+                .map_err(|_| "budget_context_unavailable")?
+                .ok_or("budget_context_unavailable")?;
+            if draft.revision != revision {
+                return Err("budget_context_changed".into());
+            }
+            let mut recipients = Vec::new();
+            for binding in &bindings {
+                let recipient = Recipient {
+                    provider_id: binding.provider_id.clone(),
+                    account_profile_id: binding.provider_profile_id.clone(),
+                };
+                if !recipients.contains(&recipient) {
+                    recipients.push(recipient);
+                }
+            }
+            let first = recipients
+                .first()
+                .cloned()
+                .ok_or("budget_core_binding_invalid")?;
+            // This projection is transient and confers no stored or external disclosure authority.
+            let projected = draft
+                .manifest
+                .confirm_disclosure(recipients, &draft.manifest.digest, 0)
+                .map_err(|_| "budget_context_invalid")?;
+            let context = projected
+                .run_manifest_for_recipient(&first)
+                .map_err(|_| "budget_context_invalid")?;
+            preview_capture = Some(projected);
+            context
+        }
+        _ => return Err("budget_context_revision_required".into()),
+    };
+    let roles = preset
+        .roles
+        .iter()
+        .map(|definition| {
+            let index = references
+                .iter()
+                .position(|reference| reference.core_id == definition.core_id)
+                .ok_or("budget_core_binding_invalid")?;
+            Ok(CoreRoleProfile {
+                core_id: definition.core_id,
+                profile_id: definition.profile_id.clone(),
+                revision: preset.revision,
+                display_name: definition.display_name.clone(),
+                review_purpose: definition.review_purpose.clone(),
+                evaluation_criteria: definition.evaluation_criteria.clone(),
+                falsification_questions: definition.falsification_questions.clone(),
+                response_language: definition.response_language.clone(),
+                binding: role_bindings[index].clone(),
+                catalog_binding: Some(bindings[index].clone()),
+            })
+        })
+        .collect::<Result<Vec<_>, &str>>()?
+        .try_into()
+        .map_err(|_| "budget_role_invalid")?;
+    let roles = RoleSetSnapshot::new(format!("roles-{run_id}"), roles)
+        .map_err(|_| "budget_role_invalid")?;
+    let question = QuestionSnapshot::new(
+        format!("question-{run_id}"),
+        QuestionKind::Answer,
+        input.question.clone(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    )
+    .map_err(|_| "budget_question_invalid")?;
+    let snapshot = InputSnapshot::new(
+        question,
+        context,
+        roles,
+        Digest::from_bytes(b"magi-three-role-deliberation-v1"),
+    )
+    .map_err(|_| "budget_snapshot_invalid")?
+    .with_common_context_budget(policy.clone())
+    .map_err(|_| "budget_policy_invalid")?;
+    let run = Run::new(
+        run_id.clone(),
+        format!("conversation-{run_id}"),
+        None,
+        &snapshot,
+        "1970-01-01T00:00:00Z".into(),
+    )
+    .map_err(|_| "budget_snapshot_invalid")?;
+    let aggregate = RunAggregate::new(run, snapshot).map_err(|_| "budget_snapshot_invalid")?;
+    let sources = match preview_capture.as_ref() {
+        Some(capture) => {
+            project_deliberation_sources(storage, &aggregate.input().context_manifest, capture)
+                .map_err(|failure| {
+                    format!("budget_source_projection_blocked:{}", failure.failure.code)
+                })?
+        }
+        None => Vec::new(),
+    };
+    let images = sources
+        .iter()
+        .flat_map(|source| source.images.iter().cloned())
+        .collect::<Vec<_>>();
+    let sources = sources
+        .iter()
+        .map(|source| DeliberationSource {
+            source_id: &source.source_id,
+            object_digest: &source.object_digest,
+            allowed_locators: &source.allowed_locators,
+            content: &source.content,
+            content_kinds: &source.content_kinds,
+        })
+        .collect::<Vec<_>>();
+    let common_text = serde_json::to_string(&serde_json::json!({
+        "question": aggregate.input().question, "approved_sources": sources,
+    }))
+    .map_err(|_| "budget_common_projection_invalid")?;
+    let mut slots = Vec::new();
+    for slot in 0..LIVE_RUN_DISPATCH_CAPACITY {
+        let turn = DeliberationTurn::for_slot(slot).ok_or("budget_dispatch_plan_invalid")?;
+        let prompt = deliberation_turn_prompt(&aggregate, turn, &sources)
+            .map_err(|_| "budget_prompt_invalid")?;
+        let (stage, future_count) = match turn {
+            DeliberationTurn::Assessment(AssessmentStage::IndependentReview, _) => {
+                ("independent_review", 0)
+            }
+            DeliberationTurn::Assessment(AssessmentStage::CrossReview, _) => ("cross_review", 3),
+            DeliberationTurn::Synthesis => ("synthesis", 6),
+            DeliberationTurn::Ballot(_) => ("balloting", 7),
+        };
+        let binding = &aggregate
+            .input()
+            .role_set
+            .roles
+            .iter()
+            .find(|role| role.core_id == turn.binding_core())
+            .ok_or("budget_role_invalid")?
+            .binding;
+        let mut blocks = vec![serde_json::json!({"type":"text","text":prompt})];
+        blocks.extend(images.iter().cloned());
+        let result = CodexAcpClient::validate_prompt_blocks(&blocks)
+            .map_err(|_| "The complete wire blocks exceed the provider byte limit.".to_owned())
+            .and_then(|()| {
+                crate::runtime_budget::validate_common_context_with_limit(
+                    &common_text,
+                    images.len() as u64,
+                    crate::runtime_budget::high_detail_vision_bound(binding, images.len() as u64),
+                    policy.token_limit,
+                )
+            })
+            .and_then(|()| {
+                crate::runtime_budget::evaluate_slot(
+                    binding,
+                    &prompt,
+                    images.len() as u64,
+                    crate::runtime_budget::high_detail_vision_bound(binding, images.len() as u64),
+                    future_count,
+                )
+            });
+        let (budget, blocked_reason) = match result {
+            Ok(budget) => (Some(budget), None),
+            Err(reason) => (None, Some(reason)),
+        };
+        slots.push(DeliberationBudgetSlot {
+            slot,
+            core_id: turn.binding_core(),
+            stage,
+            base_input_bytes: prompt.len() as u64,
+            budget,
+            blocked_reason,
+        });
+    }
+    Ok(DeliberationBudgetPreview {
+        input_fingerprint:fingerprint,common_context_budget:policy.clone(),ready:slots.iter().all(|slot|slot.budget.is_some()),slots,
+        future_artifacts_known:false,scope:"serialized_base_inputs_conservative",
+        warnings:vec!["Future assessments and the proposal are absent. Their reserved reinput bytes are conservative headroom, not known output sizes. Every actual next prompt must be checked again.".into()],
+    })
+}
+
+#[tauri::command]
+pub async fn preview_deliberation_budget(
+    window: WebviewWindow,
+    app: AppHandle,
+    state: State<'_, DesktopState>,
+    input: PreviewDeliberationBudgetInput,
+) -> Result<DeliberationBudgetPreview, String> {
+    ensure_main_window(&window)?;
+    let storage = state.storage()?;
+    async_runtime::spawn_blocking(move || {
+        crate::preferences::with_common_context_budget(
+            &app,
+            input.expected_common_context_budget_revision.unwrap_or(0),
+            |policy| preview_budget(&storage, &input, &policy),
+        )
+        .and_then(|result| result)
+    })
+    .await
+    .map_err(|_| "budget_preview_worker_failed".to_owned())?
+}
+
+#[cfg(test)]
+mod budget_preview_tests {
+    use super::*;
+
+    struct OwnedPreviewRoot(PathBuf);
+
+    impl Drop for OwnedPreviewRoot {
+        fn drop(&mut self) {
+            if self.0.exists()
+                && let Err(error) = fs::remove_dir_all(&self.0)
+            {
+                if std::thread::panicking() {
+                    eprintln!("Failed to remove owned preview fixture: {error}");
+                } else {
+                    panic!("Failed to remove owned preview fixture: {error}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn queued_legacy_claim_without_aggregate_is_rejected_without_provider_effects() {
+        let prepared = catalog_selection_ipc_tests::publication_fault_fixture();
+        let _owned_root = OwnedPreviewRoot(prepared.0.clone());
+        let (_root, storage, aggregate, original_claim) = prepared;
+        storage
+            .fail_live_run(
+                &original_claim,
+                &unreviewed_live_failure(),
+                false,
+                "2026-10-02T00:00:00Z",
+            )
+            .unwrap();
+        let request = LiveRunAdmissionRequest {
+            command_id: "legacy-negative-command".into(),
+            idempotency_key: "legacy-negative-key".into(),
+            question: "legacy must not dispatch".into(),
+            model_binding: aggregate.input().role_set.roles[0]
+                .catalog_binding
+                .clone()
+                .unwrap(),
+        };
+        let receipt = match storage.admit_live_run(&request).unwrap() {
+            LiveRunAdmissionOutcome::Accepted { receipt, .. } => receipt,
+            _ => panic!("fixture queue unexpectedly full"),
+        };
+        assert!(!storage.has_persisted_run(&receipt.run_id).unwrap());
+        let claim = storage
+            .claim_next_live_run("legacy-negative-worker", "2026-10-02T00:00:00Z")
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.run_id, receipt.run_id);
+        storage
+            .fail_live_run(
+                &claim,
+                &unreviewed_live_failure(),
+                false,
+                "2026-10-02T00:00:01Z",
+            )
+            .unwrap();
+        let snapshot = storage.get_live_run_snapshot(&claim.run_id, 0).unwrap();
+        assert_eq!(snapshot.status, LiveRunStatus::Failed);
+        assert!(
+            snapshot
+                .events
+                .iter()
+                .all(|event| event.text_delta.is_none())
+        );
+        assert!(!storage.has_persisted_run(&claim.run_id).unwrap());
+    }
+
+    #[test]
+    fn exact_three_selection_preview_is_local_readonly_and_unknown_limits_never_ready() {
+        let prepared = catalog_selection_ipc_tests::publication_fault_fixture();
+        let _owned_root = OwnedPreviewRoot(prepared.0.clone());
+        let (_root, storage, aggregate, claim) = prepared;
+        let before = serde_json::to_vec(&storage.load_run_dossier(&claim.run_id).unwrap()).unwrap();
+        let live_before =
+            serde_json::to_vec(&storage.get_live_run_snapshot(&claim.run_id, 0).unwrap()).unwrap();
+        let preset = storage
+            .load_role_preset("factory.magi.default")
+            .unwrap()
+            .unwrap();
+        let input = PreviewDeliberationBudgetInput {
+            question: "A local budget question".into(),
+            context_draft_id: None,
+            context_revision: None,
+            core_bindings: aggregate
+                .input()
+                .role_set
+                .frozen_core_selections
+                .clone()
+                .unwrap()
+                .to_vec(),
+            role_preset_id: preset.preset_id,
+            role_revision: preset.revision,
+            expected_common_context_budget_revision: None,
+        };
+        let preview = preview_budget(
+            &storage,
+            &input,
+            &magi_domain::CommonContextBudgetPolicy::new(32_000, 0).unwrap(),
+        )
+        .unwrap();
+        let wider = preview_budget(
+            &storage,
+            &input,
+            &magi_domain::CommonContextBudgetPolicy::new(128_000, 0).unwrap(),
+        )
+        .unwrap();
+        assert_ne!(preview.input_fingerprint, wider.input_fingerprint);
+        assert_eq!(wider.common_context_budget.token_limit, 128_000);
+        assert!(
+            preview_budget(
+                &storage,
+                &input,
+                &magi_domain::CommonContextBudgetPolicy::new(128_000, 1).unwrap()
+            )
+            .is_err()
+        );
+        let mut revised = input.clone();
+        revised.expected_common_context_budget_revision = Some(1);
+        assert!(
+            preview_budget(
+                &storage,
+                &revised,
+                &magi_domain::CommonContextBudgetPolicy::new(128_000, 1).unwrap()
+            )
+            .is_ok()
+        );
+        assert_eq!(preview.slots.len(), 10);
+        assert!(!preview.future_artifacts_known);
+        assert!(preview.slots.iter().all(|slot| slot.base_input_bytes > 0));
+        assert!(!preview.ready);
+        assert!(
+            preview
+                .slots
+                .iter()
+                .all(|slot| slot.budget.is_none() && slot.blocked_reason.is_some())
+        );
+        assert_eq!(
+            serde_json::to_vec(&storage.load_run_dossier(&claim.run_id).unwrap()).unwrap(),
+            before
+        );
+        assert_eq!(
+            serde_json::to_vec(&storage.get_live_run_snapshot(&claim.run_id, 0).unwrap()).unwrap(),
+            live_before
+        );
+        let mut oversized = input.clone();
+        oversized.question = "x".repeat(32_000);
+        let oversized_preview = preview_budget(
+            &storage,
+            &oversized,
+            &magi_domain::CommonContextBudgetPolicy::new(32_000, 0).unwrap(),
+        )
+        .unwrap();
+        assert!(!oversized_preview.ready);
+        assert!(oversized_preview.slots.iter().all(|slot| {
+            slot.blocked_reason
+                .as_ref()
+                .is_some_and(|reason| reason.contains("common question"))
+        }));
+        let mut checked_aggregate = aggregate.clone();
+        let before_input = checked_aggregate.input().input_digest.clone();
+        for malformed in [
+            r#"{"nested":{"a":1,"a":2}}"#.to_owned(),
+            format!("{}0{}", "[".repeat(33), "]".repeat(33)),
+            " ".repeat(256 * 1024 + 1),
+        ] {
+            assert!(
+                accept_deliberation_output(
+                    &mut checked_aggregate,
+                    DeliberationTurn::for_slot(0).unwrap(),
+                    &malformed
+                )
+                .is_err()
+            );
+            assert_eq!(checked_aggregate.input().input_digest, before_input);
+        }
+        let mut stale = input;
+        stale.core_bindings[0].core_selection_revision += 1;
+        assert!(
+            preview_budget(
+                &storage,
+                &stale,
+                &magi_domain::CommonContextBudgetPolicy::new(32_000, 0).unwrap()
+            )
+            .is_err()
+        );
+    }
+}
+
+fn project_native_deliberation_source(
+    storage: &Storage,
+    source: &magi_domain::SourceSnapshot,
+    captured: &magi_context::ManifestSource,
+) -> Result<LoadedDeliberationSource, LiveRunDispatchFailure> {
+    let bad = || {
+        deliberation_error(
+            "approved_native_source_invalid",
+            "The captured page or image proof is not an exact frozen representation.",
+            false,
+        )
+    };
+    let digest = captured.derived_digest.as_ref().ok_or_else(bad)?;
+    let original = storage
+        .read_source_object(&source.object_digest)
+        .map_err(|_| bad())?;
+    if Digest::from_bytes(&original) != source.object_digest {
+        return Err(bad());
+    }
+    let bytes = storage.read_source_object(digest).map_err(|_| bad())?;
+    if Digest::from_bytes(&bytes) != *digest {
+        return Err(bad());
+    }
+    let extracted: magi_context::NativeExtraction =
+        serde_json::from_slice(&bytes).map_err(|_| bad())?;
+    if extracted.schema_version != 1 || Some(extracted.kind) != captured.representation_kind {
+        return Err(bad());
+    }
+    let identifiers = captured
+        .included_locators
+        .iter()
+        .map(|locator| evidence_locator_identifier(locator, digest))
+        .collect::<Vec<_>>();
+    if identifiers != source.allowed_locators
+        || identifiers.is_empty()
+        || captured.included_locators.iter().any(|locator| {
+            locator.source_id != source.source_id
+                || locator.object_digest != source.object_digest
+                || locator.start_line.is_some()
+                || locator.end_line.is_some()
+                || locator.total_lines.is_some()
+        })
+    {
+        return Err(bad());
+    }
+    let mut images = Vec::new();
+    let mut content_kinds = std::collections::BTreeSet::new();
+    let content = match extracted.kind {
+        magi_context::RepresentationKind::PdfText | magi_context::RepresentationKind::PdfRaster => {
+            if extracted.mime_type != "application/pdf"
+                || extracted.pages.is_empty()
+                || extracted.pages.len() > 200
+                || extracted.pages.len() != captured.included_locators.len()
+                || extracted.image_base64.is_some()
+            {
+                return Err(bad());
+            }
+            let mut pages = Vec::new();
+            let mut previous = 0;
+            for (page, locator) in extracted.pages.iter().zip(&captured.included_locators) {
+                if page.page <= previous
+                    || locator.page != Some(page.page)
+                    || locator.width != page.width
+                    || locator.height != page.height
+                {
+                    return Err(bad());
+                }
+                previous = page.page;
+                if let Some(data) = &page.image_base64 {
+                    if page.text.is_some()
+                        || page.mime_type.as_deref() != Some("image/png")
+                        || page.width.is_none()
+                        || page.height.is_none()
+                    {
+                        return Err(bad());
+                    }
+                    content_kinds.insert(magi_context::DisclosureContentKind::SourceDerivedImage);
+                    images.push(
+                        serde_json::json!({"type":"image","data":data,"mimeType":"image/png"}),
+                    );
+                } else if page.width.is_some()
+                    || page.height.is_some()
+                    || page.mime_type.is_some()
+                    || page.text.is_none()
+                {
+                    return Err(bad());
+                }
+                if page.text.is_some() {
+                    content_kinds.insert(magi_context::DisclosureContentKind::SourceDerivedText);
+                }
+                pages.push(serde_json::json!({"page":page.page,"text":page.text,"width":page.width,"height":page.height,"imageProvided":page.image_base64.is_some()}));
+            }
+            serde_json::to_string(&serde_json::json!({"kind":extracted.kind,"pages":pages}))
+                .map_err(|_| bad())?
+        }
+        magi_context::RepresentationKind::Image => {
+            if !extracted.pages.is_empty() || captured.included_locators.len() != 1 {
+                return Err(bad());
+            }
+            let locator = &captured.included_locators[0];
+            if locator.page.is_some()
+                || locator.width != extracted.width
+                || locator.height != extracted.height
+                || extracted.width.is_none()
+                || extracted.height.is_none()
+            {
+                return Err(bad());
+            }
+            let data = extracted.image_base64.as_ref().ok_or_else(bad)?;
+            if !matches!(extracted.mime_type.as_str(), "image/png" | "image/jpeg") {
+                return Err(bad());
+            }
+            let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data)
+                .map_err(|_| bad())?;
+            content_kinds.insert(if Digest::from_bytes(&decoded) == source.object_digest {
+                magi_context::DisclosureContentKind::SourceOriginal
+            } else {
+                magi_context::DisclosureContentKind::SourceDerivedImage
+            });
+            images.push(
+                serde_json::json!({"type":"image","data":data,"mimeType":extracted.mime_type}),
+            );
+            serde_json::to_string(&serde_json::json!({"kind":"image","width":extracted.width,"height":extracted.height,"imageProvided":true})).map_err(|_|bad())?
+        }
+        _ => return Err(bad()),
+    };
+    let mut blocks = vec![serde_json::json!({"type":"text","text":content})];
+    blocks.extend(images.iter().cloned());
+    CodexAcpClient::validate_prompt_blocks(&blocks).map_err(|_| bad())?;
+    Ok(LoadedDeliberationSource {
+        source_id: source.source_id.clone(),
+        object_digest: source.object_digest.as_str().to_owned(),
+        allowed_locators: source.allowed_locators.clone(),
+        content,
+        images,
+        content_kinds,
+    })
+}
+
+#[cfg(test)]
+mod native_source_wire_tests {
+    use super::*;
+
+    struct OwnedWireRoot(PathBuf);
+    impl Drop for OwnedWireRoot {
+        fn drop(&mut self) {
+            if self.0.exists()
+                && let Err(error) = fs::remove_dir_all(&self.0)
+            {
+                if std::thread::panicking() {
+                    eprintln!("Failed to remove owned wire fixture: {error}");
+                } else {
+                    panic!("Failed to remove owned wire fixture: {error}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn selected_pdf_page_is_the_only_original_content_in_actual_turn_wire() {
+        let prepared = catalog_selection_ipc_tests::publication_fault_fixture();
+        let _owned_root = OwnedWireRoot(prepared.0.clone());
+        let (_root, storage, aggregate, _claim) = prepared;
+        let original = storage
+            .put_source_object(b"outside-page-one outside-page-three original PDF")
+            .unwrap();
+        let extraction = magi_context::NativeExtraction {
+            schema_version: 1,
+            kind: magi_context::RepresentationKind::PdfText,
+            mime_type: "application/pdf".into(),
+            width: None,
+            height: None,
+            image_base64: None,
+            pages: vec![magi_context::ExtractedPage {
+                page: 2,
+                text: Some("selected-page-two".into()),
+                mime_type: None,
+                image_base64: None,
+                width: None,
+                height: None,
+            }],
+            warnings: vec![],
+            total_pages: Some(3),
+        };
+        let derived = storage
+            .put_source_object(&serde_json::to_vec(&extraction).unwrap())
+            .unwrap();
+        let locator = magi_context::EvidenceLocator {
+            source_id: "pdf-proof".into(),
+            object_digest: original.digest.clone(),
+            start_line: None,
+            end_line: None,
+            total_lines: None,
+            page: Some(2),
+            width: None,
+            height: None,
+        };
+        let frozen = magi_domain::SourceSnapshot {
+            source_id: "pdf-proof".into(),
+            object_digest: original.digest.clone(),
+            allowed_locators: vec![evidence_locator_identifier(&locator, &derived.digest)],
+        };
+        let captured = magi_context::ManifestSource {
+            source_id: "pdf-proof".into(),
+            display_name: "selected.pdf".into(),
+            state: magi_context::ManifestSourceState::Captured,
+            byte_length: Some(original.byte_length),
+            mime_type: Some("application/pdf".into()),
+            object_digest: Some(original.digest),
+            derived_digest: Some(derived.digest),
+            representation_kind: Some(extraction.kind),
+            extractor_id: Some("fixture".into()),
+            extractor_version: Some("1".into()),
+            included_locators: vec![locator],
+            omission: None,
+            captured_at_epoch_ms: Some(0),
+            secret_pattern_findings: vec![],
+            secret_scan_incomplete: true,
+        };
+        let loaded = project_native_deliberation_source(&storage, &frozen, &captured).unwrap();
+        assert!(loaded.images.is_empty());
+        assert_eq!(
+            loaded.content_kinds,
+            [magi_context::DisclosureContentKind::SourceDerivedText]
+                .into_iter()
+                .collect()
+        );
+        let sources = [DeliberationSource {
+            source_id: &loaded.source_id,
+            object_digest: &loaded.object_digest,
+            allowed_locators: &loaded.allowed_locators,
+            content: &loaded.content,
+            content_kinds: &loaded.content_kinds,
+        }];
+        let prompt =
+            deliberation_turn_prompt(&aggregate, DeliberationTurn::for_slot(0).unwrap(), &sources)
+                .unwrap();
+        let blocks = [serde_json::json!({"type":"text","text":prompt})];
+        CodexAcpClient::validate_prompt_blocks(&blocks).unwrap();
+        let wire = serde_json::to_string(&blocks).unwrap();
+        assert!(wire.contains("selected-page-two"));
+        assert!(!wire.contains("outside-page-one"));
+        assert!(!wire.contains("outside-page-three"));
+        let png = base64::Engine::decode(&base64::engine::general_purpose::STANDARD,
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=").unwrap();
+        let data = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &png);
+        let mut raster = extraction.clone();
+        raster.kind = magi_context::RepresentationKind::PdfRaster;
+        raster.pages[0].text = None;
+        raster.pages[0].image_base64 = Some(data.clone());
+        raster.pages[0].mime_type = Some("image/png".into());
+        raster.pages[0].width = Some(1);
+        raster.pages[0].height = Some(1);
+        let derived_raster = storage
+            .put_source_object(&serde_json::to_vec(&raster).unwrap())
+            .unwrap();
+        let mut raster_capture = captured.clone();
+        raster_capture.derived_digest = Some(derived_raster.digest.clone());
+        raster_capture.representation_kind = Some(raster.kind);
+        raster_capture.included_locators[0].width = Some(1);
+        raster_capture.included_locators[0].height = Some(1);
+        let mut raster_source = frozen.clone();
+        raster_source.allowed_locators = vec![evidence_locator_identifier(
+            &raster_capture.included_locators[0],
+            &derived_raster.digest,
+        )];
+        let projected =
+            project_native_deliberation_source(&storage, &raster_source, &raster_capture).unwrap();
+        assert_eq!(
+            projected.content_kinds,
+            [magi_context::DisclosureContentKind::SourceDerivedImage]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(projected.images.len(), 1);
+        let raster_sources = [DeliberationSource {
+            source_id: &projected.source_id,
+            object_digest: &projected.object_digest,
+            allowed_locators: &projected.allowed_locators,
+            content: &projected.content,
+            content_kinds: &projected.content_kinds,
+        }];
+        let raster_prompt = deliberation_turn_prompt(
+            &aggregate,
+            DeliberationTurn::for_slot(0).unwrap(),
+            &raster_sources,
+        )
+        .unwrap();
+        let mut raster_blocks = vec![serde_json::json!({"type":"text","text":raster_prompt})];
+        raster_blocks.extend(projected.images.iter().cloned());
+        CodexAcpClient::validate_prompt_blocks(&raster_blocks).unwrap();
+        let raster_wire = serde_json::to_string(&raster_blocks).unwrap();
+        assert!(raster_wire.contains("source_derived_image"));
+        assert!(!raster_wire.contains("outside-page-one"));
+        assert!(!raster_wire.contains("outside-page-three"));
+        for original_bytes in [&png[..], b"different original image bytes".as_slice()] {
+            let original_image = storage.put_source_object(original_bytes).unwrap();
+            let image = magi_context::NativeExtraction {
+                schema_version: 1,
+                kind: magi_context::RepresentationKind::Image,
+                mime_type: "image/png".into(),
+                width: Some(1),
+                height: Some(1),
+                image_base64: Some(data.clone()),
+                pages: vec![],
+                warnings: vec![],
+                total_pages: None,
+            };
+            let derived_image = storage
+                .put_source_object(&serde_json::to_vec(&image).unwrap())
+                .unwrap();
+            let mut image_capture = raster_capture.clone();
+            image_capture.object_digest = Some(original_image.digest.clone());
+            image_capture.derived_digest = Some(derived_image.digest.clone());
+            image_capture.representation_kind = Some(image.kind);
+            image_capture.mime_type = Some("image/png".into());
+            image_capture.included_locators[0].object_digest = original_image.digest.clone();
+            image_capture.included_locators[0].page = None;
+            let mut image_source = frozen.clone();
+            image_source.object_digest = original_image.digest;
+            image_source.allowed_locators = vec![evidence_locator_identifier(
+                &image_capture.included_locators[0],
+                &derived_image.digest,
+            )];
+            let projected =
+                project_native_deliberation_source(&storage, &image_source, &image_capture)
+                    .unwrap();
+            let expected = if original_bytes == png {
+                magi_context::DisclosureContentKind::SourceOriginal
+            } else {
+                magi_context::DisclosureContentKind::SourceDerivedImage
+            };
+            assert_eq!(projected.content_kinds, [expected].into_iter().collect());
+            assert_eq!(projected.images[0]["data"], data);
+        }
+        let mut forged = captured.clone();
+        forged.included_locators[0].page = Some(1);
+        assert!(project_native_deliberation_source(&storage, &frozen, &forged).is_err());
+        let mut forged = frozen;
+        forged.allowed_locators[0] = "forged-page".into();
+        assert!(project_native_deliberation_source(&storage, &forged, &captured).is_err());
+    }
+}
+
+#[cfg(test)]
+mod provider_operation_boundary_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    struct OwnedRoot(PathBuf);
+    impl Drop for OwnedRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    struct OwnedWait(tokio::task::JoinHandle<Result<(), ProviderError>>);
+    impl Drop for OwnedWait {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
+    #[test]
+    fn pending_provider_wait_releases_operation_and_rejects_late_publication() {
+        tauri::async_runtime::block_on(async {
+            let (root, storage, _aggregate, claim) =
+                catalog_selection_ipc_tests::publication_fault_fixture();
+            let _root = OwnedRoot(root);
+            let storage = Arc::new(storage);
+            let controls = LiveRunControlRegistry::default();
+            let control = controls.register(&claim.run_id);
+            control
+                .bind_execution(
+                    crate::commands::NativeExecutionAuthority::capture(storage.clone()).unwrap(),
+                )
+                .unwrap();
+            let expected = storage.admission_execution_authority().unwrap();
+            let original_effect = control.effect_request().unwrap();
+            let (started_sender, started) = tokio::sync::oneshot::channel();
+            let (response_sender, response) = tokio::sync::oneshot::channel();
+            let pending_control = control.clone();
+            let published = Arc::new(AtomicBool::new(false));
+            let late_published = published.clone();
+            let mut wait = OwnedWait(tokio::spawn(async move {
+                await_provider_rpc(Some(&pending_control), async {
+                    started_sender.send(()).unwrap();
+                    response.await.map_err(|_| ProviderError::ProcessClosed)
+                })
+                .await?;
+                late_published.store(true, Ordering::Release);
+                Ok(())
+            }));
+            tokio::time::timeout(Duration::from_secs(1), started)
+                .await
+                .unwrap()
+                .unwrap();
+            let operation =
+                tokio::time::timeout(Duration::from_millis(200), control.operation.lock())
+                    .await
+                    .expect("pending provider wait must not own the cancellation lock");
+            let change = storage
+                .begin_deliberation_cancel(&claim.run_id, "2026-10-02T00:00:01Z")
+                .unwrap();
+            assert_eq!(change.0, LiveRunStatus::Cancelling);
+            control.revoke_effects();
+            drop(operation);
+            assert!(original_effect.check().is_err());
+            response_sender.send(()).unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(1), &mut wait.0)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(result, Err(ProviderError::Cancelled)));
+            assert!(!published.load(Ordering::Acquire));
+            assert!(
+                storage
+                    .load_frozen_deliberation_slot_with_authority(&expected, &claim, 0,)
+                    .is_err()
+            );
+            assert_eq!(
+                storage
+                    .get_live_run_snapshot(&claim.run_id, 0)
+                    .unwrap()
+                    .status,
+                LiveRunStatus::Cancelling
+            );
+        });
     }
 }

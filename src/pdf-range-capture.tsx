@@ -1,3 +1,4 @@
+import { t } from "./lib/locale";
 import { useEffect, useRef, useState } from "react";
 import { Button, Panel } from "./ui-controls";
 import { applyPdfRangeCapture, discardPdfRangeCapture, isDesktopApp, preparePdfRangeCapture, type ContextSelectionSummary, type PdfRangePreview } from "./lib/desktop-api";
@@ -102,20 +103,20 @@ export function PdfRangeCapture({ selection, onChange }: { selection: ContextSel
       if (current(request, capturedKey)) { busy.current = false; setPhase("idle"); }
     }
   };
-  return <Panel title="PDF 페이지를 골라 접수" kicker="PDF PAGE SELECTION">
-    <p>먼저 파일과 전체 페이지 수만 확인합니다. 선택한 최대 200페이지를 접수하며, 적용 전에는 초안을 바꾸거나 모델로 전송하지 않습니다.</p>
-    <div ref={selectAnchor} className="page-actions"><Button disabled={phase !== "idle" || !isDesktopApp()} onClick={() => void prepare()}>페이지 범위를 정할 PDF 선택</Button></div>
-    {phase !== "idle" && <p role="status">{phase === "selecting" ? "파일 선택과 페이지 수를 확인하는 중…" : "선택한 페이지를 접수하는 중…"}</p>}
+  return <Panel title={t("PDF 페이지를 골라 접수")} kicker="PDF PAGE SELECTION">
+    <p>{t("먼저 파일과 전체 페이지 수만 확인합니다. 선택한 최대 200페이지를 접수하며, 적용 전에는 초안을 바꾸거나 모델로 전송하지 않습니다.")}</p>
+    <div ref={selectAnchor} className="page-actions"><Button disabled={phase !== "idle" || !isDesktopApp()} onClick={() => void prepare()}>{t("페이지 범위를 정할 PDF 선택")}</Button></div>
+    {phase !== "idle" && <p role="status">{phase === "selecting" ? t("파일 선택과 페이지 수를 확인하는 중…") : t("선택한 페이지를 접수하는 중…")}</p>}
     {preview && <>
-      <fieldset disabled={phase !== "idle" || expired}><legend>{preview.displayName}</legend><p>전체 {preview.totalPages}페이지 · 한 번에 최대 200페이지</p><p className="field-help">수집본 digest · {preview.capturedDigest.slice(0, 12)}…</p>
-        <label className="field"><span>시작 페이지</span><input ref={startInput} type="number" min={1} max={preview.totalPages} value={start} onChange={event => setStart(event.target.value)} /></label>
-        <label className="field"><span>끝 페이지</span><input type="number" min={1} max={preview.totalPages} value={end} onChange={event => setEnd(event.target.value)} /></label>
-        <Button tone="primary" disabled={!valid || phase !== "idle"} onClick={() => void apply()}>이 페이지 범위만 접수</Button>
+      <fieldset disabled={phase !== "idle" || expired}><legend>{preview.displayName}</legend><p>{t("전체")}{preview.totalPages}{t("페이지 · 한 번에 최대 200페이지")}</p><p className="field-help">{t("수집본 digest ·")}{preview.capturedDigest.slice(0, 12)}…</p>
+        <label className="field"><span>{t("시작 페이지")}</span><input ref={startInput} type="number" min={1} max={preview.totalPages} value={start} onChange={event => setStart(event.target.value)} /></label>
+        <label className="field"><span>{t("끝 페이지")}</span><input type="number" min={1} max={preview.totalPages} value={end} onChange={event => setEnd(event.target.value)} /></label>
+        <Button tone="primary" disabled={!valid || phase !== "idle"} onClick={() => void apply()}>{t("이 페이지 범위만 접수")}</Button>
       </fieldset>
-      <div className="page-actions"><Button disabled={phase !== "idle"} onClick={cancel}>PDF 선택 취소</Button></div>
+      <div className="page-actions"><Button disabled={phase !== "idle"} onClick={cancel}>{t("PDF 선택 취소")}</Button></div>
     </>}
-    {expired && <p role="alert">PDF 선택 권한이 만료되었습니다. 현재 초안은 유지됩니다. 파일을 다시 선택하십시오.</p>}
-    {error && <p role="alert">PDF 범위를 접수하지 못했습니다. 입력한 페이지와 기존 초안은 유지됩니다. 다시 확인하고 재시도하십시오.</p>}
-    {!isDesktopApp() && <p className="field-help">PDF 선택은 데스크톱 앱에서 사용할 수 있습니다.</p>}
+    {expired && <p role="alert">{t("PDF 선택 권한이 만료되었습니다. 현재 초안은 유지됩니다. 파일을 다시 선택하십시오.")}</p>}
+    {error && <p role="alert">{t("PDF 범위를 접수하지 못했습니다. 입력한 페이지와 기존 초안은 유지됩니다. 다시 확인하고 재시도하십시오.")}</p>}
+    {!isDesktopApp() && <p className="field-help">{t("PDF 선택은 데스크톱 앱에서 사용할 수 있습니다.")}</p>}
   </Panel>;
 }

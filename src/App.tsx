@@ -1,3 +1,5 @@
+import { DossierPublicationFence } from "./lib/run-sync";
+import { t, setLocale, useLocale, type Locale } from "./lib/locale";
 import type { EvidenceReadingTarget } from "./records";
 import { useCoreBindings } from "./core-bindings";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -38,7 +40,11 @@ import {
   cancelDeliberationRequest,
   cancelDeliberation,
   loadRunDossier,
+  loadRunCoreDispatches,
+  validCoreDispatchProjection,
+  type CoreDispatchProjection,
   listenRunUpdate,
+  listenCoreDispatches,
   listRolePresets,
   loadActiveRolePresetSelection,
   normalizeRoleStoreDiagnostic,
@@ -113,6 +119,7 @@ function defaultConsolePreferences(): ConsolePreferences {
     theme: "command",
     fontScale: 100,
     language: "ko",
+    commonContextTokenLimit: 32000,
   };
 }
 
@@ -285,12 +292,14 @@ function toRolePresetDraft(preset: RolePreset): RolePresetDraft {
 }
 
 export default function App() {
+  const locale = useLocale();
   const [screen, setScreen] = useState<ScreenId>("home");
   const [question, setQuestion] = useState("");
   const [preferenceDefaults] = useState(defaultConsolePreferences);
   const [motion, setMotion] = useState<MotionSetting>(preferenceDefaults.motion);
   const [sound, setSound] = useState(preferenceDefaults.sound);
   const [theme, setTheme] = useState<ThemeSetting>(preferenceDefaults.theme);
+  const [commonContextTokenLimit, setCommonContextTokenLimit] = useState(preferenceDefaults.commonContextTokenLimit);
   const [fontScale, setFontScale] = useState<ConsolePreferences["fontScale"]>(preferenceDefaults.fontScale);
   const [snapshot, setSnapshot] = useState<ConsoleSnapshot>(emptySnapshot);
   const [contextSelection, setContextSelection] = useState<ContextSelectionSummary | null>(null);
@@ -386,7 +395,8 @@ export default function App() {
   const reloadPreferences = useRef<(() => Promise<void>) | null>(null);
   const preferenceSaveQueue = useRef<Promise<void>>(Promise.resolve());
   const preferenceAuthority = useRef<SettingsSnapshot | null>(null);
-  const preferenceEditGenerations = useRef<Record<PreferenceField, number>>({ motion: 0, sound: 0, theme: 0, fontScale: 0, language: 0 });
+  const [commonContextBudgetRevision, setCommonContextBudgetRevision] = useState<number | null>(null);
+  const preferenceEditGenerations = useRef<Record<PreferenceField, number>>({ motion: 0, sound: 0, theme: 0, fontScale: 0, language: 0, commonContextTokenLimit: 0 });
   type PreferenceOperation = { promise: Promise<SettingsReceipt>; retry: () => Promise<SettingsReceipt>; state: "pending" | "committed" | "conflict" | "unresolved" };
   const preferencePredecessors = useRef<Partial<Record<PreferenceField, PreferenceOperation>>>({});
   const profileSavePending = useRef(false);
@@ -421,7 +431,46 @@ export default function App() {
   const activeLiveRunIdRef = useRef<string | null>(null);
 
   const activeRun = snapshot.activeRun;
+  const latestRunRef = useRef(activeRun);
+  latestRunRef.current = activeRun;
+  const [newDraftFromRunId, setNewDraftFromRunId] = useState<string | null>(null);
+  const newDraftRunRef = useRef<string | null>(null);
+  const retainsNewDraft = (runId: string, status: string, route: ScreenId) => newDraftRunRef.current === runId && ["completed", "cancelled", "failed"].includes(status) && ["input", "intake", "confirmation"].includes(route);
   const currentRunId = activeRun?.id ?? acceptedRunId;
+  const [dispatchProjection, setDispatchProjection] = useState<CoreDispatchProjection | null>(null);
+  const dispatchRequest = useRef(0);
+  const dispatchAuthority = useRef<CoreDispatchProjection | null>(null);
+  const dispatchRun = useRef(currentRunId);
+  dispatchRun.current = currentRunId;
+  const refreshCoreDispatches = useCallback(async (runId: string) => {
+    const request = ++dispatchRequest.current;
+    try {
+      const next = await loadRunCoreDispatches(runId);
+      if (request !== dispatchRequest.current || dispatchRun.current !== runId) return;
+      const previous = dispatchAuthority.current;
+      if (previous?.runId === runId && (next.generation < previous.generation || next.runRevision < previous.runRevision || (next.generation === previous.generation && next.inputDigest !== previous.inputDigest))) return;
+      dispatchAuthority.current = next; setDispatchProjection(next);
+    } catch { if (request === dispatchRequest.current && dispatchRun.current === runId) { setDispatchProjection(null); } }
+  }, []);
+  useEffect(() => {
+    let disposed = false;
+    let stop: (() => void) | undefined;
+    ++dispatchRequest.current; dispatchAuthority.current = null; setDispatchProjection(null);
+    if (currentRunId) void (async () => {
+      try {
+        stop = await listenCoreDispatches(next => {
+          if (disposed || dispatchRun.current !== currentRunId || next?.runId !== currentRunId) return;
+          if (!validCoreDispatchProjection(next, currentRunId)) { ++dispatchRequest.current; setDispatchProjection(null); return; }
+          void refreshCoreDispatches(currentRunId);
+        });
+        if (disposed) { stop(); return; }
+        await refreshCoreDispatches(currentRunId);
+      } catch { if (!disposed) setDispatchProjection(null); }
+    })();
+    return () => { disposed = true; ++dispatchRequest.current; stop?.(); };
+  }, [currentRunId, refreshCoreDispatches]);
+  const currentDispatchProjection = dispatchProjection?.runId === currentRunId && (runDossier?.runId !== currentRunId || (dispatchProjection.runRevision >= runDossier.revision && dispatchProjection.generation >= runDossier.generation)) ? dispatchProjection : null;
+  const presentedSnapshot: ConsoleSnapshot = { ...snapshot, activeRun: activeRun ? { ...activeRun, dispatchProjection: currentDispatchProjection ?? undefined } : undefined };
   const currentRunProgress = runProgress?.runId === currentRunId ? runProgress : null;
   const currentRunDossier = runDossier?.runId === currentRunId ? runDossier : null;
   const selectedProviderProfile = acpProfiles.find((profile) => profile.id === selectedAcpProfileId);
@@ -434,6 +483,16 @@ export default function App() {
     observedAuthenticationFailures.current.add(identity);
     coreBindings.invalidateAuthentication(binding);
   }, [coreBindings.invalidateAuthentication]);
+  const dossierFence = useRef(new DossierPublicationFence());
+  const publishDossier = useCallback((dossier: RunDossierView, request?: number): boolean => {
+    const current = dispatchRun.current === dossier.runId;
+    const selected = selectedRunIdRef.current === dossier.runId;
+    if ((!current && !selected) || !dossierFence.current.accept(dossier, request)) return false;
+    observeAuthenticationFailure(`deliberation:${dossier.runId}:${dossier.generation}:${dossier.revision}:${dossier.error?.code}`, dossier.error);
+    if (current) { setRunDossier(dossier); setRunDossierState("ready"); }
+    if (selected) { setSelectedRunDossier(dossier); setSelectedRunDossierState("ready"); }
+    return true;
+  }, [observeAuthenticationFailure]);
   const selectedAuthProfileResult = coreBindings.verifiedAuthentication(selectedProviderProfile);
   const selectedLiveCatalog = liveCatalog && liveCatalog.providerProfileId === selectedProviderProfile?.id
     && liveCatalog.profileRevision === selectedProviderProfile?.revision
@@ -448,8 +507,9 @@ export default function App() {
     : liveRunTextDeltas.map((delta) => delta.text).join("");
   const selectedRolePreset = rolePresets.find((preset) => preset.id === selectedRolePresetId);
   const currentClarificationDraft = clarificationDraft?.parent.runId === currentRunId && currentRunDossier?.status === "paused" && verifiedClarificationParent?.runId === clarificationDraft.parent.runId && verifiedClarificationParent.revision === clarificationDraft.parent.revision && verifiedClarificationParent.inputDigest === clarificationDraft.parent.inputDigest && verifiedClarificationParent.generation === clarificationDraft.parent.generation ? clarificationDraft : null;
-  const shownQuestion = currentClarificationDraft && ["input", "confirmation", "intake"].includes(screen) ? currentClarificationDraft.question : activeRun?.question ?? question;
-  const isDraft = screen === "input" && !activeRun;
+  const newDraftView = Boolean(activeRun && newDraftFromRunId === activeRun.id && ["completed", "cancelled", "failed"].includes(activeRun.status) && ["input", "intake", "confirmation"].includes(screen));
+  const shownQuestion = currentClarificationDraft && ["input", "confirmation", "intake"].includes(screen) ? currentClarificationDraft.question : newDraftView ? question : activeRun?.question ?? question;
+  const isDraft = screen === "input" && (!activeRun || newDraftView);
 
   useEffect(() => {
     if (!selectedRunId) {
@@ -459,15 +519,15 @@ export default function App() {
     }
     let disposed = false;
     setSelectedRunDossierState("loading");
+    const request = dossierFence.current.begin(selectedRunId);
     void loadRunDossier(selectedRunId).then((dossier) => {
       if (disposed || selectedRunIdRef.current !== selectedRunId || dossier.runId !== selectedRunId) return;
-      setSelectedRunDossier(dossier);
-      setSelectedRunDossierState("ready");
+      publishDossier(dossier, request);
     }).catch(() => {
-      if (!disposed) setSelectedRunDossierState("error");
+      if (!disposed && selectedRunIdRef.current === selectedRunId && dossierFence.current.isCurrent(selectedRunId, request)) setSelectedRunDossierState("error");
     });
     return () => { disposed = true; };
-  }, [selectedRunId]);
+  }, [selectedRunId, publishDossier]);
 
   useEffect(() => {
     document.documentElement.dataset.motion = motion;
@@ -682,30 +742,34 @@ export default function App() {
     let disposed = false;
     let unlisten: (() => void) | undefined;
     const runtimeScreens: ScreenId[] = ["confirmation", "independent", "review", "proposal", "sealed", "verdict", "paused", "interrupted", "cancelling", "cancelled", "failed"];
-    const showRunDossier = (dossier: RunDossierView) => {
-      observeAuthenticationFailure(`deliberation:${dossier.runId}:${dossier.error?.code}`, dossier.error);
-      setRunDossier(dossier);
-      setRunDossierState("ready");
+    const showRunDossier = (dossier: RunDossierView, request?: number) => {
+      if (!publishDossier(dossier, request)) return false;
       const next = routeForDossier(dossier);
-      if (next) setScreen((current) => runtimeScreens.includes(current) && !(clarificationDraftRef.current?.parent.runId === dossier.runId && dossier.status === "paused" && ["input", "confirmation"].includes(current)) ? next : current);
+      if (next) setScreen((current) => runtimeScreens.includes(current) && !retainsNewDraft(dossier.runId, dossier.status, current) && !(clarificationDraftRef.current?.parent.runId === dossier.runId && dossier.status === "paused" && ["input", "confirmation"].includes(current)) ? next : current);
+      return true;
     };
     const refreshRunState = async (runId: string) => {
+      const request = dossierFence.current.begin(runId);
       try {
         const dossier = await loadRunDossier(runId);
         if (disposed || activeRunIdRef.current !== runId || dossier.runId !== runId) return;
-        showRunDossier(dossier);
+        if (!showRunDossier(dossier, request)) return;
         if (["completed", "failed", "cancelled"].includes(dossier.status)) {
           const [nextSnapshot, recentRuns] = await Promise.all([getConsoleSnapshot(), listRecentRuns()]);
-          if (disposed || activeRunIdRef.current !== runId) return;
+          if (disposed || activeRunIdRef.current !== runId || !dossierFence.current.isCurrent(runId, request) || (nextSnapshot.eventSequence ?? -1) < lastEventSequence.current) return;
+          lastEventSequence.current = nextSnapshot.eventSequence ?? -1;
           setSnapshot(nextSnapshot);
           setHomeData({ recordsState: "ready", recentRuns: recentRuns.map((run) => ({ id: run.runId, question: run.question, status: run.status, createdAt: run.createdAt })) });
         }
       } catch {
-        if (!disposed) setRunDossierState("error");
+        if (!disposed && dispatchRun.current === runId && dossierFence.current.isCurrent(runId, request)) setRunDossierState("error");
       }
     };
     void listenRunUpdate((update) => {
       if (!activeRunIdRef.current || activeRunIdRef.current !== update.runId) return;
+      if (update.result && (update.result.runId !== update.runId || !showRunDossier(update.result))) return;
+      if (!update.dispatchProjection || validCoreDispatchProjection(update.dispatchProjection, update.runId)) void refreshCoreDispatches(update.runId);
+      else { ++dispatchRequest.current; setDispatchProjection(null); }
       setAcceptedRunId(update.runId);
       setRunProgress((current) => {
         const previousText = current?.runId === update.runId ? current.text ?? "" : "";
@@ -721,9 +785,7 @@ export default function App() {
               : update.text,
         };
       });
-      if (update.result?.runId === update.runId) {
-        showRunDossier(update.result);
-      } else if (update.state === "failed" || update.state === "cancelled" || update.state === "completed") {
+      if (!update.result && (update.state === "failed" || update.state === "cancelled" || update.state === "completed")) {
         void refreshRunState(update.runId);
       }
       if (!update.result && (update.state === "started" || update.state === "streaming")) {
@@ -742,7 +804,7 @@ export default function App() {
       disposed = true;
       unlisten?.();
     };
-  }, [announce, observeAuthenticationFailure]);
+  }, [announce, publishDossier, refreshCoreDispatches]);
 
   useEffect(() => {
     let disposed = false;
@@ -880,7 +942,7 @@ export default function App() {
     setAcceptedRunId(activeRun.id);
     const next = runtimeRoutes[activeRun.status];
     const runtimeScreens: ScreenId[] = ["input", "independent", "review", "proposal", "sealed", "verdict", "paused", "interrupted", "cancelling", "cancelled", "failed", "save-error", "confirmation"];
-    if (next && runtimeScreens.includes(screen) && screen !== next && !(currentClarificationDraft && ["input", "confirmation"].includes(screen))) {
+    if (next && runtimeScreens.includes(screen) && screen !== next && !retainsNewDraft(activeRun.id, activeRun.status, screen) && !(currentClarificationDraft && ["input", "confirmation"].includes(screen))) {
       setScreen(next);
     }
   }, [activeRun?.id, activeRun?.status, screen, currentClarificationDraft]);
@@ -893,19 +955,18 @@ export default function App() {
     }
     let disposed = false;
     setRunDossierState("loading");
+    const request = dossierFence.current.begin(currentRunId);
     void loadRunDossier(currentRunId).then((dossier) => {
       if (disposed || dossier.runId !== currentRunId) return;
-      observeAuthenticationFailure(`deliberation:${dossier.runId}:${dossier.error?.code}`, dossier.error);
-      setRunDossier(dossier);
-      setRunDossierState("ready");
+      if (!publishDossier(dossier, request)) return;
       const next = routeForDossier(dossier);
       const runtimeScreens: ScreenId[] = ["confirmation", "independent", "review", "proposal", "sealed", "verdict", "paused", "interrupted", "cancelling", "cancelled", "failed"];
-      if (next) setScreen((current) => runtimeScreens.includes(current) && !(clarificationDraftRef.current?.parent.runId === dossier.runId && dossier.status === "paused" && ["input", "confirmation"].includes(current)) ? next : current);
+      if (next) setScreen((current) => runtimeScreens.includes(current) && !retainsNewDraft(dossier.runId, dossier.status, current) && !(clarificationDraftRef.current?.parent.runId === dossier.runId && dossier.status === "paused" && ["input", "confirmation"].includes(current)) ? next : current);
     }).catch(() => {
-      if (!disposed) setRunDossierState("error");
+      if (!disposed && dispatchRun.current === currentRunId && dossierFence.current.isCurrent(currentRunId, request)) setRunDossierState("error");
     });
     return () => { disposed = true; };
-  }, [currentRunId, observeAuthenticationFailure]);
+  }, [currentRunId, publishDossier]);
 
   useEffect(() => {
     const node = dialogRef.current;
@@ -933,6 +994,11 @@ export default function App() {
   const navigate = useCallback((requested: ScreenId, returning = false) => {
     const next = requested === "provider" ? "connections" : requested;
     const current = screenRef.current;
+    const latest = latestRunRef.current;
+    if (next === "input" && latest && ["completed", "cancelled", "failed"].includes(latest.status)) {
+      newDraftRunRef.current = latest.id;
+      setNewDraftFromRunId(latest.id);
+    }
     screenScrollPositions.current[current] = { top: window.scrollY, left: window.scrollX };
     if (!returning && next === "connections" && current !== "connections") connectionReturnScreen.current = current;
     if (!returning && next === "settings" && current !== "settings") settingsReturnScreen.current = current;
@@ -1589,10 +1655,11 @@ export default function App() {
   const displayPreferences = useCallback((snapshot: SettingsSnapshot) => {
     if (preferenceAuthority.current && snapshot.revision < preferenceAuthority.current.revision) return;
     preferenceAuthority.current = snapshot;
+    setCommonContextBudgetRevision(snapshot.fieldRevisions.commonContextTokenLimit);
     const resolved = { ...snapshot.preferences };
     for (const field of changedPreferenceFields.current) Object.assign(resolved, { [field]: preferencesRef.current[field] });
     preferencesRef.current = resolved;
-    setMotion(resolved.motion); setSound(resolved.sound); setTheme(resolved.theme); setFontScale(resolved.fontScale);
+    setMotion(resolved.motion); setSound(resolved.sound); setTheme(resolved.theme); setFontScale(resolved.fontScale); setLocale(resolved.language); setCommonContextTokenLimit(resolved.commonContextTokenLimit);
   }, []);
 
   const queuePreferenceSave = useCallback((preferences: ConsolePreferences, onlyField?: PreferenceField) => {
@@ -1655,10 +1722,6 @@ export default function App() {
         if (disposed || generation !== preferenceReadGeneration.current || snapshot === null) return;
         displayPreferences(snapshot);
         preferencesReady.current = true;
-        if (snapshot.preferences.language !== "ko") {
-          changedPreferenceFields.current.add("language"); preferenceEditGenerations.current.language++;
-          preferencesRef.current = { ...preferencesRef.current, language: "ko" };
-        }
         if (initial && changedPreferenceFields.current.size > 0) queuePreferenceSave(preferencesRef.current);
       } catch {
         if (disposed || generation !== preferenceReadGeneration.current) return;
@@ -1696,6 +1759,32 @@ export default function App() {
     const next = { ...preferencesRef.current, fontScale: value }; preferencesRef.current = next; setFontScale(value);
     if (preferencesReady.current) queuePreferenceSave(next, "fontScale");
   }, [queuePreferenceSave]);
+
+  const changeCommonContextTokenLimit = useCallback((value: number) => {
+    if (!Number.isSafeInteger(value) || value < 1 || value > 128000) return;
+    if (value === preferencesRef.current.commonContextTokenLimit) {
+      const pending = preferencePredecessors.current.commonContextTokenLimit;
+      if (pending?.state === "unresolved") {
+        pending.state = "pending";
+        pending.promise = preferenceSaveQueue.current.catch(() => undefined).then(() => pending.retry());
+        preferenceSaveQueue.current = pending.promise.then(() => undefined).catch(async () => {
+          announce("콘솔 설정을 저장하지 못했습니다. 입력은 유지했습니다. 충돌한 설정은 다시 확인해 주세요.");
+          await reloadPreferences.current?.();
+        });
+      }
+      return;
+    }
+    changedPreferenceFields.current.add("commonContextTokenLimit"); preferenceEditGenerations.current.commonContextTokenLimit++;
+    const next = { ...preferencesRef.current, commonContextTokenLimit: value }; preferencesRef.current = next; setCommonContextTokenLimit(value);
+    if (preferencesReady.current) queuePreferenceSave(next, "commonContextTokenLimit");
+  }, [announce, queuePreferenceSave]);
+
+  const changeLocale = useCallback((value: Locale) => {
+    changedPreferenceFields.current.add("language"); preferenceEditGenerations.current.language++;
+    const next = { ...preferencesRef.current, language: value }; preferencesRef.current = next; setLocale(value);
+    if (preferencesReady.current) queuePreferenceSave(next, "language");
+  }, [queuePreferenceSave]);
+  useEffect(() => { document.documentElement.lang = locale; }, [locale]);
 
   const confirmQuestion = () => {
     if (!question.trim()) {
@@ -1813,6 +1902,11 @@ export default function App() {
       return;
     }
 
+    if (!preferencesReady.current || !preferenceAuthority.current) {
+      setRunStartError("저장된 콘솔 설정을 확인한 뒤 다시 시작하십시오.");
+      return;
+    }
+    const budgetRevision = preferenceAuthority.current.fieldRevisions.commonContextTokenLimit;
     const bindings = coreBindings.destinations.flatMap(item => item.reference ? [item.reference] : []);
     const previousCommand = pendingDeliberationCommand.current;
     const reusableCommand = previousCommand
@@ -1827,6 +1921,7 @@ export default function App() {
       contextDraftId: contextSelection?.draftId ?? null, contextRevision: contextSelection?.revision ?? null,
       rolePresetId: selectedRolePreset.id, roleRevision: selectedRolePreset.revision,
       coreBindings: bindings, disclosureConfirmed: true,
+      expectedCommonContextBudgetRevision: budgetRevision,
     };
     if (admissionFlow.current?.request === command && admissionFlow.current.cancellation) {
       setRunStartError("이 시작 요청의 취소 의도가 유지되고 있습니다. 취소 응답과 저장 상태를 확인하십시오.");
@@ -1916,20 +2011,13 @@ export default function App() {
 
   const refreshRunStatus = async (runId: string) => {
     const refreshCurrent = runId === currentRunId;
+    const request = dossierFence.current.begin(runId);
     if (refreshCurrent) setRunDossierState("loading");
     if (selectedRunIdRef.current === runId) setSelectedRunDossierState("loading");
     try {
       const dossier = await loadRunDossier(runId);
       if (dossier.runId !== runId) throw new Error("Run dossier mismatch.");
-      if (refreshCurrent) {
-        observeAuthenticationFailure(`deliberation:${dossier.runId}:${dossier.error?.code}`, dossier.error);
-        setRunDossier(dossier);
-        setRunDossierState("ready");
-      }
-      if (selectedRunIdRef.current === runId) {
-        setSelectedRunDossier(dossier);
-        setSelectedRunDossierState("ready");
-      }
+      if (!publishDossier(dossier, request)) return;
       try {
         const recentRuns = await listRecentRuns();
         setHomeData({
@@ -1941,14 +2029,17 @@ export default function App() {
       }
       if (activeRunIdRef.current === runId && ["completed", "failed", "cancelled"].includes(dossier.status)) {
         try {
-          setSnapshot(await getConsoleSnapshot());
+          const nextSnapshot = await getConsoleSnapshot();
+          if (activeRunIdRef.current === runId && dossierFence.current.isCurrent(runId, request) && (nextSnapshot.eventSequence ?? -1) >= lastEventSequence.current) { lastEventSequence.current = nextSnapshot.eventSequence ?? -1; setSnapshot(nextSnapshot); }
         } catch {
           announce("심의 결과는 확인했지만 앱 상태 스냅샷을 새로 읽지 못했습니다.");
         }
       }
     } catch {
-      if (refreshCurrent) setRunDossierState("error");
-      if (selectedRunIdRef.current === runId) setSelectedRunDossierState("error");
+      if (dossierFence.current.isCurrent(runId, request)) {
+        if (dispatchRun.current === runId) setRunDossierState("error");
+        if (selectedRunIdRef.current === runId) setSelectedRunDossierState("error");
+      }
       announce("저장된 심의 상태를 다시 읽지 못했습니다.");
     }
   };
@@ -1956,7 +2047,7 @@ export default function App() {
   const openCore = (core: string) => {
     setDialog({
       title: `${core} · ${screen === "input" ? "관점" : "코어 정보"}`,
-      body: "기본 관점과 역할 편집 화면을 확인할 수 있습니다. 실행 중인 모델 의견은 아직 없습니다.",
+      body: currentDispatchProjection ? currentDispatchProjection.coreDispatches.filter(slot => slot.bindingCoreId.replace("-", "·") === core || slot.bindingCoreId === core).map(slot => `${slot.slotOrdinal} · ${slot.stage} · ${slot.state}${slot.resultRef ? ` · ${slot.resultRef}` : ""}`).join("\n") + (currentRunDossier?.assessments?.filter(assessment => assessment.coreId.replace("-", "·") === core || assessment.coreId === core).map(assessment => `\n${assessment.positionSummary}`).join("") ?? "") || t("현재 코어의 저장된 요청이 없습니다.") : t("저장된 코어 요청 상태를 확인하지 못했습니다."),
     });
   };
 
@@ -2082,56 +2173,50 @@ export default function App() {
   const footerStage = currentRunProgress?.stage ?? activeRun?.stage ?? "안건 대기";
 
   if (shellContext?.windowLabel === "companion") {
-    return <CompanionSurface snapshot={snapshot} runId={currentRunId} progress={currentRunProgress} dossier={currentRunDossier} cancelRequest={cancelRequest} onCancelRun={cancelRun} onRefreshRunStatus={refreshRunStatus} onOpenConsole={openCompanionConsole} onOpenSettings={openCompanionSettings} onClose={closeStatusCompanion} onRequestExit={requestExitConfirmation} />;
+    return <CompanionSurface snapshot={presentedSnapshot} runId={currentRunId} progress={currentRunProgress} dossier={currentRunDossier} cancelRequest={cancelRequest} onCancelRun={cancelRun} onRefreshRunStatus={refreshRunStatus} onOpenConsole={openCompanionConsole} onOpenSettings={openCompanionSettings} onClose={closeStatusCompanion} onRequestExit={requestExitConfirmation} />;
   }
 
   return (
     <div className="console-shell" data-theme={theme}>
-      <a className="skip-link" href="#screen-content">
-        본문으로 건너뛰기
-      </a>
+      <a className="skip-link" href="#screen-content">{t("본문으로 건너뛰기")}</a>
       <header className="console-header">
         <h1 className="console-title">
-          <button type="button" className="console-brand-link" aria-label="MAGI COMMAND CONSOLE 홈으로 이동" onClick={() => navigate("home")}>
+          <button type="button" className="console-brand-link" aria-label={t("MAGI COMMAND CONSOLE 홈으로 이동")} onClick={() => navigate("home")}>
             <span className="title-long">MAGI COMMAND CONSOLE</span>
             <span className="title-short">MAGI CONSOLE</span>
           </button>
         </h1>
-        <div className="console-edition" aria-label="팬 창작 데스크톱 앱">
+        <div className="console-edition" aria-label={t("팬 창작 데스크톱 앱")}>
           <span>MACOS</span>
           <span className="edition-divider" aria-hidden="true" />
           <span>LOCAL</span>
         </div>
-        <nav className="header-actions" aria-label="콘솔 도구">
-          <button type="button" onClick={() => navigate("history")}>
-            기록
-          </button>
-          <button type="button" onClick={() => navigate("connections")}>모델 연결</button>
-          <button type="button" onClick={() => navigate("settings")}>
-            설정
-          </button>
+        <nav className="header-actions" aria-label={t("콘솔 도구")}>
+          <button type="button" onClick={() => navigate("history")}>{t("기록")}</button>
+          <button type="button" onClick={() => navigate("connections")}>{t("모델 연결")}</button>
+          <button type="button" onClick={() => navigate("settings")}>{t("설정")}</button>
           <button type="button" aria-pressed={sound} onClick={toggleSound}>
-            {sound ? "소리 켬" : "소리 끔"}
+            {sound ? t("소리 켬") : t("소리 끔")}
           </button>
           <button type="button" aria-pressed={motion !== "full"} onClick={() => changeMotion(motion === "full" ? "reduced" : "full")}>
-            {motion === "full" ? "동작 켬" : motion === "reduced" ? "동작 줄임" : "동작 끔"}
+            {motion === "full" ? t("동작 켬") : motion === "reduced" ? t("동작 줄임") : t("동작 끔")}
           </button>
         </nav>
       </header>
 
-      {screen !== "home" && <section className={`agenda ${invalidQuestion ? "agenda-invalid" : ""}`} aria-label="현재 안건">
+      {screen !== "home" && <section className={`agenda ${invalidQuestion ? "agenda-invalid" : ""}`} aria-label={t("현재 안건")}>
         <div className="agenda-marker">
-          <strong>안건</strong>
+          <strong>{t("안건")}</strong>
           <span>AGENDA</span>
         </div>
         <div className="agenda-input-wrap">
-          <label className="sr-only" htmlFor="question-draft">심의할 질문</label>
+          <label className="sr-only" htmlFor="question-draft">{t("심의할 질문")}</label>
           <textarea
             id="question-draft"
             rows={2}
             value={shownQuestion}
             readOnly={!isDraft}
-            placeholder={isDraft ? "결정이 필요한 질문을 입력하십시오…" : "안건 대기"}
+            placeholder={isDraft ? t("결정이 필요한 질문을 입력하십시오…") : t("안건 대기")}
             aria-describedby={invalidQuestion ? "question-error" : "question-help"}
             aria-invalid={invalidQuestion}
             onChange={(event) => { setQuestion(event.target.value); setDisclosureConfirmed(false); setRunStartState("idle"); setRunStartError(""); setInvalidQuestion(false); }}
@@ -2144,17 +2229,17 @@ export default function App() {
             }}
           />
           <p className="sr-only" id={invalidQuestion ? "question-error" : "question-help"}>
-            {invalidQuestion ? "심의할 질문을 입력해야 합니다." : "Enter는 줄바꿈입니다. Command와 Enter를 함께 눌러 입력 확인으로 이동합니다."}
+            {invalidQuestion ? t("심의할 질문을 입력해야 합니다.") : t("Enter는 줄바꿈입니다. Command와 Enter를 함께 눌러 입력 확인으로 이동합니다.")}
           </p>
         </div>
         <div className="agenda-actions">
           <div className="agenda-source-status">
             <span className="source-symbol" aria-hidden="true">▤</span>
-            <span>{activeRun ? `자료 ${activeRun.sourceCount}개` : contextSelection ? `자료 ${contextSelection.sources.filter((source) => source.status === "captured").length}개 접수` : "자료 0개"}</span>
-            <button type="button" className="text-action" onClick={() => navigate("intake")}>자료 보기</button>
+            <span>{activeRun && !newDraftView ? `자료 ${activeRun.sourceCount}개` : contextSelection ? `자료 ${contextSelection.sources.filter((source) => source.status === "captured").length}개 접수` : t("자료 0개")}</span>
+            <button type="button" className="text-action" onClick={() => navigate("intake")}>{t("자료 보기")}</button>
           </div>
           <button type="button" className="button button-primary agenda-primary" onClick={confirmQuestion} disabled={!isDraft}>
-            {isDraft ? "입력 확인" : activeRun ? "진행 중" : "새 안건"}
+            {isDraft ? t("입력 확인") : activeRun ? t("진행 중") : t("새 안건")}
             <span aria-hidden="true">↗</span>
           </button>
         </div>
@@ -2167,7 +2252,7 @@ export default function App() {
           motion={motion}
           sound={sound}
           theme={theme}
-          snapshot={snapshot}
+          snapshot={presentedSnapshot}
           homeData={homeData}
           evidenceReadingTarget={evidenceReadingTarget}
           onEvidenceReadingTargetChange={setEvidenceReadingTarget}
@@ -2177,10 +2262,10 @@ export default function App() {
           currentRunId={currentRunId}
           runProgress={currentRunProgress}
           onClarificationParentVerified={setVerifiedClarificationParent}
-          onDiscardClarificationDraft={(action) => setDialog({ title: "자식 초안 삭제", body: "저장된 자식 질문과 초안을 삭제합니다. 부모 심의와 검토는 유지됩니다. 작성 중인 변경도 버립니다.", confirm: { label: "초안 삭제", danger: true, action } })}
+          onDiscardClarificationDraft={(action) => setDialog({ title: t("자식 초안 삭제"), body: t("저장된 자식 질문과 초안을 삭제합니다. 부모 심의와 검토는 유지됩니다. 작성 중인 변경도 버립니다."), confirm: { label: t("초안 삭제"), danger: true, action } })}
           clarificationDraft={currentClarificationDraft}
           onClarificationDraftChanged={(draft) => { setClarificationDraft(draft); if (draft) { setQuestion(draft.question); setContextSelection(draft.context); } else { setQuestion(currentRunDossier?.question ?? ""); setContextSelection(null); } setDisclosureConfirmed(false); }}
-          onConfirmClarificationDraft={(draft) => { if (draft.parent.runId !== currentRunId || currentRunDossier?.status !== "paused") { setRunStartError("자식 초안의 부모 상태를 현재 저장 기록에서 확인하십시오."); return; } setClarificationDraft(draft); setQuestion(draft.question); setContextSelection(draft.context); setDisclosureConfirmed(false); navigate("confirmation"); }}
+          onConfirmClarificationDraft={(draft) => { if (draft.parent.runId !== currentRunId || currentRunDossier?.status !== "paused") { setRunStartError(t("자식 초안의 부모 상태를 현재 저장 기록에서 확인하십시오.")); return; } setClarificationDraft(draft); setQuestion(draft.question); setContextSelection(draft.context); setDisclosureConfirmed(false); navigate("confirmation"); }}
           runDossier={currentRunDossier}
           runDossierState={runDossierState}
           runStartState={runStartState}
@@ -2243,7 +2328,7 @@ export default function App() {
             setSelectedRunId(null);
             setSelectedRunDossier(null);
             setSelectedRunDossierState("idle");
-            announce("선택한 기록을 삭제했습니다.");
+            announce(t("선택한 기록을 삭제했습니다."));
           }}
           onBeginAcpProfileCreate={beginAcpProfileCreate}
           onBeginAcpProfileEdit={beginAcpProfileEdit}
@@ -2283,6 +2368,11 @@ export default function App() {
           onSelectContextFiles={chooseContextFiles}
           onSelectContextDirectory={chooseContextDirectory}
           onPdfCaptured={acceptPdfCapture}
+          locale={locale}
+          onLocaleChange={changeLocale}
+          commonContextBudgetRevision={commonContextBudgetRevision}
+          commonContextTokenLimit={commonContextTokenLimit}
+          onCommonContextTokenLimitChange={changeCommonContextTokenLimit}
           fontScale={fontScale}
           onFontScaleChange={changeFontScale}
           onOpenConsole={openCompanionConsole}
@@ -2295,11 +2385,11 @@ export default function App() {
       <footer className="console-footer">
         <span className="footer-system">MAGI SYSTEM <span aria-hidden="true">///</span></span>
         <span className="footer-rule" aria-hidden="true" />
-        <span className="footer-value">{storageLabel}</span>
-        <span className="footer-stage">{footerStage}</span>
+        <span className="footer-value">{t(storageLabel)}</span>
+        <span className="footer-stage">{t(footerStage)}</span>
         <button type="button" className="connection-state" onClick={() => navigate("connections")}>
           <span className={`status-dot status-${snapshot.connection}`} aria-hidden="true" />
-          {connectionLabel}
+          {t(connectionLabel)}
         </button>
       </footer>
 
@@ -2308,12 +2398,12 @@ export default function App() {
           <>
             <div className="dialog-header">
               <span>MAGI / CONTROL</span>
-              <button type="button" className="icon-button" aria-label="대화상자 닫기" onClick={() => setDialog(null)}>×</button>
+              <button type="button" className="icon-button" aria-label={t("대화상자 닫기")} onClick={() => setDialog(null)}>×</button>
             </div>
             <h2 id="dialog-title">{dialog.title}</h2>
             <p className="dialog-copy">{dialog.body}</p>
             <div className="dialog-actions">
-              <button type="button" className="button" onClick={() => setDialog(null)}>닫기</button>
+              <button type="button" className="button" onClick={() => setDialog(null)}>{t("닫기")}</button>
               {dialog.confirm && (
                 <button type="button" className={`button ${dialog.confirm.danger ? "button-danger" : "button-primary"}`} onClick={() => { const action = dialog.confirm?.action; setDialog(null); action?.(); }}>
                   {dialog.confirm.label}

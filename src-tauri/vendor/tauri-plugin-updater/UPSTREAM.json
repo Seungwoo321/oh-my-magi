@@ -1,0 +1,17 @@
+{
+  "name": "tauri-plugin-updater",
+  "version": "2.11.0",
+  "source": "https://crates.io/crates/tauri-plugin-updater/2.11.0",
+  "archiveSha256": "b28d8cabdeb0564f03ae261963de4bc3d98321cd3d213e76a81b7d344e5df606",
+  "vcs": {
+    "git": {
+      "sha1": "6aa2854f314481a459be1189b02c65a2450789ab"
+    },
+    "path_in_vcs": "plugins/updater"
+  },
+  "modifiedFiles": [
+    "src/updater.rs",
+    "src/error.rs"
+  ],
+  "change": "Adds network-free construction from bounded verified metadata and a macOS installer that bounds archive entries, checks bundle identity/version/architecture/minimum OS and executable signatures, requires stapled notarization and Gatekeeper acceptance for the validated release entrypoint, syncs staged files, atomically exchanges bundles, and persists authority for the retained previous application."
+}

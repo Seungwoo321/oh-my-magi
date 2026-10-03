@@ -65,6 +65,7 @@ pub struct ManifestSource {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SafeSourceSummary {
+    pub included_locators: Vec<EvidenceLocator>,
     pub source_id: String,
     pub display_name: String,
     pub result: ManifestSourceState,
@@ -184,6 +185,7 @@ pub enum DisclosureContentKind {
     RoleProfile,
     SourceOriginal,
     SourceDerivedText,
+    SourceDerivedImage,
     PriorAssessment,
     Proposal,
 }
@@ -324,6 +326,7 @@ impl SourceCaptureManifest {
             .sources
             .iter()
             .map(|source| SafeSourceSummary {
+                included_locators: source.included_locators.clone(),
                 source_id: source.source_id.clone(),
                 display_name: source.display_name.clone(),
                 result: source.state,
@@ -628,6 +631,16 @@ fn evidence_locator_id(locator: &EvidenceLocator, derived_digest: Option<&Digest
     let derived_digest = derived_digest
         .map(ToString::to_string)
         .unwrap_or_else(|| "missing-digest".to_owned());
+    if let Some(page) = locator.page {
+        return format!(
+            "pdf-page-v1:{derived_digest}:page:{page}:width:{}:height:{}",
+            locator.width.map_or("text".into(), |v| v.to_string()),
+            locator.height.map_or("text".into(), |v| v.to_string())
+        );
+    }
+    if let (Some(width), Some(height)) = (locator.width, locator.height) {
+        return format!("image-v1:{derived_digest}:width:{width}:height:{height}");
+    }
     match (locator.start_line, locator.end_line, locator.total_lines) {
         (Some(start), Some(end), Some(total)) => {
             format!("utf8-text-v1:{derived_digest}:lines:{start}-{end}:of-{total}")
@@ -705,6 +718,11 @@ mod representation_version_tests {
         source.included_locators[0].page = Some(1);
         let binary = SourceCaptureManifest::draft(vec![source], 1).unwrap();
         assert_eq!(binary.schema_version, 2);
+        let summary = binary.safe_source_summaries().unwrap();
+        assert_eq!(
+            summary[0].included_locators,
+            binary.content.sources[0].included_locators
+        );
         let mut wrong = binary.clone();
         wrong.schema_version = 1;
         wrong.digest = wrong.calculate_digest().unwrap();
@@ -717,5 +735,63 @@ mod representation_version_tests {
         wrong.content.sources[0].included_locators[0].page = Some(0);
         wrong.digest = wrong.calculate_digest().unwrap();
         assert!(wrong.validate().is_err());
+        assert!(wrong.safe_source_summaries().is_err());
+    }
+}
+
+#[cfg(test)]
+mod typed_locator_identity_tests {
+    use super::*;
+    #[test]
+    fn captured_pages_have_distinct_ids_and_text_identity_is_preserved() {
+        let digest = Digest::from_bytes(b"captured");
+        let mut locator = EvidenceLocator {
+            source_id: "fixture".into(),
+            object_digest: digest.clone(),
+            start_line: None,
+            end_line: None,
+            total_lines: None,
+            page: Some(2),
+            width: None,
+            height: None,
+        };
+        let second = evidence_locator_id(&locator, Some(&digest));
+        locator.page = Some(3);
+        assert_ne!(second, evidence_locator_id(&locator, Some(&digest)));
+        locator.page = None;
+        assert_eq!(
+            evidence_locator_id(&locator, Some(&digest)),
+            format!("utf8-text-v1:{digest}:all")
+        );
+        locator.width = Some(1024);
+        locator.height = Some(512);
+        assert!(evidence_locator_id(&locator, Some(&digest)).starts_with("image-v1:"));
+    }
+}
+
+#[cfg(test)]
+mod disclosure_representation_tests {
+    use super::*;
+
+    #[test]
+    fn derived_image_kind_preserves_existing_serialized_kinds() {
+        for (kind, encoded) in [
+            (DisclosureContentKind::SourceOriginal, "source_original"),
+            (
+                DisclosureContentKind::SourceDerivedText,
+                "source_derived_text",
+            ),
+            (
+                DisclosureContentKind::SourceDerivedImage,
+                "source_derived_image",
+            ),
+        ] {
+            let value = serde_json::to_value(kind).unwrap();
+            assert_eq!(value, encoded);
+            assert_eq!(
+                serde_json::from_value::<DisclosureContentKind>(value).unwrap(),
+                kind
+            );
+        }
     }
 }

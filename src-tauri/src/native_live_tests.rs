@@ -1,10 +1,6 @@
-mod commands;
+use crate::{commands, profiles};
 #[path = "../native/connection-ui-fixture.rs"]
 mod connection_ui_fixture;
-mod pdf_capture;
-mod preferences;
-mod profiles;
-mod run_projection;
 
 use std::os::unix::fs::PermissionsExt;
 use std::{
@@ -199,7 +195,7 @@ fn validate_saved_profile_records(
             return Err("saved profile reference drift");
         }
         let core = storage
-            .load_core_model_selection(binding.core_id)
+            .load_core_model_selection_intent(binding.core_id)
             .map_err(|_| "saved core unavailable")?;
         match (core, binding.core_selection_revision) {
             (None, None) => {}
@@ -236,7 +232,7 @@ fn derive_saved_profile_bindings(
                 .map_err(|_| "saved model unavailable")?
                 .ok_or("saved model missing")?;
             let core = storage
-                .load_core_model_selection(reference.core_id)
+                .load_core_model_selection_intent(reference.core_id)
                 .map_err(|_| "saved core unavailable")?;
             let core_selection_revision = match core {
                 None if reference.core_selection_revision.is_none() => None,
@@ -1593,6 +1589,306 @@ async fn retained_saved_preparation(
     ))
 }
 
+struct OwnedPreparationPath {
+    path: PathBuf,
+    keep: bool,
+}
+impl Drop for OwnedPreparationPath {
+    fn drop(&mut self) {
+        if !self.keep
+            && self.path.exists()
+            && let Err(error) = std::fs::remove_dir_all(&self.path)
+        {
+            if std::thread::panicking() {
+                eprintln!("Owned preparation cleanup failed: {error}");
+            } else {
+                panic!("Owned preparation cleanup failed: {error}");
+            }
+        }
+    }
+}
+
+fn prepare_retained_saved_profile_backup() -> Result<(), String> {
+    let required = |name| {
+        std::env::var_os(name)
+            .map(PathBuf::from)
+            .ok_or_else(|| format!("{name} required"))
+    };
+    prepare_retained_saved_profile_backup_at(
+        required("MAGI_TEST_RETAINED_PROFILE_ROOT")?,
+        required("MAGI_TEST_OWNED_COPY_ROOT")?,
+        required("MAGI_TEST_SAVED_PROFILE_BACKUP_ROOT")?,
+    )
+}
+
+fn prepare_retained_saved_profile_backup_at(
+    retained: PathBuf,
+    copy: PathBuf,
+    backup: PathBuf,
+) -> Result<(), String> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    if copy.exists() || backup.exists() || retained == copy || retained == backup {
+        return Err("fresh distinct owned destinations required".into());
+    }
+    use std::os::fd::{AsRawFd, FromRawFd};
+    fn open_at(
+        parent: &std::fs::File,
+        name: &str,
+        directory: bool,
+    ) -> Result<std::fs::File, String> {
+        let name = std::ffi::CString::new(name).map_err(|_| "retained name invalid")?;
+        let flags = libc::O_RDONLY
+            | libc::O_NOFOLLOW
+            | libc::O_CLOEXEC
+            | libc::O_NONBLOCK
+            | if directory { libc::O_DIRECTORY } else { 0 };
+        let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err("retained relative acquisition failed".into());
+        }
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let metadata = file.metadata().map_err(|_| "retained metadata")?;
+        if metadata.uid() != unsafe { libc::geteuid() } || (directory && !metadata.is_dir()) {
+            return Err("retained owner invalid".into());
+        }
+        Ok(file)
+    }
+    fn names(parent: &std::fs::File) -> Result<Vec<String>, String> {
+        let fd = unsafe { libc::dup(parent.as_raw_fd()) };
+        if fd < 0 {
+            return Err("directory enumeration failed".into());
+        }
+        let directory = unsafe { libc::fdopendir(fd) };
+        if directory.is_null() {
+            unsafe {
+                libc::close(fd);
+            }
+            return Err("directory enumeration failed".into());
+        }
+        let result = (|| {
+            let mut names = Vec::new();
+            loop {
+                let entry = unsafe { libc::readdir(directory) };
+                if entry.is_null() {
+                    break;
+                }
+                let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }
+                    .to_str()
+                    .map_err(|_| "directory name invalid")?;
+                if name != "." && name != ".." {
+                    names.push(name.to_owned());
+                }
+            }
+            Ok(names)
+        })();
+        if unsafe { libc::closedir(directory) } != 0 {
+            return Err("directory close failed".into());
+        }
+        result
+    }
+    let retained_directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(&retained)
+        .map_err(|_| "retained directory unavailable")?;
+    let state_directory = open_at(&retained_directory, "state", true)?;
+    let objects_directory = open_at(&retained_directory, "objects", true)?;
+    let check_closed = || -> Result<(), String> {
+        for suffix in ["-wal", "-shm"] {
+            let name = std::ffi::CString::new(format!("magi.sqlite{suffix}"))
+                .map_err(|_| "retained name")?;
+            let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+            let result = unsafe {
+                libc::fstatat(
+                    state_directory.as_raw_fd(),
+                    name.as_ptr(),
+                    metadata.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOENT) {
+                return Err("closed retained store required".into());
+            }
+        }
+        Ok(())
+    };
+    let read_file = |parent: &std::fs::File, name: &str| -> Result<Vec<u8>, String> {
+        let mut file = open_at(parent, name, false)?;
+        let before = file.metadata().map_err(|_| "retained metadata")?;
+        if !before.is_file() || before.nlink() != 1 || before.len() > 500 * 1024 * 1024 {
+            return Err("retained file custody invalid".into());
+        }
+        let mut bytes = Vec::new();
+        file.by_ref()
+            .take(500 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "retained read")?;
+        let identity = |m: &std::fs::Metadata| {
+            (
+                m.dev(),
+                m.ino(),
+                m.len(),
+                m.mtime(),
+                m.mtime_nsec(),
+                m.ctime(),
+                m.ctime_nsec(),
+            )
+        };
+        if bytes.len() as u64 != before.len()
+            || identity(&before) != identity(&file.metadata().map_err(|_| "retained metadata")?)
+            || identity(&before)
+                != identity(
+                    &open_at(parent, name, false)?
+                        .metadata()
+                        .map_err(|_| "retained metadata")?,
+                )
+        {
+            return Err("retained file changed".into());
+        }
+        Ok(bytes)
+    };
+    let copy_file = |parent: &std::fs::File,
+                     name: &str,
+                     destination: &Path|
+     -> Result<magi_domain::Digest, String> {
+        use std::io::Write;
+        let bytes = read_file(parent, name)?;
+        let digest = magi_domain::Digest::from_bytes(&bytes);
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(destination)
+            .map_err(|_| "owned copy write")?;
+        output.write_all(&bytes).map_err(|_| "owned copy write")?;
+        Ok(digest)
+    };
+    for path in [
+        &retained,
+        &retained.join("state"),
+        &retained.join("objects"),
+    ] {
+        let m = std::fs::symlink_metadata(path).map_err(|_| "retained root unavailable")?;
+        if !m.is_dir() || m.file_type().is_symlink() || m.uid() != unsafe { libc::geteuid() } {
+            return Err("retained root custody invalid".into());
+        }
+    }
+    check_closed()?;
+    std::fs::create_dir(&copy).map_err(|_| "owned copy root")?;
+    let _copy_guard = OwnedPreparationPath {
+        path: copy.clone(),
+        keep: false,
+    };
+    std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o700))
+        .map_err(|_| "owned copy permissions")?;
+    for name in ["state", "objects"] {
+        std::fs::create_dir(copy.join(name)).map_err(|_| "owned copy directory")?;
+        std::fs::set_permissions(copy.join(name), std::fs::Permissions::from_mode(0o700))
+            .map_err(|_| "owned directory permissions")?;
+    }
+    let original_db = copy_file(
+        &state_directory,
+        "magi.sqlite",
+        &copy.join("state/magi.sqlite"),
+    )?;
+    for prefix in names(&objects_directory)? {
+        if prefix.len() != 2 || !prefix.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("object prefix invalid".into());
+        }
+        let object_directory = open_at(&objects_directory, &prefix, true)?;
+        std::fs::create_dir(copy.join("objects").join(&prefix)).map_err(|_| "owned objects")?;
+        for name in names(&object_directory)? {
+            if name.len() != 62 || !name.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err("object name invalid".into());
+            }
+            let digest = copy_file(
+                &object_directory,
+                &name,
+                &copy.join("objects").join(&prefix).join(&name),
+            )?;
+            if digest.as_str() != format!("{prefix}{name}") {
+                return Err("retained object integrity mismatch".into());
+            }
+        }
+    }
+    check_closed()?;
+    let original_after =
+        magi_domain::Digest::from_bytes(&read_file(&state_directory, "magi.sqlite")?);
+    if original_db != original_after {
+        return Err("retained database changed".into());
+    }
+    let storage =
+        magi_storage::Storage::open_or_create(&copy).map_err(|_| "owned copy migration failed")?;
+    let mut backup_guard = OwnedPreparationPath {
+        path: backup.clone(),
+        keep: false,
+    };
+    let manifest = storage
+        .create_backup(&backup)
+        .map_err(|_| "coherent backup failed")?;
+    std::fs::write(backup.join("preparation-proof.json"),serde_json::to_vec_pretty(&serde_json::json!({"sourceDatabaseDigest":original_db,"backup":manifest,"sourceWrites":0})).map_err(|_| "backup proof encoding")?).map_err(|_| "backup proof write")?;
+    std::fs::set_permissions(
+        backup.join("preparation-proof.json"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .map_err(|_| "proof permissions")?;
+    backup_guard.keep = true;
+    Ok(())
+}
+
+#[derive(Default)]
+struct SavedDeliberationUiState {
+    nonce: Mutex<Option<String>>,
+    outcome: Mutex<Option<Result<serde_json::Value, String>>>,
+}
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SavedDeliberationUiReport {
+    nonce: String,
+    receipt: Option<serde_json::Value>,
+    request: Option<serde_json::Value>,
+    failure: Option<String>,
+}
+#[tauri::command]
+fn saved_deliberation_ui_report(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, SavedDeliberationUiState>,
+    input: SavedDeliberationUiReport,
+) -> Result<(), String> {
+    if window.label() != "main"
+        || state.nonce.lock().map_err(|_| "UI nonce lock")?.as_deref() != Some(input.nonce.as_str())
+    {
+        return Err("UI report fenced".into());
+    }
+    let mut outcome = state.outcome.lock().map_err(|_| "UI outcome lock")?;
+    if outcome.is_some() {
+        return Err("UI report duplicate".into());
+    }
+    *outcome = Some(if let Some(failure) = input.failure {
+        let category = match failure.as_str() {
+            "physical_ui_bridge_ready"
+            | "physical_ui_document_ready"
+            | "physical_ui_new_deliberation"
+            | "physical_ui_question_writable"
+            | "physical_ui_sources_view"
+            | "physical_ui_native_picker"
+            | "physical_ui_capture_complete"
+            | "physical_ui_input_review"
+            | "physical_ui_consent_ready"
+            | "physical_ui_start_ready"
+            | "physical_ui_start_receipt" => failure.as_str(),
+            _ => "unknown_ui_action",
+        };
+        Err(format!("actual UI action failed: {category}"))
+    } else {
+        Ok(
+            serde_json::json!({"receipt":input.receipt.ok_or("UI receipt missing")?,"request":input.request.ok_or("UI request missing")?}),
+        )
+    });
+    Ok(())
+}
+
 fn prepare_saved_profile_run_store() -> Result<(), String> {
     let source = PathBuf::from(
         std::env::var_os("MAGI_TEST_SAVED_PROFILE_SOURCE_ROOT")
@@ -1685,7 +1981,16 @@ fn prepare_saved_profile_run_store_at(
     Ok(())
 }
 
-fn main() {
+pub(crate) fn run() {
+    if std::env::args().nth(1).as_deref() == Some("--prepare-retained-saved-profile-backup") {
+        assert_eq!(
+            std::env::args().count(),
+            2,
+            "closed backup preparation arguments required"
+        );
+        prepare_retained_saved_profile_backup().expect("retained backup preparation failed");
+        return;
+    }
     if std::env::args().nth(1).as_deref() == Some("--prepare-saved-profile-run-store") {
         assert_eq!(
             std::env::args().count(),
@@ -1835,7 +2140,7 @@ fn main() {
         );
     }
     let root = root.canonicalize().expect("canonical disposable data root");
-    let mut context = tauri::generate_context!();
+    let mut context = crate::desktop::product_context();
     if purpose == ProbePurpose::RecoveryCancel {
         assert!(
             std::env::var_os("MAGI_TEST_FRONTEND_MODE").is_none(),
@@ -1887,67 +2192,30 @@ fn main() {
     });
     let setup_monitor = monitor.clone();
     let app = tauri::Builder::default()
+        .plugin(
+            tauri_plugin_updater::Builder::new()
+                .pubkey(crate::release::updater_public_key())
+                .build(),
+        )
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![
+        .on_page_load(|webview, payload| {
+            if webview.label() == "main" {
+                let url = payload.url();
+                let owned_debug_origin = url.scheme() == "http"
+                    && url.host_str() == Some("127.0.0.1")
+                    && url.port_or_known_default() == Some(1427);
+                eprintln!(
+                    "native main page load: event={:?}; owned_debug_origin={owned_debug_origin}",
+                    payload.event()
+                );
+            }
+        })
+        .invoke_handler(crate::desktop::product_invoke_handler!(
+            get_console_snapshot,
             pdf_ui_probe_report,
             connections_ui_probe_report,
-            crate::pdf_capture::prepare_pdf_range_capture,
-            crate::pdf_capture::apply_pdf_range_capture,
-            crate::pdf_capture::discard_pdf_range_capture,
-            get_console_snapshot,
-            crate::commands::load_run_dossier,
-            crate::commands::select_context_files,
-            crate::commands::select_context_directory,
-            crate::preferences::get_console_preferences,
-            crate::preferences::save_console_preferences,
-            crate::commands::shell_context,
-            crate::commands::shell_open_console,
-            crate::commands::shell_open_settings,
-            crate::commands::shell_close_companion,
-            crate::commands::shell_request_exit,
-            crate::commands::shell_confirm_exit,
-            crate::profiles::list_recent_runs,
-            crate::profiles::list_acp_adapters,
-            crate::profiles::list_provider_profiles,
-            crate::profiles::list_provider_source_scopes,
-            crate::profiles::pick_provider_source_directory,
-            crate::profiles::add_provider_source_scope,
-            crate::profiles::revoke_provider_source_scope,
-            crate::profiles::load_active_provider_profile_selection,
-            crate::profiles::save_provider_profile,
-            crate::profiles::set_active_provider_profile,
-            crate::profiles::validate_provider_profile,
-            crate::profiles::authenticate_provider_profile,
-            crate::profiles::cancel_provider_authentication,
-            crate::profiles::refresh_provider_model_catalog,
-            crate::profiles::load_provider_catalog,
-            crate::profiles::refresh_provider_catalog,
-            crate::profiles::select_provider_model,
-            crate::profiles::load_core_model_selections,
-            crate::profiles::load_core_execution_witnesses,
-            crate::profiles::select_core_model,
-            crate::profiles::register_deliberation_request,
-            crate::profiles::register_clarification_request,
-            crate::profiles::start_clarification,
-            crate::profiles::cancel_clarification_request,
-            crate::profiles::start_deliberation,
-            crate::profiles::load_run_clarification,
-            crate::commands::create_clarification_draft,
-            crate::commands::load_clarification_draft,
-            crate::commands::list_clarification_drafts,
-            crate::commands::save_clarification_question,
-            crate::commands::discard_clarification_draft,
-            crate::profiles::start_live_run,
-            crate::profiles::get_live_run_snapshot,
-            crate::profiles::cancel_live_run,
-            crate::profiles::cancel_deliberation,
-            crate::profiles::cancel_deliberation_request,
-            crate::profiles::list_role_presets,
-            crate::profiles::load_active_role_preset_selection,
-            crate::profiles::set_active_role_preset,
-            crate::profiles::clone_role_preset,
-            crate::profiles::save_role_preset
-        ])
+            saved_deliberation_ui_report,
+        ))
         .setup(move |app| {
             setup_monitor.mark("setup");
             app.manage(saved_input.clone());
@@ -1963,6 +2231,7 @@ fn main() {
                 },
             );
             app.manage(PdfUiProbeState::default());
+            app.manage(SavedDeliberationUiState::default());
             app.manage(ConnectionsUiState {
                 enabled: purpose == ProbePurpose::ConnectionsUi,
                 ..ConnectionsUiState::default()
@@ -2356,14 +2625,15 @@ async fn probe(
         .path()
         .resource_dir()
         .map_err(|_| "source capture resources")?;
+    let capture_digest = expected_source_digest.clone();
     let captured = tauri::async_runtime::spawn_blocking(move || {
         let _capture_lease = capture_lease;
         let _capture_operation = capture_operation;
         _capture_operation
             .check()
             .map_err(|_| "source capture resources frozen".to_owned())?;
-        let approved_source = verified_policy_resource(&resource_root, &expected_source_digest)
-            .map_err(str::to_owned)?;
+        let approved_source =
+            verified_policy_resource(&resource_root, &capture_digest).map_err(str::to_owned)?;
         commands::capture_context_files(
             capture_storage,
             capture_draft,
@@ -2414,46 +2684,111 @@ async fn probe(
     )
     .map_err(|_| "source capture evidence")?;
     let question = "Using only the explicitly captured product security contract, produce the confirmation checklist for this desktop product before a saved subscription profile sends an approved source representation to its selected external provider. Identify the fields that must be disclosed and the changes that require reconfirmation. The captured contract already defines the decision scope: do not request additional user data, do not infer facts outside the source, and record unknown provider retention, training, deletion, or cancellation behavior as a non-essential limitation of the policy. Return a complete policy decision grounded in the approved source so the review can proceed to cross-review, synthesis, and private ballots.";
-    let mut request = serde_json::json!({"commandId":command_id,"idempotencyKey":command_id,"question":question,"contextDraftId":draft_id,"contextRevision":context_revision,"coreBindings":core_bindings,"rolePresetId":role.preset_id,"roleRevision":role.revision,"disclosureConfirmed":true});
-    monitor.ensure_running()?;
-    *monitor.active_request.lock().map_err(|_| "request reference lock")? = Some(serde_json::from_value(serde_json::json!({"request":request,"commandId":uuid::Uuid::new_v4().to_string(),"idempotencyKey":uuid::Uuid::new_v4().to_string()})).map_err(|_| "cancellation intent encoding")?);
-    let registration = profiles::register_deliberation_request_inner(
-        window.clone(),
-        app.clone(),
-        app.state(),
-        serde_json::from_value(request.clone()).map_err(|_| "registration request encoding")?,
-        Some(&monitor.lifecycle),
-    )
-    .await
-    .map_err(|_| "request registration")?;
-    monitor.ensure_running()?;
-    let registration = serde_json::to_value(registration).map_err(|_| "registration output")?;
-    if registration["kind"] != "registered" {
-        return Err("fresh probe request unexpectedly replayed".into());
+    let physical = std::env::var("MAGI_TEST_ACTUAL_DOM_START").ok().as_deref() == Some("1");
+    if physical && purpose != ProbePurpose::SavedProfileDeliberation {
+        return Err("physical start requires saved-profile purpose".into());
     }
-    let authority = &registration["admissionAuthority"];
-    request["admissionAuthority"] =
-        serde_json::json!({"token":authority["token"],"processEpoch":authority["processEpoch"]});
-    let input =
-        serde_json::from_value(request.clone()).map_err(|_| "deliberation input encoding")?;
-    request
-        .as_object_mut()
-        .ok_or("request object")?
-        .remove("admissionAuthority");
-    if let Some(reference) = monitor
-        .active_request
-        .lock()
-        .map_err(|_| "request reference lock")?
-        .as_mut()
-    {
-        reference.admission_authority = Some(serde_json::from_value(serde_json::json!({"token":authority["token"],"processEpoch":authority["processEpoch"]})).map_err(|_| "cancellation authority encoding")?);
-    }
-    monitor.ensure_running()?;
-    monitor.mark_verified(app, "admitting", &root);
-    let receipt = profiles::start_deliberation(window.clone(), app.clone(), app.state(), input)
+    let receipt = if physical {
+        commands::focus_main_window(app).map_err(|_| "physical console restoration failed")?;
+        if !window
+            .is_visible()
+            .map_err(|_| "physical console visibility unavailable")?
+        {
+            return Err("physical console is not visible".into());
+        }
+        let state = app.state::<SavedDeliberationUiState>();
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        *state.nonce.lock().map_err(|_| "UI nonce lock")? = Some(nonce.clone());
+        let config = serde_json::to_string(&serde_json::json!({"nonce":nonce,"question":question}))
+            .map_err(|_| "UI config encoding")?;
+        window
+            .eval(format!(
+                "window.__MAGI_SAVED_UI_CONFIG={config};\n{}",
+                include_str!("../native/saved-deliberation-ui-probe.js")
+            ))
+            .map_err(|_| "UI script")?;
+        monitor.mark("physical_ui_confirmation");
+        let deadline = Instant::now() + Duration::from_secs(300);
+        let observed = loop {
+            monitor.ensure_running()?;
+            if let Some(outcome) = state.outcome.lock().map_err(|_| "UI outcome lock")?.take() {
+                break outcome?;
+            }
+            if Instant::now() >= deadline {
+                return Err("actual UI start deadline".into());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        *state.nonce.lock().map_err(|_| "UI nonce lock")? = None;
+        let request = observed["request"].clone();
+        if request["question"] != question
+            || request["coreBindings"]
+                != serde_json::to_value(&core_bindings).map_err(|_| "UI binding encoding")?
+            || request["disclosureConfirmed"] != true
+        {
+            return Err("actual UI admitted input differs from reviewed saved selections".into());
+        }
+        let actual_draft = storage
+            .load_context_draft(
+                request["contextDraftId"]
+                    .as_str()
+                    .ok_or("UI capture identity missing")?,
+            )
+            .map_err(|_| "UI capture reload")?
+            .ok_or("UI capture missing")?;
+        if Some(actual_draft.revision) != request["contextRevision"].as_u64()
+            || actual_draft.manifest.content.sources.len() != 1
+            || actual_draft.manifest.content.sources[0]
+                .object_digest
+                .as_ref()
+                .map(magi_domain::Digest::as_str)
+                != Some(expected_source_digest.as_str())
+        {
+            return Err("actual UI source differs from approved policy".into());
+        }
+        *monitor.active_request.lock().map_err(|_|"request reference lock")?=Some(serde_json::from_value(serde_json::json!({"request":request,"commandId":uuid::Uuid::new_v4().to_string(),"idempotencyKey":uuid::Uuid::new_v4().to_string()})).map_err(|_|"UI cancellation intent")?);
+        observed["receipt"].clone()
+    } else {
+        let mut request = serde_json::json!({"commandId":command_id,"idempotencyKey":command_id,"question":question,"contextDraftId":draft_id,"contextRevision":context_revision,"coreBindings":core_bindings,"rolePresetId":role.preset_id,"roleRevision":role.revision,"disclosureConfirmed":true});
+        monitor.ensure_running()?;
+        *monitor.active_request.lock().map_err(|_| "request reference lock")? = Some(serde_json::from_value(serde_json::json!({"request":request,"commandId":uuid::Uuid::new_v4().to_string(),"idempotencyKey":uuid::Uuid::new_v4().to_string()})).map_err(|_| "cancellation intent encoding")?);
+        let registration = profiles::register_deliberation_request_inner(
+            window.clone(),
+            app.clone(),
+            app.state(),
+            serde_json::from_value(request.clone()).map_err(|_| "registration request encoding")?,
+            Some(&monitor.lifecycle),
+        )
         .await
-        .map_err(|e| format!("admission: {e:?}"))?;
-    let receipt = serde_json::to_value(receipt).map_err(|_| "admission receipt")?;
+        .map_err(|_| "request registration")?;
+        monitor.ensure_running()?;
+        let registration = serde_json::to_value(registration).map_err(|_| "registration output")?;
+        if registration["kind"] != "registered" {
+            return Err("fresh probe request unexpectedly replayed".into());
+        }
+        let authority = &registration["admissionAuthority"];
+        request["admissionAuthority"] = serde_json::json!({"token":authority["token"],"processEpoch":authority["processEpoch"]});
+        let input =
+            serde_json::from_value(request.clone()).map_err(|_| "deliberation input encoding")?;
+        request
+            .as_object_mut()
+            .ok_or("request object")?
+            .remove("admissionAuthority");
+        if let Some(reference) = monitor
+            .active_request
+            .lock()
+            .map_err(|_| "request reference lock")?
+            .as_mut()
+        {
+            reference.admission_authority = Some(serde_json::from_value(serde_json::json!({"token":authority["token"],"processEpoch":authority["processEpoch"]})).map_err(|_| "cancellation authority encoding")?);
+        }
+        monitor.ensure_running()?;
+        monitor.mark_verified(app, "admitting", &root);
+        let receipt = profiles::start_deliberation(window.clone(), app.clone(), app.state(), input)
+            .await
+            .map_err(|e| format!("admission: {e:?}"))?;
+        serde_json::to_value(receipt).map_err(|_| "admission receipt")?
+    };
     let run_id = receipt["runId"].as_str().ok_or("run id missing")?;
     std::fs::write(root.join("admission.json"), serde_json::to_vec_pretty(&serde_json::json!({"runId":run_id,"observedSelections":observed_selections,"coreBindings":core_bindings})).map_err(|_| "admission evidence encoding")?).map_err(|_| "admission evidence output")?;
     eprintln!("native live probe: production deliberation admitted; run {run_id}");
@@ -4191,6 +4526,38 @@ mod saved_activation_tests {
             bindings,
         };
         (storage, input)
+    }
+
+    #[test]
+    fn retained_backup_copies_coherently_without_mutating_original() {
+        let root = std::env::temp_dir().join(format!(
+            "magi-retained-backup-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let _owned = OwnedPreparationPath {
+            path: root.clone(),
+            keep: false,
+        };
+        let retained = root.join("retained");
+        let (storage, _input) = saved_profile_fixture(&retained);
+        drop(storage);
+        let before = std::fs::read(retained.join("state/magi.sqlite")).unwrap();
+        let copy = root.join("copy");
+        let backup = root.join("backup");
+        prepare_retained_saved_profile_backup_at(retained.clone(), copy.clone(), backup.clone())
+            .unwrap();
+        assert!(!copy.exists());
+        assert_eq!(
+            std::fs::read(retained.join("state/magi.sqlite")).unwrap(),
+            before
+        );
+        let manifest: magi_storage::BackupManifest =
+            serde_json::from_slice(&std::fs::read(backup.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest.schema_version, 18);
+        let restored = Storage::restore_backup(&backup, &root.join("verified-restored")).unwrap();
+        assert_eq!(restored.store_id, manifest.store_id);
+        assert!(prepare_retained_saved_profile_backup_at(retained, copy, backup).is_err());
     }
 
     #[test]

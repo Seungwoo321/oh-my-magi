@@ -165,6 +165,7 @@ const ADMISSION_REQUEST_DEADLINE: Duration = Duration::from_secs(300);
 pub(crate) struct NativeResourceCoordinator {
     state: Arc<Mutex<NativeResourceState>>,
     closed: Arc<AtomicBool>,
+    maintenance: Arc<AtomicBool>,
 }
 #[derive(Default)]
 struct NativeResourceState {
@@ -206,7 +207,10 @@ impl NativeResourceOperation {
             .state
             .lock()
             .map_err(|_| magi_provider::ProviderError::Cancelled)?;
-        if state.frozen || state.epoch != self.epoch {
+        if state.frozen
+            || self.coordinator.maintenance.load(Ordering::Acquire)
+            || state.epoch != self.epoch
+        {
             return Err(magi_provider::ProviderError::Cancelled);
         }
         Ok(effect(&NativeResourceAdmission {
@@ -219,7 +223,10 @@ impl NativeResourceOperation {
             .state
             .lock()
             .map_err(|_| magi_provider::ProviderError::Cancelled)?;
-        if state.frozen || state.epoch != self.epoch {
+        if state.frozen
+            || self.coordinator.maintenance.load(Ordering::Acquire)
+            || state.epoch != self.epoch
+        {
             Err(magi_provider::ProviderError::Cancelled)
         } else {
             Ok(())
@@ -245,6 +252,7 @@ impl NativeResourceCoordinator {
                 ..NativeResourceState::default()
             })),
             closed: Arc::new(AtomicBool::new(true)),
+            maintenance: Arc::new(AtomicBool::new(false)),
         }
     }
     fn cold_permission(&self) -> Result<NativeResourceQuiescence, magi_provider::ProviderError> {
@@ -309,6 +317,9 @@ impl NativeResourceCoordinator {
     pub(crate) fn preflight_operation(
         &self,
     ) -> Result<NativeResourceOperation, magi_provider::ProviderError> {
+        if self.maintenance.load(Ordering::Acquire) {
+            return Err(magi_provider::ProviderError::Cancelled);
+        }
         if self.check_open().is_ok() {
             return self.enter(None);
         }
@@ -316,7 +327,8 @@ impl NativeResourceCoordinator {
             .state
             .lock()
             .map_err(|_| magi_provider::ProviderError::Cancelled)?;
-        if !state.cold_initialization
+        if self.maintenance.load(Ordering::Acquire)
+            || !state.cold_initialization
             || !state.frozen
             || state.epoch != 1
             || !state.roots.is_empty()
@@ -406,7 +418,7 @@ impl NativeResourceCoordinator {
         Ok(())
     }
     pub(crate) fn check_open(&self) -> Result<(), magi_provider::ProviderError> {
-        if self.closed.load(Ordering::Acquire) {
+        if self.closed.load(Ordering::Acquire) || self.maintenance.load(Ordering::Acquire) {
             Err(magi_provider::ProviderError::Cancelled)
         } else {
             Ok(())
@@ -420,7 +432,7 @@ impl NativeResourceCoordinator {
             .state
             .lock()
             .map_err(|_| magi_provider::ProviderError::Cancelled)?;
-        if state.frozen {
+        if state.frozen || self.maintenance.load(Ordering::Acquire) {
             return Err(magi_provider::ProviderError::Cancelled);
         }
         state
@@ -584,6 +596,24 @@ impl NativeResourceQuiescence {
     }
 }
 
+struct StartupStorePermission {
+    quiescence: NativeResourceQuiescence,
+    previous: magi_storage::AdmissionExecutionAuthority,
+}
+impl magi_storage::AdmissionActivationPermission for StartupStorePermission {
+    fn validate(
+        &self,
+        previous: &magi_storage::AdmissionExecutionAuthority,
+    ) -> Result<(), StorageError> {
+        if previous != &self.previous {
+            return Err(StorageError::DispatchFenced);
+        }
+        self.quiescence
+            .validate()
+            .map_err(|_| StorageError::DispatchFenced)
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct NativeExecutionAuthority {
     pub(crate) storage: Arc<Storage>,
@@ -618,6 +648,7 @@ pub(crate) struct AdmissionRequestAuthority {
     pub(crate) verification: VerificationRequest,
     pub(crate) state: Arc<Mutex<AdmissionRequestState>>,
     pub(crate) binding: magi_storage::AdmissionRequestBinding,
+    pub(crate) common_context_budget: Option<magi_domain::CommonContextBudgetPolicy>,
     expires: Instant,
     expires_at: String,
     operations: Arc<AtomicUsize>,
@@ -854,13 +885,19 @@ impl AdmissionRequestRegistry {
         binding: magi_storage::AdmissionRequestBinding,
         lifecycle: Option<&AdmissionRequestLifecycle>,
         storage: Arc<Storage>,
+        common_context_budget: magi_domain::CommonContextBudgetPolicy,
     ) -> Result<IssuedAdmissionAuthorityDto, magi_provider::ProviderError> {
         if !Arc::ptr_eq(&self.resources.state, &admission.coordinator.state)
             || admission.coordinator.closed.load(Ordering::Acquire)
         {
             return Err(magi_provider::ProviderError::Cancelled);
         }
-        self.issue_from_lifecycle_inner(binding, lifecycle, Some(storage))
+        self.issue_from_lifecycle_inner(
+            binding,
+            lifecycle,
+            Some(storage),
+            Some(common_context_budget),
+        )
     }
     #[cfg(test)]
     pub(crate) fn issue(
@@ -896,7 +933,7 @@ impl AdmissionRequestRegistry {
         if boundary.frozen || boundary.epoch != operation.epoch {
             return Err(magi_provider::ProviderError::Cancelled);
         }
-        let result = self.issue_from_lifecycle_inner(binding, lifecycle, execution_storage);
+        let result = self.issue_from_lifecycle_inner(binding, lifecycle, execution_storage, None);
         drop(boundary);
         result
     }
@@ -905,7 +942,13 @@ impl AdmissionRequestRegistry {
         binding: magi_storage::AdmissionRequestBinding,
         lifecycle: Option<&AdmissionRequestLifecycle>,
         execution_storage: Option<Arc<Storage>>,
+        common_context_budget: Option<magi_domain::CommonContextBudgetPolicy>,
     ) -> Result<IssuedAdmissionAuthorityDto, magi_provider::ProviderError> {
+        if let Some(policy) = &common_context_budget {
+            policy
+                .validate()
+                .map_err(|_| magi_provider::ProviderError::InvalidLaunch)?;
+        }
         let mut requests = self
             .requests
             .lock()
@@ -915,6 +958,9 @@ impl AdmissionRequestRegistry {
             .iter()
             .find(|(_, request)| request.binding == binding && request.check().is_ok())
         {
+            if request.common_context_budget != common_context_budget {
+                return Err(magi_provider::ProviderError::InvalidLaunch);
+            }
             if let Some(lifecycle) = lifecycle {
                 lifecycle.check()?;
                 if !Arc::ptr_eq(&request.state, &lifecycle.state) {
@@ -962,6 +1008,7 @@ impl AdmissionRequestRegistry {
                 verification: lifecycle.verification.clone(),
                 state: lifecycle.state.clone(),
                 binding,
+                common_context_budget,
                 expires,
                 expires_at: expires_at.clone(),
                 operations: lifecycle.operations.clone(),
@@ -1089,6 +1136,7 @@ pub(crate) struct LiveRunControl {
     pub(crate) admission_request: Mutex<Option<Arc<AdmissionRequestAuthority>>>,
     effect_root: VerificationRequest,
     execution: Mutex<Option<NativeExecutionAuthority>>,
+    provider_deadline: Mutex<Option<(Uuid, Instant)>>,
 }
 
 #[derive(Default)]
@@ -1122,6 +1170,7 @@ impl LiveRunControlRegistry {
                     active_session: Mutex::new(ActiveRunSession::default()),
                     admission_request: Mutex::new(None),
                     execution: Mutex::new(None),
+                    provider_deadline: Mutex::new(None),
                     effect_root: VerificationRequest::until(
                         Instant::now() + Duration::from_secs(60),
                     ),
@@ -1172,7 +1221,51 @@ impl LiveRunControlRegistry {
     }
 }
 
+pub(crate) struct ProviderDeadlineGuard {
+    control: Arc<LiveRunControl>,
+    token: Uuid,
+}
+
+impl Drop for ProviderDeadlineGuard {
+    fn drop(&mut self) {
+        let mut deadline = self
+            .control
+            .provider_deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if deadline
+            .as_ref()
+            .is_some_and(|(token, _)| *token == self.token)
+        {
+            *deadline = None;
+        }
+    }
+}
+
 impl LiveRunControl {
+    pub(crate) fn set_provider_deadline(
+        self: &Arc<Self>,
+        deadline: Instant,
+    ) -> Result<ProviderDeadlineGuard, magi_provider::ProviderError> {
+        self.check_effect_authority()?;
+        let now = Instant::now();
+        if deadline <= now || deadline.duration_since(now) > Duration::from_secs(600) {
+            return Err(magi_provider::ProviderError::Cancelled);
+        }
+        let mut current = self
+            .provider_deadline
+            .lock()
+            .map_err(|_| magi_provider::ProviderError::Cancelled)?;
+        if current.is_some() {
+            return Err(magi_provider::ProviderError::Cancelled);
+        }
+        let token = Uuid::new_v4();
+        *current = Some((token, deadline));
+        Ok(ProviderDeadlineGuard {
+            control: self.clone(),
+            token,
+        })
+    }
     pub(crate) fn bind_execution(
         &self,
         capture: NativeExecutionAuthority,
@@ -1222,10 +1315,19 @@ impl LiveRunControl {
             self.effect_root
                 .with_deadline(Instant::now() + Duration::from_secs(60))
         };
+        let deadline = *self
+            .provider_deadline
+            .lock()
+            .map_err(|_| magi_provider::ProviderError::Cancelled)?;
+        let request = match deadline {
+            Some((_, deadline)) => request.with_deadline(deadline),
+            None => request,
+        };
         if self.cancellation_requested.load(Ordering::Acquire) {
             request.revoke();
             return Err(magi_provider::ProviderError::Cancelled);
         }
+        request.check()?;
         Ok(request)
     }
 
@@ -1391,6 +1493,45 @@ pub(crate) struct DesktopState {
     #[cfg(test)]
     shutdown_preparation_gate: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
     pub(crate) resource_coordinator: NativeResourceCoordinator,
+}
+
+pub(crate) fn acquire_update_admission(app: &AppHandle, storage: &Storage) -> Result<(), String> {
+    let desktop = app.state::<DesktopState>();
+    let coordinator = &desktop.resource_coordinator;
+    let mut resources = coordinator
+        .state
+        .lock()
+        .map_err(|_| "Execution admission unavailable.")?;
+    if coordinator.maintenance.load(Ordering::Acquire) || resources.operations != 0 {
+        return Err("An operation is active or maintenance is already pending.".into());
+    }
+    resources
+        .roots
+        .retain(|_, request| !request.observed_revoked_settlement());
+    if !resources.roots.is_empty() {
+        return Err("Provider cleanup must settle before maintenance.".into());
+    }
+    let authority = storage
+        .admission_execution_authority()
+        .map_err(|_| "Execution authority unavailable.")?;
+    if !storage
+        .list_live_run_ids_requiring_shutdown_with_authority(&authority)
+        .map_err(|_| "Cannot verify active deliberations.")?
+        .is_empty()
+    {
+        return Err("Finish active deliberations before maintenance.".into());
+    }
+    // Run publication holds this same mutex, preventing a start after the idle check.
+    coordinator.maintenance.store(true, Ordering::Release);
+    Ok(())
+}
+
+pub(crate) fn release_update_admission(app: &AppHandle) {
+    let desktop = app.state::<DesktopState>();
+    let coordinator = &desktop.resource_coordinator;
+    if let Ok(_resources) = coordinator.state.lock() {
+        coordinator.maintenance.store(false, Ordering::Release);
+    }
 }
 
 impl DesktopState {
@@ -1814,27 +1955,7 @@ impl DesktopState {
             .runtime_verification
             .get()
             .ok_or(magi_provider::ProviderError::ArtifactVerification)?;
-        loop {
-            match tokio::time::timeout_at(
-                tokio::time::Instant::from_std(deadline),
-                service.close_custody(),
-            )
-            .await
-            {
-                Ok(Ok(())) => break,
-                Ok(Err(magi_provider::ProviderError::ArtifactVerification))
-                    if Instant::now() < deadline =>
-                {
-                    tokio::time::sleep(
-                        Duration::from_millis(5)
-                            .min(deadline.saturating_duration_since(Instant::now())),
-                    )
-                    .await;
-                }
-                Ok(Err(error)) => return Err(error),
-                Err(_) => return Err(magi_provider::ProviderError::Timeout),
-            }
-        }
+        close_custody_until(deadline, || service.close_custody()).await?;
         permission.check_settlement()?;
         permission.extraction = Some(
             extraction_helper::retired_authority()
@@ -1864,16 +1985,47 @@ impl DesktopState {
 
     pub(crate) fn open_quiet(app: &AppHandle) -> Self {
         let (storage, storage_diagnostic) = match app.path().app_data_dir() {
-            Ok(data_root) => match Storage::open_or_create(data_root) {
-                Ok(storage) => (Some(Arc::new(storage)), None),
-                Err(error) => (None, Some(StorageUnavailableDiagnostic::from_error(&error))),
-            },
+            Ok(data_root) => {
+                let startup_resources = NativeResourceCoordinator::cold_start();
+                match crate::store_selection::open_selected_storage(app, &data_root, |previous| {
+                    let quiescence = startup_resources
+                        .cold_permission()
+                        .map_err(|_| StorageError::DispatchFenced)?;
+                    quiescence
+                        .validate()
+                        .map_err(|_| StorageError::DispatchFenced)?;
+                    Ok(StartupStorePermission {
+                        quiescence,
+                        previous: previous.clone(),
+                    })
+                }) {
+                    Ok(storage) => (Some(Arc::new(storage)), None),
+                    Err(crate::store_selection::OpenSelectedStoreError::Storage(error)) => {
+                        (None, Some(StorageUnavailableDiagnostic::from_error(&error)))
+                    }
+                    Err(crate::store_selection::OpenSelectedStoreError::Selection(_)) => (
+                        None,
+                        Some(StorageUnavailableDiagnostic {
+                            code: "selected_store_open_failed",
+                            message: "선택한 저장소의 권한 또는 무결성 확인에 실패했습니다.",
+                            action: "저장소를 변경하거나 삭제하지 말고 선택 및 복원 상태를 확인하십시오.",
+                        }),
+                    ),
+                }
+            }
             Err(_) => (
                 None,
                 Some(StorageUnavailableDiagnostic::app_data_unavailable()),
             ),
         };
-        Self::from_storage_parts(storage, storage_diagnostic)
+        let state = Self::from_storage_parts(storage, storage_diagnostic);
+        if crate::release::installation_requires_maintenance(app) {
+            state
+                .resource_coordinator
+                .maintenance
+                .store(true, Ordering::Release);
+        }
+        state
     }
 
     pub(crate) fn from_storage_parts(
@@ -2074,6 +2226,7 @@ struct CapturedSourceSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     digest: Option<String>,
     issue_codes: Vec<String>,
+    included_locators: Vec<magi_context::EvidenceLocator>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2873,6 +3026,7 @@ pub(crate) fn context_summary(
                     .object_digest
                     .map(|digest| digest.as_str().to_owned()),
                 issue_codes,
+                included_locators: source.included_locators,
             }
         })
         .collect();
@@ -3030,9 +3184,99 @@ pub(crate) fn focus_main_window(app: &AppHandle) -> Result<(), String> {
         .map_err(|_| "The main console window could not be focused.".to_owned())
 }
 
+async fn close_custody_until<F, Fut>(
+    deadline: Instant,
+    mut close: F,
+) -> Result<(), magi_provider::ProviderError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), magi_provider::ProviderError>>,
+{
+    loop {
+        if Instant::now() >= deadline {
+            return Err(magi_provider::ProviderError::Timeout);
+        }
+        match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), close()).await {
+            Ok(Ok(())) => {
+                if Instant::now() >= deadline {
+                    return Err(magi_provider::ProviderError::Timeout);
+                }
+                return Ok(());
+            }
+            Ok(Err(magi_provider::ProviderError::ArtifactVerification)) => {
+                if Instant::now() >= deadline {
+                    return Err(magi_provider::ProviderError::Timeout);
+                }
+                tokio::time::sleep(
+                    Duration::from_millis(5)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                )
+                .await;
+            }
+            Ok(Err(error)) => return Err(error),
+            Err(_) => return Err(magi_provider::ProviderError::Timeout),
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod resource_quiescence_tests {
     use super::*;
+
+    #[test]
+    fn expired_custody_deadline_never_starts_ready_cleanup() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let attempts = std::cell::Cell::new(0);
+        let result = runtime.block_on(close_custody_until(Instant::now(), || {
+            attempts.set(attempts.get() + 1);
+            std::future::ready(Err(magi_provider::ProviderError::ArtifactVerification))
+        }));
+        assert!(matches!(result, Err(magi_provider::ProviderError::Timeout)));
+        assert_eq!(attempts.get(), 0);
+    }
+
+    #[test]
+    fn ready_busy_custody_crossing_deadline_returns_timeout() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let attempts = std::cell::Cell::new(0);
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let result = runtime.block_on(close_custody_until(deadline, || {
+            attempts.set(attempts.get() + 1);
+            while Instant::now() < deadline {
+                std::hint::spin_loop();
+            }
+            std::future::ready(Err(magi_provider::ProviderError::ArtifactVerification))
+        }));
+        assert!(matches!(result, Err(magi_provider::ProviderError::Timeout)));
+        assert_eq!(attempts.get(), 1);
+    }
+
+    #[test]
+    fn successful_ready_custody_crossing_deadline_is_not_timely_permission() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let attempts = std::cell::Cell::new(0);
+        let completed = std::cell::Cell::new(false);
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let result = runtime.block_on(close_custody_until(deadline, || {
+            attempts.set(attempts.get() + 1);
+            while Instant::now() < deadline {
+                std::hint::spin_loop();
+            }
+            completed.set(true);
+            std::future::ready(Ok(()))
+        }));
+        assert!(completed.get());
+        assert!(matches!(result, Err(magi_provider::ProviderError::Timeout)));
+        assert_eq!(attempts.get(), 1);
+        assert!(
+            runtime
+                .block_on(close_custody_until(
+                    Instant::now() + Duration::from_secs(1),
+                    || std::future::ready(Ok(()))
+                ))
+                .is_ok()
+        );
+    }
 
     struct ApplicationFixture(PathBuf);
     impl Drop for ApplicationFixture {
@@ -3043,6 +3287,14 @@ pub(crate) mod resource_quiescence_tests {
     fn application_fixture() -> (ApplicationFixture, Arc<DesktopState>, String) {
         let (root, storage, aggregate, claim) =
             crate::profiles::catalog_selection_ipc_tests::publication_fault_fixture();
+        use std::os::unix::fs::MetadataExt;
+        let original = fs::metadata(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let canonical = fs::metadata(&root).unwrap();
+        assert_eq!(
+            (original.dev(), original.ino()),
+            (canonical.dev(), canonical.ino())
+        );
         let coordinator = NativeResourceCoordinator::cold_start();
         let state = DesktopState {
             storage: Some(Arc::new(storage)),
@@ -3066,19 +3318,34 @@ pub(crate) mod resource_quiescence_tests {
         assert_eq!(aggregate.run().run_id, claim.run_id);
         (ApplicationFixture(root), Arc::new(state), claim.run_id)
     }
+    struct OwnedCaptureRoot {
+        path: PathBuf,
+        device: u64,
+        inode: u64,
+    }
+    impl OwnedCaptureRoot {
+        fn matches_identity(&self) -> bool {
+            use std::os::unix::fs::MetadataExt;
+            fs::symlink_metadata(&self.path).is_ok_and(|metadata| {
+                metadata.is_dir()
+                    && !metadata.file_type().is_symlink()
+                    && (metadata.dev(), metadata.ino()) == (self.device, self.inode)
+            })
+        }
+    }
     pub(crate) struct SignedInstallationFixture {
         state: Arc<DesktopState>,
         fixture: Option<ApplicationFixture>,
+        app_identity: (u64, u64),
+        run_id: String,
+        capture_roots: Vec<OwnedCaptureRoot>,
+        retention_reason: &'static str,
         pub(crate) publication: PathBuf,
     }
     impl SignedInstallationFixture {
-        pub(crate) fn open() -> Self {
+        fn owned(publication: PathBuf) -> Self {
             use std::os::unix::fs::MetadataExt;
-            let publication = PathBuf::from(
-                std::env::var_os("MAGI_TEST_NATIVE_SIGNED_PUBLICATION")
-                    .expect("explicit owned signed installation"),
-            );
-            let (mut fixture, state, _) = application_fixture();
+            let (mut fixture, state, run_id) = application_fixture();
             let original = fs::metadata(&fixture.0).unwrap();
             fixture.0 = fixture.0.canonicalize().unwrap();
             let canonical = fs::metadata(&fixture.0).unwrap();
@@ -3086,44 +3353,172 @@ pub(crate) mod resource_quiescence_tests {
                 (original.dev(), original.ino()),
                 (canonical.dev(), canonical.ino())
             );
-            application_runtime()
-                .block_on(state.ensure_installed_resources(
-                    publication.clone(),
-                    fixture.0.clone(),
-                    publication.join("provider/codex-acp/darwin-arm64/codex-acp"),
-                    VerificationRequest::until(Instant::now() + Duration::from_secs(60)),
-                ))
-                .unwrap();
             Self {
                 state,
                 fixture: Some(fixture),
+                app_identity: (canonical.dev(), canonical.ino()),
+                run_id,
+                capture_roots: vec![],
+                retention_reason: "resource_consumers_unsettled",
                 publication,
             }
+        }
+        pub(crate) fn open() -> Self {
+            let publication = PathBuf::from(
+                std::env::var_os("MAGI_TEST_NATIVE_SIGNED_PUBLICATION")
+                    .expect("explicit owned signed installation"),
+            );
+            let installation = Self::owned(publication);
+            application_runtime()
+                .block_on(
+                    installation.state.ensure_installed_resources(
+                        installation.publication.clone(),
+                        installation.fixture.as_ref().unwrap().0.clone(),
+                        installation
+                            .publication
+                            .join("provider/codex-acp/darwin-arm64/codex-acp"),
+                        VerificationRequest::until(Instant::now() + Duration::from_secs(60)),
+                    ),
+                )
+                .unwrap();
+            installation
+        }
+        pub(crate) fn create_capture_root(&mut self, prefix: &'static str) -> PathBuf {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            assert!(matches!(prefix, "pdf-range" | "image-capture"));
+            let path = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
+            fs::create_dir(&path).unwrap();
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            self.capture_roots.push(OwnedCaptureRoot {
+                path: path.clone(),
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            });
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            path
         }
         pub(crate) fn finish(mut self) {
             self.close().expect("actual signed extraction cleanup");
         }
         fn close(&mut self) -> Result<(), magi_provider::ProviderError> {
-            if self.fixture.is_some() {
-                let permission = application_runtime().block_on(
-                    self.state
-                        .freeze_resource_consumers(Instant::now() + Duration::from_secs(30), None),
-                )?;
-                permission.validate()?;
-                self.fixture.take();
+            use std::os::unix::fs::MetadataExt;
+            if self.fixture.is_none() {
+                return Ok(());
             }
+            self.retention_reason = "resource_consumers_unsettled";
+            let permission = application_runtime().block_on(
+                self.state
+                    .freeze_resource_consumers(Instant::now() + Duration::from_secs(30), None),
+            )?;
+            permission.validate()?;
+            self.retention_reason = "fixture_state_or_storage_still_owned";
+            let state =
+                Arc::get_mut(&mut self.state).ok_or(magi_provider::ProviderError::Cancelled)?;
+            if state
+                .storage
+                .as_ref()
+                .is_some_and(|storage| Arc::strong_count(storage) != 1)
+            {
+                return Err(magi_provider::ProviderError::Cancelled);
+            }
+            drop(state.storage.take());
+            self.retention_reason = "owned_root_identity_changed";
+            let app = &self.fixture.as_ref().unwrap().0;
+            let app_metadata = fs::symlink_metadata(app)
+                .map_err(|_| magi_provider::ProviderError::ArtifactVerification)?;
+            if !app_metadata.is_dir()
+                || app_metadata.file_type().is_symlink()
+                || (app_metadata.dev(), app_metadata.ino()) != self.app_identity
+                || self
+                    .capture_roots
+                    .iter()
+                    .any(|root| !root.matches_identity())
+            {
+                return Err(magi_provider::ProviderError::ArtifactVerification);
+            }
+            self.retention_reason = "owned_root_remove_failed";
+            while let Some(root) = self.capture_roots.last() {
+                permission.validate()?;
+                fs::remove_dir_all(&root.path)
+                    .map_err(|_| magi_provider::ProviderError::ArtifactVerification)?;
+                self.capture_roots.pop();
+            }
+            permission.validate()?;
+            fs::remove_dir_all(app)
+                .map_err(|_| magi_provider::ProviderError::ArtifactVerification)?;
+            self.fixture.take();
             Ok(())
+        }
+        fn report_retained(&self, error: &magi_provider::ProviderError) {
+            let category = if matches!(error, magi_provider::ProviderError::Timeout) {
+                "timeout"
+            } else if matches!(error, magi_provider::ProviderError::Cancelled) {
+                "authority_unproved"
+            } else {
+                "cleanup_verification_failed"
+            };
+            for path in self
+                .fixture
+                .iter()
+                .map(|fixture| &fixture.0)
+                .chain(self.capture_roots.iter().map(|root| &root.path))
+            {
+                eprintln!(
+                    "Retained owned signed-capture fixture: root={} reason={} category={} consumer=signed_capture_acceptance release_condition=validated_same_epoch_resource_quiescence_and_exclusive_fixture_ownership_and_unchanged_root_identity",
+                    path.display(),
+                    self.retention_reason,
+                    category
+                );
+            }
         }
     }
     impl Drop for SignedInstallationFixture {
         fn drop(&mut self) {
-            if self.close().is_err()
-                && let Some(fixture) = self.fixture.take()
-            {
-                std::mem::forget(fixture);
+            if let Err(error) = self.close() {
+                self.report_retained(&error);
+                if let Some(fixture) = self.fixture.take() {
+                    std::mem::forget(fixture);
+                }
             }
         }
     }
+    #[test]
+    fn owned_capture_fixture_cleans_failure_only_after_actual_unused_resources_close() {
+        let mut installation = SignedInstallationFixture::owned(PathBuf::new());
+        let app = installation.fixture.as_ref().unwrap().0.clone();
+        let capture = installation.create_capture_root("pdf-range");
+        let capture_for_failure = capture.clone();
+        let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _installation = installation;
+            let _storage = Storage::open_or_create(capture_for_failure.join("store")).unwrap();
+            fs::write(
+                capture_for_failure.join("owned-document.pdf"),
+                b"owned failure fixture",
+            )
+            .unwrap();
+            panic!("injected assertion failure after owned capture setup");
+        }));
+        assert!(failure.is_err());
+        assert!(!capture.exists());
+        assert!(!app.exists());
+    }
+
+    #[test]
+    fn owned_capture_fixture_retains_roots_until_state_consumer_releases_and_proof_validates() {
+        let mut installation = SignedInstallationFixture::owned(PathBuf::new());
+        let app = installation.fixture.as_ref().unwrap().0.clone();
+        let capture = installation.create_capture_root("image-capture");
+        let state_consumer = installation.state.clone();
+        assert!(matches!(
+            installation.close(),
+            Err(magi_provider::ProviderError::Cancelled)
+        ));
+        assert!(capture.exists() && app.exists());
+        drop(state_consumer);
+        installation.finish();
+        assert!(!capture.exists() && !app.exists());
+    }
+
     fn application_runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -3317,13 +3712,15 @@ pub(crate) mod resource_quiescence_tests {
                 .expect("explicit owned signed installation"),
         );
         let executable = publication.join("provider/codex-acp/darwin-arm64/codex-acp");
-        let (_fixture, state, run_id) = application_fixture();
+        let installation = SignedInstallationFixture::owned(publication.clone());
+        let state = installation.state.clone();
+        let run_id = installation.run_id.clone();
         let runtime = application_runtime();
         let startup = VerificationRequest::until(Instant::now() + Duration::from_secs(60));
         let service = runtime
             .block_on(state.ensure_installed_resources(
                 publication.clone(),
-                _fixture.0.clone(),
+                installation.fixture.as_ref().unwrap().0.clone(),
                 executable.clone(),
                 startup.clone(),
             ))
@@ -3372,20 +3769,38 @@ pub(crate) mod resource_quiescence_tests {
         assert_eq!(prepared.permission.epoch, epoch);
         assert_eq!(prepared.pending_runs, vec![run_id.clone()]);
         let cache_held = runtime.block_on(state.freeze_resource_consumers(deadline, None));
-        assert!(cache_held.is_err());
+        assert!(
+            matches!(cache_held, Err(magi_provider::ProviderError::Timeout)),
+            "expected held-cache timeout, received {:?}",
+            cache_held.as_ref().err()
+        );
         assert_eq!(request.settlement().provider_operations, 0);
         assert!(state.resource_coordinator.enter(None).is_err());
         drop(artifact);
+        let retry_deadline = Instant::now() + Duration::from_secs(5);
         let stopped = runtime
-            .block_on(state.freeze_resource_consumers(deadline, None))
+            .block_on(state.freeze_resource_consumers(retry_deadline, None))
             .unwrap();
         assert_eq!(stopped.epoch, epoch);
         assert!(stopped.validate().is_ok());
         assert!(request.observed_revoked_settlement());
-        let namespace = magi_provider::resource_custody::ArtifactNamespace::development(
-            Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap(),
-            magi_provider::resource_custody::DevelopmentProfile::Debug,
-        )
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let namespace = if publication == workspace.join("src-tauri/target/debug") {
+            magi_provider::resource_custody::ArtifactNamespace::development(
+                workspace,
+                magi_provider::resource_custody::DevelopmentProfile::Debug,
+            )
+        } else if publication == workspace.join("src-tauri/target/release") {
+            magi_provider::resource_custody::ArtifactNamespace::development(
+                workspace,
+                magi_provider::resource_custody::DevelopmentProfile::Release,
+            )
+        } else {
+            magi_provider::resource_custody::ArtifactNamespace::installed_resources(
+                &publication,
+                &installation.fixture.as_ref().unwrap().0,
+            )
+        }
         .unwrap();
         let journal = magi_provider::resource_custody::ResourceCustody::open(namespace).unwrap();
         assert_eq!(journal.unresolved_operations().unwrap(), 0);
@@ -3398,6 +3813,10 @@ pub(crate) mod resource_quiescence_tests {
                 .status,
             magi_storage::LiveRunStatus::Cancelling
         );
+        drop(journal);
+        drop(service);
+        drop(state);
+        installation.finish();
     }
 
     fn signed_held_extraction_retry(overlap: bool) {
@@ -3530,6 +3949,7 @@ pub(crate) mod resource_quiescence_tests {
                 .unwrap(),
             0
         );
+        drop(state);
         installation.finish();
     }
 
@@ -3579,6 +3999,7 @@ pub(crate) mod resource_quiescence_tests {
                     binding.clone(),
                     None,
                     storage.clone(),
+                    magi_domain::CommonContextBudgetPolicy::new(32_000, 0).unwrap(),
                 )
             })
             .unwrap()
@@ -4051,6 +4472,7 @@ mod dossier_authentication_command_tests {
                 idempotency_key: "test".into(),
                 intent_digest: Digest::from_bytes(b"test"),
             },
+            common_context_budget: None,
             expires: Instant::now(),
             expires_at: crate::profiles::admission_expiry(),
             operations: Arc::new(AtomicUsize::new(0)),
@@ -4084,6 +4506,48 @@ mod dossier_authentication_command_tests {
                 Err(magi_provider::ProviderError::Cancelled)
             ));
         }
+    }
+
+    #[test]
+    fn provider_turn_deadline_is_absolute_bounded_and_revocation_still_fences_effects() {
+        struct TemporaryStore(std::path::PathBuf);
+        impl Drop for TemporaryStore {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = TemporaryStore(
+            std::env::temp_dir().join(format!("provider-deadline-{}", Uuid::new_v4())),
+        );
+        let storage = Arc::new(Storage::open_or_create(&root.0).unwrap());
+        let controls = LiveRunControlRegistry::default();
+        let control = controls.register("bounded-provider-turn");
+        control
+            .bind_execution(NativeExecutionAuthority::capture(storage).unwrap())
+            .unwrap();
+        assert!(control.set_provider_deadline(Instant::now()).is_err());
+        assert!(
+            control
+                .set_provider_deadline(Instant::now() + Duration::from_secs(601))
+                .is_err()
+        );
+        let deadline = Instant::now() + Duration::from_secs(599);
+        let scope = control.set_provider_deadline(deadline).unwrap();
+        let first = control.effect_request().unwrap();
+        assert_eq!(first.deadline(), deadline);
+        assert!(control.set_provider_deadline(deadline).is_err());
+        assert_eq!(control.effect_request().unwrap().deadline(), deadline);
+        drop(scope);
+        let next_deadline = Instant::now() + Duration::from_secs(300);
+        let next_scope = control.set_provider_deadline(next_deadline).unwrap();
+        let next = control.effect_request().unwrap();
+        assert_eq!(next.deadline(), next_deadline);
+        control.revoke_effects();
+        assert!(first.check().is_err());
+        assert!(next.check().is_err());
+        assert!(control.effect_request().is_err());
+        drop(next_scope);
+        assert!(control.provider_deadline.lock().unwrap().is_none());
     }
 
     #[test]

@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "endpoint": "https://github.com/Seungwoo321/oh-my-magi/releases/latest/download/release-manifest.json",
+  "allowedDownloadHosts": [
+    "github.com",
+    "release-assets.githubusercontent.com"
+  ],
+  "updaterPublicKey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ4NUE2ODgwMkRBQkRBOUQKUldTZDJxc3RnR2hhU0xmK1UydElmMXRYR2c0Z1hOQ1VjYzg3elQ3SXkrMERnU0JqU1F4WXkxbWMK",
+  "manifestPublicKeyPem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEARjv0sY4IgvGjSkCw+jp6RWPwjbt3YiOdNZWHa1w3z28=\n-----END PUBLIC KEY-----\n"
+}

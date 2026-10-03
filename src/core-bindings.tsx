@@ -1,3 +1,4 @@
+import { t } from "./lib/locale";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { executionValuesEqual, catalogHasExecutionAuthority, catalogsHaveEquivalentExecutionAuthority, loadProviderCatalog, loadCoreModelSelections, loadCoreExecutionWitnesses, type CoreExecutionWitnesses, selectProviderModel, selectCoreModel, type AcpModelBindingSnapshot, type ProviderCatalogSnapshot, type ProfileAuthenticationBinding, type AuthProfileResult, type CoreId, type CoreBindingReference, type CoreModelSelectionState, type ProviderCatalogState } from "./lib/desktop-api";
 import type { AcpProfile } from "./screens";
@@ -96,9 +97,7 @@ export function useCoreBindings(profiles: AcpProfile[], enabled: boolean) {
     const request = ++epoch.current;
     currentWitnesses.current = null;
     setWitnesses(null);
-    setCores([]);
-    setCatalogs({});
-    if (!enabled) return;
+    if (!enabled) { setCores([]); setCatalogs({}); return; }
     const capturedSignature = currentProfiles.current.map(profile => `${profile.id}:${profile.revision}`).join("|");
     const captured = currentProfiles.current.filter(profile => profile.authenticationMethod === "local_subscription");
     setCatalogProjections(Object.fromEntries(captured.map(profile => [profile.id, { revision: profile.revision, state: "pending" as const }])));
@@ -116,7 +115,10 @@ export function useCoreBindings(profiles: AcpProfile[], enabled: boolean) {
       if (request !== epoch.current || capturedSignature !== currentProfiles.current.map(profile => `${profile.id}:${profile.revision}`).join("|")) return;
       if (!Array.isArray(rows) || rows.length !== 3 || CORE_IDS.some(coreId => rows.filter(row => row.coreId === coreId).length !== 1)) throw new Error("Invalid core selection set");
       coreProjectionReady = true;
-      setCatalogs(next);
+      setCatalogs(previous => Object.fromEntries(captured.flatMap(profile => {
+        const state = next[profile.id] ?? (previous[profile.id] ? { ...previous[profile.id], selectionState: "stale" as const } : null);
+        return state ? [[profile.id, state]] : [];
+      })));
       setCores(rows);
       setCatalogProjections(Object.fromEntries(captured.map(profile => [profile.id, { revision: profile.revision, state: next[profile.id] ? "ready" as const : "error" as const }])));
       const references = CORE_IDS.map(coreId => {
@@ -133,7 +135,7 @@ export function useCoreBindings(profiles: AcpProfile[], enabled: boolean) {
       }
       setErrors(previous => ({ ...previous, ...failures, load: "" }));
     } catch {
-      if (request === epoch.current && capturedSignature === currentProfiles.current.map(profile => `${profile.id}:${profile.revision}`).join("|")) { if (!coreProjectionReady) { setCatalogs({}); setCatalogProjections(Object.fromEntries(captured.map(profile => [profile.id, { revision: profile.revision, state: "error" as const }]))); } setErrors(previous => ({ ...previous, load: "세 코어의 저장된 연결을 확인하지 못했습니다." })); }
+      if (request === epoch.current && capturedSignature === currentProfiles.current.map(profile => `${profile.id}:${profile.revision}`).join("|")) { if (!coreProjectionReady) { setCatalogs(previous => Object.fromEntries(Object.entries(previous).map(([id, state]) => [id, { ...state, selectionState: "stale" as const }]))); setCatalogProjections(Object.fromEntries(captured.map(profile => [profile.id, { revision: profile.revision, state: "error" as const }]))); } setErrors(previous => ({ ...previous, load: "세 코어의 저장된 연결을 확인하지 못했습니다." })); }
     }
   }, [enabled]);
   useEffect(() => { void reload(); return () => { epoch.current++; }; }, [reload, signature]);
@@ -157,7 +159,7 @@ export function useCoreBindings(profiles: AcpProfile[], enabled: boolean) {
       || (catalog.negotiatedModes.modes.length ? !catalog.negotiatedModes.modes.some(mode => mode.modeId === modeId) : modeId !== null || catalog.negotiatedModes.currentModeId !== null)) return;
     const request = epoch.current;
     await perform(profileId, async () => {
-      setCatalogs(previous => ({ ...previous, [profileId]: { ...state, modelSelection: null, selectionState: "stale" } }));
+      setCatalogs(previous => ({ ...previous, [profileId]: { ...state, selectionState: "stale" } }));
       const saved = await selectProviderModel({ providerProfileId: profileId, profileRevision: profile.revision, catalogSnapshotId: catalog.catalogSnapshotId, catalogDigest: catalog.catalogDigest, modelId, modeId, expectedSelectionRevision: state.modelSelectionRevision });
       const readback = await loadProviderCatalog(profileId, profile.revision);
       if (request !== epoch.current || !currentProfiles.current.some(item => item.id === profileId && item.revision === profile.revision)) return;
@@ -199,18 +201,18 @@ export function useCoreBindings(profiles: AcpProfile[], enabled: boolean) {
       && catalogsHaveEquivalentExecutionAuthority(witness.freshCatalog, state?.catalog) && bindingCurrentlyVerified(profile, model));
     const ready = Boolean(connectionReady(profile) && currentAuthority && !dirty && row?.selectionState === "selected" && saved && saved.selectionRevision === row.selectionRevision && saved.profileRevision === profile?.revision && saved.modelSelectionRevision === state?.modelSelection?.selectionRevision && savedModelReady(originalState, profile, true));
     const reference: CoreBindingReference | null = ready && saved ? { coreId, providerProfileId: saved.providerProfileId, profileRevision: saved.profileRevision, modelSelectionRevision: saved.modelSelectionRevision, coreSelectionRevision: saved.selectionRevision } : null;
-    return { coreId, profile, model: state?.modelSelection?.binding, dirty, ready, reference, connectionState: profile && connectionChecks[profile.id]?.profileRevision === profile.revision ? connectionChecks[profile.id].state : "not_checked" };
+    return { coreId, profile, model: state?.modelSelection?.binding, savedSelectionState: row?.selectionState ?? "unselected", savedModelState: state?.selectionState ?? "unselected", dirty, ready, reference, connectionState: profile && connectionChecks[profile.id]?.profileRevision === profile.revision ? connectionChecks[profile.id].state : "not_checked" };
   });
   return { catalogs, cores, drafts, busy, errors, destinations, ready: destinations.every(item => item.ready) && busy.length === 0, canStart: () => currentWitnesses.current === witnesses && destinations.every(item => item.ready && connectionReady(item.profile) && bindingCurrentlyVerified(item.profile, item.model)) && pending.current.size === 0, beginConnectionCheck, finishConnectionCheck, invalidateAuthentication, verifiedAuthentication, profileConnectionState, profileCatalogProjection, reload, saveModel, saveCore, setDraft: (coreId: CoreId, profileId: string) => setDrafts(previous => ({ ...previous, [coreId]: profileId })) };
 }
 export type CoreBindingsController = ReturnType<typeof useCoreBindings>;
 
 export function CoreBindingControls({ controller, profiles }: { controller: CoreBindingsController; profiles: AcpProfile[] }) {
-  return <><button className="button" disabled={controller.busy.length > 0} onClick={() => { void controller.reload(); }}>저장 상태 다시 확인</button>{controller.errors.load && <p role="alert">{controller.errors.load}</p>}{controller.destinations.map(destination => {
+  return <><button className="button" disabled={controller.busy.length > 0} onClick={() => { void controller.reload(); }}>{t("저장 상태 다시 확인")}</button>{controller.errors.load && <p role="alert">{t(controller.errors.load)}</p>}{controller.destinations.map(destination => {
     const { coreId } = destination;
     const draft = controller.drafts[coreId] ?? destination.profile?.id ?? "";
     const profile = profiles.find(item => item.id === draft);
     const canSave = savedModelReady(controller.catalogs[draft], profile);
-    return <div className="field" key={coreId}><label className="field-label" htmlFor={`core-${coreId}`}>{coreId}</label><p>저장된 연결 · {destination.profile && destination.model ? `${destination.profile.displayName} · ${destination.model.modelId}` : "확인 필요"}</p>{destination.connectionState !== "ready" && <p className="field-help" role="status">{destination.connectionState === "checking" ? "연결 확인 중 · 심의를 시작할 수 없습니다." : destination.connectionState === "failed" ? "연결 확인 실패 · 저장된 선택은 유지됩니다. 연결을 다시 확인하십시오." : "저장된 선택 · 현재 연결을 자동으로 확인합니다."}</p>}{destination.dirty && <p className="field-help" role="status">편집 중인 선택 · {profile?.displayName ?? "미선택"}. 코어 연결을 저장해야 심의를 시작할 수 있습니다.</p>}<select id={`core-${coreId}`} className="text-field" value={draft} disabled={controller.busy.length > 0} onChange={event => controller.setDraft(coreId, event.target.value)}><option value="">이 코어에 사용할 프로필 선택</option>{profiles.filter(item => item.authenticationMethod === "local_subscription").map(item => <option key={item.id} value={item.id}>{item.displayName}</option>)}</select><button className="button" disabled={!canSave || controller.busy.length > 0} onClick={() => { void controller.saveCore(coreId); }}>{controller.busy.length > 0 ? "저장 중…" : "코어 연결 저장"}</button>{controller.errors[coreId] && <p role="alert">{controller.errors[coreId]}</p>}</div>;
-  })}{controller.ready && new Set(controller.destinations.map(item => `${item.model?.providerId}:${item.model?.modelId}:${item.model?.modeId ?? ""}`)).size === 1 && <p className="field-help">세 코어가 같은 모델을 사용합니다. 역할이 달라도 모델의 판단 경향은 겹칠 수 있습니다.</p>}</>;
+    return <div className="field" key={coreId}><label className="field-label" htmlFor={`core-${coreId}`}>{coreId}</label><p>{t("저장된 연결 ·")}{destination.profile && destination.model ? `${destination.profile.displayName} · ${destination.model.modelId} · ${destination.model.modeId ?? "—"}` : t("확인 필요")}</p>{(destination.savedSelectionState === "stale" || destination.savedModelState === "stale") && <p className="field-help" role="status">{t("저장된 모델 선택을 다시 확인하십시오.")}</p>}{destination.connectionState !== "ready" && <p className="field-help" role="status">{destination.connectionState === "checking" ? t("연결 확인 중 · 심의를 시작할 수 없습니다.") : destination.connectionState === "failed" ? t("연결 확인 실패 · 저장된 선택은 유지됩니다. 연결을 다시 확인하십시오.") : t("저장된 선택 · 현재 연결을 자동으로 확인합니다.")}</p>}{destination.dirty && <p className="field-help" role="status">{t("편집 중인 선택 ·")}{profile?.displayName ?? t("미선택")}{t(". 코어 연결을 저장해야 심의를 시작할 수 있습니다.")}</p>}<select id={`core-${coreId}`} className="text-field" value={draft} disabled={controller.busy.length > 0} onChange={event => controller.setDraft(coreId, event.target.value)}><option value="">{t("이 코어에 사용할 프로필 선택")}</option>{profiles.filter(item => item.authenticationMethod === "local_subscription").map(item => <option key={item.id} value={item.id}>{item.displayName}</option>)}</select><button className="button" disabled={!canSave || controller.busy.length > 0} onClick={() => { void controller.saveCore(coreId); }}>{controller.busy.length > 0 ? t("저장 중…") : t("코어 연결 저장")}</button>{controller.errors[coreId] && <p role="alert">{t(controller.errors[coreId])}</p>}</div>;
+  })}{controller.ready && new Set(controller.destinations.map(item => `${item.model?.providerId}:${item.model?.modelId}:${item.model?.modeId ?? ""}`)).size === 1 && <p className="field-help">{t("세 코어가 같은 모델을 사용합니다. 역할이 달라도 모델의 판단 경향은 겹칠 수 있습니다.")}</p>}</>;
 }
