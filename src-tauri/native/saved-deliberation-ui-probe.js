@@ -43,13 +43,16 @@
     const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value").set;
     setter.call(textarea, config.question);
     textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    if (config.sourceMode !== "file" && config.sourceMode !== "question-only") throw Error("invalid source mode");
     await mark("sources_view");
     (await wait(() => button(["자료 보기", "View sources"]))).click();
-    await mark("native_picker");
-    (await wait(() => button(["파일 선택", "Select files"]))).click();
-    // The owned native picker is completed separately using the approved policy file.
-    await mark("capture_complete");
-    await wait(() => Array.from(document.querySelectorAll(".source-row-mark")).some(mark => mark.textContent.trim() === "✓"));
+    if (config.sourceMode === "file") {
+      await mark("native_picker");
+      (await wait(() => button(["파일 선택", "Select files"]))).click();
+      // The owned native picker is completed separately using the approved policy file.
+      await mark("capture_complete");
+      await wait(() => Array.from(document.querySelectorAll(".source-row-mark")).some(mark => mark.textContent.trim() === "✓"));
+    }
     await mark("input_review");
     (await wait(() => button(["입력 확인", "Review input"]))).click();
     await mark("consent_ready");

@@ -2854,96 +2854,125 @@ async fn probe(
         .ok_or("factory role missing")?;
     let command_id = uuid::Uuid::new_v4().to_string();
     monitor.ensure_running()?;
-    monitor.mark("capturing_sources");
-    let draft_id = uuid::Uuid::new_v4().to_string();
-    let capture_storage = storage.clone();
-    let capture_draft = draft_id.clone();
-    let expected_source_digest = std::env::var("MAGI_TEST_POLICY_SOURCE_DIGEST")
-        .map_err(|_| "explicit approved canonical source digest required")?;
-    if expected_source_digest.len() != 64
-        || !expected_source_digest
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit())
-    {
-        return Err("invalid approved canonical source digest".into());
-    }
-    let capture_lease = monitor
-        .lifecycle
-        .lease()
-        .map_err(|_| "source capture revoked")?;
-    let capture_operation = app
-        .state::<commands::DesktopState>()
-        .resource_coordinator
-        .enter(Some(monitor.lifecycle.verification.clone()))
-        .map_err(|_| "source capture resources frozen")?;
-    let approved_digest = expected_source_digest.clone();
-    let resource_root = app
-        .path()
-        .resource_dir()
-        .map_err(|_| "source capture resources")?;
-    let capture_digest = expected_source_digest.clone();
-    let captured = tauri::async_runtime::spawn_blocking(move || {
-        let _capture_lease = capture_lease;
-        let _capture_operation = capture_operation;
-        _capture_operation
-            .check()
-            .map_err(|_| "source capture resources frozen".to_owned())?;
-        let approved_source =
-            verified_policy_resource(&resource_root, &capture_digest).map_err(str::to_owned)?;
-        commands::capture_context_files(
-            capture_storage,
-            capture_draft,
-            None,
-            vec![approved_source],
-            &resource_root,
-        )
-    })
-    .await
-    .map_err(|_| "source capture worker")??;
-    monitor.ensure_running()?;
-    let captured = serde_json::to_value(captured).map_err(|_| "source capture summary")?;
-    if captured["sources"].as_array().map(Vec::len) != Some(1)
-        || captured["sources"][0]["status"] != "captured"
-        || captured["sources"][0]["digest"].as_str() != Some(approved_digest.as_str())
-    {
-        return Err("the approved canonical source was not fully captured".into());
-    }
-    let context_revision = captured["revision"]
-        .as_u64()
-        .ok_or("source capture revision")?;
-    let draft = storage
-        .load_context_draft(&draft_id)
-        .map_err(|_| "source capture durable read")?
-        .ok_or("source capture durable draft missing")?;
-    let source = draft
-        .manifest
-        .content
-        .sources
-        .first()
-        .ok_or("source capture durable entry missing")?;
-    if draft.revision != context_revision
-        || draft.manifest.content.sources.len() != 1
-        || source
-            .object_digest
-            .as_ref()
-            .map(magi_domain::Digest::as_str)
-            != captured["sources"][0]["digest"].as_str()
-        || source.included_locators.is_empty()
-    {
-        return Err("source capture durable authority mismatch".into());
-    }
-    let capture_evidence = serde_json::json!({"capture":captured,"canonicalSourceDigest":source.object_digest,"manifestDigest":draft.manifest.digest,"includedLocators":source.included_locators});
-    std::fs::write(
-        root.join("approved-policy-source-capture.json"),
-        serde_json::to_vec_pretty(&capture_evidence)
-            .map_err(|_| "source capture evidence encoding")?,
-    )
-    .map_err(|_| "source capture evidence")?;
-    let question = "Using only the explicitly captured product security contract, produce the confirmation checklist for this desktop product before a saved subscription profile sends an approved source representation to its selected external provider. Identify the fields that must be disclosed and the changes that require reconfirmation. The captured contract already defines the decision scope: do not request additional user data, do not infer facts outside the source, and record unknown provider retention, training, deletion, or cancellation behavior as a non-essential limitation of the policy. Return a complete policy decision grounded in the approved source so the review can proceed to cross-review, synthesis, and private ballots.";
     let physical = std::env::var("MAGI_TEST_ACTUAL_DOM_START").ok().as_deref() == Some("1");
     if physical && purpose != ProbePurpose::SavedProfileDeliberation {
         return Err("physical start requires saved-profile purpose".into());
     }
+    #[derive(serde::Serialize, PartialEq, Eq)]
+    #[serde(rename_all = "kebab-case")]
+    enum PhysicalSourceMode {
+        File,
+        QuestionOnly,
+    }
+    let source_mode = match std::env::var("MAGI_TEST_PHYSICAL_SOURCE_MODE") {
+        Err(std::env::VarError::NotPresent) => PhysicalSourceMode::File,
+        Ok(value) if value == "file" => PhysicalSourceMode::File,
+        Ok(value) if value == "question-only" && physical => PhysicalSourceMode::QuestionOnly,
+        _ => return Err("invalid explicit physical source mode".into()),
+    };
+    let (draft_id, context_revision, expected_source_digest) = if source_mode
+        == PhysicalSourceMode::File
+    {
+        monitor.mark("capturing_sources");
+        let draft_id = uuid::Uuid::new_v4().to_string();
+        let capture_storage = storage.clone();
+        let capture_draft = draft_id.clone();
+        let expected_source_digest = std::env::var("MAGI_TEST_POLICY_SOURCE_DIGEST")
+            .map_err(|_| "explicit approved canonical source digest required")?;
+        if expected_source_digest.len() != 64
+            || !expected_source_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err("invalid approved canonical source digest".into());
+        }
+        let capture_lease = monitor
+            .lifecycle
+            .lease()
+            .map_err(|_| "source capture revoked")?;
+        let capture_operation = app
+            .state::<commands::DesktopState>()
+            .resource_coordinator
+            .enter(Some(monitor.lifecycle.verification.clone()))
+            .map_err(|_| "source capture resources frozen")?;
+        let approved_digest = expected_source_digest.clone();
+        let resource_root = app
+            .path()
+            .resource_dir()
+            .map_err(|_| "source capture resources")?;
+        let capture_digest = expected_source_digest.clone();
+        let captured = tauri::async_runtime::spawn_blocking(move || {
+            let _capture_lease = capture_lease;
+            let _capture_operation = capture_operation;
+            _capture_operation
+                .check()
+                .map_err(|_| "source capture resources frozen".to_owned())?;
+            let approved_source =
+                verified_policy_resource(&resource_root, &capture_digest).map_err(str::to_owned)?;
+            commands::capture_context_files(
+                capture_storage,
+                capture_draft,
+                None,
+                vec![approved_source],
+                &resource_root,
+            )
+        })
+        .await
+        .map_err(|_| "source capture worker")??;
+        monitor.ensure_running()?;
+        let captured = serde_json::to_value(captured).map_err(|_| "source capture summary")?;
+        if captured["sources"].as_array().map(Vec::len) != Some(1)
+            || captured["sources"][0]["status"] != "captured"
+            || captured["sources"][0]["digest"].as_str() != Some(approved_digest.as_str())
+        {
+            return Err("the approved canonical source was not fully captured".into());
+        }
+        let context_revision = captured["revision"]
+            .as_u64()
+            .ok_or("source capture revision")?;
+        let draft = storage
+            .load_context_draft(&draft_id)
+            .map_err(|_| "source capture durable read")?
+            .ok_or("source capture durable draft missing")?;
+        let source = draft
+            .manifest
+            .content
+            .sources
+            .first()
+            .ok_or("source capture durable entry missing")?;
+        if draft.revision != context_revision
+            || draft.manifest.content.sources.len() != 1
+            || source
+                .object_digest
+                .as_ref()
+                .map(magi_domain::Digest::as_str)
+                != captured["sources"][0]["digest"].as_str()
+            || source.included_locators.is_empty()
+        {
+            return Err("source capture durable authority mismatch".into());
+        }
+        let capture_evidence = serde_json::json!({"capture":captured,"canonicalSourceDigest":source.object_digest,"manifestDigest":draft.manifest.digest,"includedLocators":source.included_locators});
+        std::fs::write(
+            root.join("approved-policy-source-capture.json"),
+            serde_json::to_vec_pretty(&capture_evidence)
+                .map_err(|_| "source capture evidence encoding")?,
+        )
+        .map_err(|_| "source capture evidence")?;
+        (
+            Some(draft_id),
+            Some(context_revision),
+            Some(expected_source_digest),
+        )
+    } else {
+        monitor.mark("question_only_no_capture");
+        (None, None, None)
+    };
+    let policy_question = "Using only the explicitly captured product security contract, produce the confirmation checklist for this desktop product before a saved subscription profile sends an approved source representation to its selected external provider. Identify the fields that must be disclosed and the changes that require reconfirmation. The captured contract already defines the decision scope: do not request additional user data, do not infer facts outside the source, and record unknown provider retention, training, deletion, or cancellation behavior as a non-essential limitation of the policy. Return a complete policy decision grounded in the approved source so the review can proceed to cross-review, synthesis, and private ballots.";
+    let question = if source_mode == PhysicalSourceMode::File {
+        policy_question
+    } else {
+        "Decide whether a small desktop team should adopt a weekly 30-minute internal retrospective for the next four weeks. The team has three engineers, works remotely, has no contractual meeting requirement, and can reserve this time within its existing schedule at no additional cost. Compare adopting the retrospective with keeping the current asynchronous weekly written updates. Evaluate coordination value, interruption cost, and reversibility. Recommend one complete decision, specify a four-week success criterion and a stop condition, and give each viewpoint enough information for cross-review, synthesis, and private ballots. All facts needed for this decision are stated here; no files, external research, or additional user information are required."
+    };
     let receipt = if physical {
         commands::focus_main_window(app).map_err(|_| "physical console restoration failed")?;
         if !window
@@ -2955,8 +2984,10 @@ async fn probe(
         let state = app.state::<SavedDeliberationUiState>();
         let nonce = uuid::Uuid::new_v4().simple().to_string();
         *state.nonce.lock().map_err(|_| "UI nonce lock")? = Some(nonce.clone());
-        let config = serde_json::to_string(&serde_json::json!({"nonce":nonce,"question":question}))
-            .map_err(|_| "UI config encoding")?;
+        let config = serde_json::to_string(
+            &serde_json::json!({"nonce":nonce,"question":question,"sourceMode":source_mode}),
+        )
+        .map_err(|_| "UI config encoding")?;
         window
             .eval(format!(
                 "window.__MAGI_SAVED_UI_CONFIG={config};\n{}",
@@ -2984,23 +3015,29 @@ async fn probe(
         {
             return Err("actual UI admitted input differs from reviewed saved selections".into());
         }
-        let actual_draft = storage
-            .load_context_draft(
-                request["contextDraftId"]
-                    .as_str()
-                    .ok_or("UI capture identity missing")?,
-            )
-            .map_err(|_| "UI capture reload")?
-            .ok_or("UI capture missing")?;
-        if Some(actual_draft.revision) != request["contextRevision"].as_u64()
-            || actual_draft.manifest.content.sources.len() != 1
-            || actual_draft.manifest.content.sources[0]
-                .object_digest
-                .as_ref()
-                .map(magi_domain::Digest::as_str)
-                != Some(expected_source_digest.as_str())
-        {
-            return Err("actual UI source differs from approved policy".into());
+        if source_mode == PhysicalSourceMode::QuestionOnly {
+            if !request["contextDraftId"].is_null() || !request["contextRevision"].is_null() {
+                return Err("question-only UI unexpectedly supplied captured context".into());
+            }
+        } else {
+            let actual_draft = storage
+                .load_context_draft(
+                    request["contextDraftId"]
+                        .as_str()
+                        .ok_or("UI capture identity missing")?,
+                )
+                .map_err(|_| "UI capture reload")?
+                .ok_or("UI capture missing")?;
+            if Some(actual_draft.revision) != request["contextRevision"].as_u64()
+                || actual_draft.manifest.content.sources.len() != 1
+                || actual_draft.manifest.content.sources[0]
+                    .object_digest
+                    .as_ref()
+                    .map(magi_domain::Digest::as_str)
+                    != expected_source_digest.as_deref()
+            {
+                return Err("actual UI source differs from approved policy".into());
+            }
         }
         *monitor.active_request.lock().map_err(|_|"request reference lock")?=Some(serde_json::from_value(serde_json::json!({"request":request,"commandId":uuid::Uuid::new_v4().to_string(),"idempotencyKey":uuid::Uuid::new_v4().to_string()})).map_err(|_|"UI cancellation intent")?);
         observed["receipt"].clone()
@@ -3054,6 +3091,22 @@ async fn probe(
         let dossier = storage
             .load_run_dossier(run_id)
             .map_err(|_| "durable dossier read")?;
+        if source_mode == PhysicalSourceMode::QuestionOnly
+            && (dossier.capture_manifest.is_some()
+                || !dossier.snapshot.input.context_manifest.sources.is_empty()
+                || dossier.snapshot.input.common_context_budget.is_none()
+                || dossier
+                    .snapshot
+                    .input
+                    .request_provenance
+                    .as_ref()
+                    .is_none_or(|provenance| {
+                        provenance.context_draft_id.is_some()
+                            || provenance.context_revision.is_some()
+                    }))
+        {
+            return Err("question-only durable source or budget authority mismatch".into());
+        }
         if dossier.snapshot.submitted_ballot_count < 3
             && dossier.snapshot.ballots_revealed.is_some()
         {
