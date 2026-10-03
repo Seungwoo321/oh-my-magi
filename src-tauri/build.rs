@@ -1,4 +1,4 @@
-use extraction_authority::{identity, Identity};
+use extraction_authority::{Identity, identity};
 use std::{
     fs,
     fs::OpenOptions,
@@ -192,7 +192,11 @@ fn main() -> io::Result<()> {
         .transpose()?;
     match BuildPurpose::parse(purpose.as_deref())? {
         BuildPurpose::Verify => verify_existing_resources(Path::new(&out_dir)),
-        BuildPurpose::Admit => admit_existing_resources(Path::new(&out_dir)),
+        BuildPurpose::Admit => admit_then_verify(
+            Path::new(&out_dir),
+            admit_existing_resources,
+            verify_existing_resources,
+        ),
         BuildPurpose::Publish => {
             require_publication_authority()?;
             prepare_extraction_resources(Path::new(&out_dir))?;
@@ -202,6 +206,15 @@ fn main() -> io::Result<()> {
             })
         }
     }
+}
+
+fn admit_then_verify(
+    out_dir: &Path,
+    admit: impl FnOnce(&Path) -> io::Result<()>,
+    verify: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    admit(out_dir)?;
+    verify(out_dir)
 }
 
 fn validate_configuration_override(value: Option<&std::ffi::OsStr>) -> io::Result<()> {
@@ -1849,16 +1862,20 @@ mod tests {
         .unwrap();
         assert!(changed_version);
         assert_ne!(identity(&fs::metadata(&parent).unwrap()), expected);
-        assert!(hold_build_ancestor(&parent, || {
-            fs::rename(&parent, fixture.0.join("retired-ancestor")).unwrap();
-            fs::create_dir(&parent).unwrap();
-        })
-        .is_err());
-        assert!(hold_build_ancestor(&parent, || {
-            fs::remove_dir(&parent).unwrap();
-            std::os::unix::fs::symlink(fixture.0.join("retired-ancestor"), &parent).unwrap();
-        })
-        .is_err());
+        assert!(
+            hold_build_ancestor(&parent, || {
+                fs::rename(&parent, fixture.0.join("retired-ancestor")).unwrap();
+                fs::create_dir(&parent).unwrap();
+            })
+            .is_err()
+        );
+        assert!(
+            hold_build_ancestor(&parent, || {
+                fs::remove_dir(&parent).unwrap();
+                std::os::unix::fs::symlink(fixture.0.join("retired-ancestor"), &parent).unwrap();
+            })
+            .is_err()
+        );
     }
 
     fn owned_codegen_fixture(path: PathBuf) -> OwnedCodegenConfiguration {
@@ -1941,10 +1958,9 @@ mod tests {
             let path = fixture.0.join(relative);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(path, b"captured release input").unwrap();
-            authority[key] = serde_json::json!(magi_domain::Digest::from_bytes(
-                b"captured release input"
-            )
-            .as_str());
+            authority[key] = serde_json::json!(
+                magi_domain::Digest::from_bytes(b"captured release input").as_str()
+            );
         }
         let authority_path = target.join("provider/codex-acp/darwin-arm64/build-manifest.json");
         fs::create_dir_all(authority_path.parent().unwrap()).unwrap();
@@ -2097,6 +2113,43 @@ mod tests {
     }
 
     #[test]
+    fn admission_must_succeed_before_strict_verification_and_codegen() {
+        let fixture = Fixture::new();
+        let calls = std::cell::RefCell::new(Vec::new());
+        assert!(
+            admit_then_verify(
+                &fixture.out(),
+                |_| {
+                    calls.borrow_mut().push("admit");
+                    Err(io::Error::other("missing pinned input"))
+                },
+                |_| {
+                    calls.borrow_mut().push("verify");
+                    Ok(())
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(*calls.borrow(), vec!["admit"]);
+        calls.borrow_mut().clear();
+        assert!(
+            admit_then_verify(
+                &fixture.out(),
+                |_| {
+                    calls.borrow_mut().push("admit");
+                    Ok(())
+                },
+                |_| {
+                    calls.borrow_mut().push("verify");
+                    Err(io::Error::other("changed admitted authority"))
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(*calls.borrow(), vec!["admit", "verify"]);
+    }
+
+    #[test]
     fn pinned_generation_fresh_admission_preserves_provider_helper_legal_and_provenance() {
         let fixture = Fixture::new();
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -2191,19 +2244,23 @@ mod tests {
         assert!(require_publication_authority().is_err());
         let injected =
             std::ffi::OsStr::new(r#"{"bundle":{"resources":{"attacker":"provider/codex-acp/"}}}"#);
-        assert!(verify_existing_resources_with(
-            Path::new("missing-output"),
-            Path::new("missing-manifest"),
-            Some(injected),
-            |_| panic!("override must reject before Tauri resource copying")
-        )
-        .is_err());
+        assert!(
+            verify_existing_resources_with(
+                Path::new("missing-output"),
+                Path::new("missing-manifest"),
+                Some(injected),
+                |_| panic!("override must reject before Tauri resource copying")
+            )
+            .is_err()
+        );
 
         validate_configuration_override(None).unwrap();
-        assert!(validate_configuration_override(Some(std::ffi::OsStr::new(
-            r#"{"bundle":{"resources":{"attacker":"provider/codex-acp/"}}}"#
-        )))
-        .is_err());
+        assert!(
+            validate_configuration_override(Some(std::ffi::OsStr::new(
+                r#"{"bundle":{"resources":{"attacker":"provider/codex-acp/"}}}"#
+            )))
+            .is_err()
+        );
         assert!(validate_configuration_override(Some(std::ffi::OsStr::new(""))).is_err());
 
         let mut config: serde_json::Value =
@@ -2240,10 +2297,12 @@ mod tests {
             .parent()
             .unwrap()
             .join("previous-codex-acp-resources");
-        assert!(retire_resources_using(&destination, &previous, |_| {
-            Err(io::Error::other("Injected placeholder retirement failure"))
-        })
-        .is_err());
+        assert!(
+            retire_resources_using(&destination, &previous, |_| {
+                Err(io::Error::other("Injected placeholder retirement failure"))
+            })
+            .is_err()
+        );
         assert_eq!(fs::metadata(&destination).unwrap().ino(), inode);
         assert_eq!(fs::metadata(&destination).unwrap().mode() & 0o777, 0o555);
         assert_eq!(
@@ -2261,18 +2320,20 @@ mod tests {
                 .unwrap(),
             Some(expected.into())
         );
-        assert!(select_developer_identity("0 valid identities found")
-            .unwrap()
-            .is_none());
-        assert!(select_developer_identity(
-            "1) ABC \"Developer ID Application: Other (OTHERTEAM)\""
-        )
-        .unwrap()
-        .is_none());
-        assert!(select_developer_identity(&format!(
-            "1) ABC \"{expected}\"\n2) DEF \"{expected}\""
-        ))
-        .is_err());
+        assert!(
+            select_developer_identity("0 valid identities found")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            select_developer_identity("1) ABC \"Developer ID Application: Other (OTHERTEAM)\"")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            select_developer_identity(&format!("1) ABC \"{expected}\"\n2) DEF \"{expected}\""))
+                .is_err()
+        );
     }
 
     #[test]
@@ -2338,14 +2399,16 @@ mod tests {
         let helper_inode = fs::metadata(helper.join("prior")).unwrap().ino();
         let outside = fixture.0.join("outside-canary");
         fs::write(&outside, b"outside").unwrap();
-        assert!(publish_fresh_resources(&fixture.out(), || {
-            fs::create_dir_all(fixture.destination())?;
-            fs::write(fixture.destination().join("fresh"), b"provider")?;
-            fs::create_dir_all(&helper)?;
-            std::os::unix::fs::symlink(&outside, helper.join("invalid"))?;
-            Ok(())
-        })
-        .is_err());
+        assert!(
+            publish_fresh_resources(&fixture.out(), || {
+                fs::create_dir_all(fixture.destination())?;
+                fs::write(fixture.destination().join("fresh"), b"provider")?;
+                fs::create_dir_all(&helper)?;
+                std::os::unix::fs::symlink(&outside, helper.join("invalid"))?;
+                Ok(())
+            })
+            .is_err()
+        );
         assert_eq!(
             fs::metadata(fixture.destination().join("prior"))
                 .unwrap()
@@ -2413,12 +2476,14 @@ mod tests {
             .unwrap()
             .join("other-provider.txt");
         fs::write(&sibling, b"unrelated generated resource").unwrap();
-        assert!(publish_fresh_resources(&fixture.out(), || {
-            fs::create_dir_all(fixture.destination())?;
-            fs::write(fixture.destination().join("partial"), b"partial")?;
-            Err(io::Error::other("controlled build failure"))
-        })
-        .is_err());
+        assert!(
+            publish_fresh_resources(&fixture.out(), || {
+                fs::create_dir_all(fixture.destination())?;
+                fs::write(fixture.destination().join("partial"), b"partial")?;
+                Err(io::Error::other("controlled build failure"))
+            })
+            .is_err()
+        );
         assert_eq!(fs::metadata(prior).unwrap().ino(), inode);
         assert_eq!(fs::read(sibling).unwrap(), b"unrelated generated resource");
         assert!(!fixture.destination().join("partial").exists());
@@ -2435,15 +2500,17 @@ mod tests {
             let outside = fixture.0.join("outside");
             fs::create_dir(&outside).unwrap();
             fs::write(outside.join("keep"), b"outside canary").unwrap();
-            assert!(publish_fresh_resources(&fixture.out(), || {
-                match output {
-                    "file" => fs::write(fixture.destination(), b"invalid resource root")?,
-                    "symlink" => std::os::unix::fs::symlink(&outside, fixture.destination())?,
-                    _ => {}
-                }
-                Ok(())
-            })
-            .is_err());
+            assert!(
+                publish_fresh_resources(&fixture.out(), || {
+                    match output {
+                        "file" => fs::write(fixture.destination(), b"invalid resource root")?,
+                        "symlink" => std::os::unix::fs::symlink(&outside, fixture.destination())?,
+                        _ => {}
+                    }
+                    Ok(())
+                })
+                .is_err()
+            );
             assert_eq!(fs::metadata(&prior).unwrap().ino(), inode);
             assert_eq!(fs::read(&prior).unwrap(), b"verified prior resource");
             assert_eq!(fs::read(outside.join("keep")).unwrap(), b"outside canary");
@@ -2468,17 +2535,19 @@ mod tests {
             let outside = fixture.0.join("outside");
             fs::create_dir(&outside).unwrap();
             fs::write(outside.join("keep"), b"outside canary").unwrap();
-            assert!(publish_fresh_resources(&fixture.out(), || {
-                fs::create_dir_all(fixture.destination())?;
-                fs::write(fixture.destination().join("new"), b"new provider")?;
-                match invalid {
-                    "file" => fs::write(&helper, b"invalid helper root")?,
-                    "symlink" => std::os::unix::fs::symlink(&outside, &helper)?,
-                    _ => {}
-                }
-                Ok(())
-            })
-            .is_err());
+            assert!(
+                publish_fresh_resources(&fixture.out(), || {
+                    fs::create_dir_all(fixture.destination())?;
+                    fs::write(fixture.destination().join("new"), b"new provider")?;
+                    match invalid {
+                        "file" => fs::write(&helper, b"invalid helper root")?,
+                        "symlink" => std::os::unix::fs::symlink(&outside, &helper)?,
+                        _ => {}
+                    }
+                    Ok(())
+                })
+                .is_err()
+            );
             assert_eq!(fs::metadata(&provider_prior).unwrap().ino(), provider_inode);
             assert_eq!(fs::metadata(&helper_prior).unwrap().ino(), helper_inode);
             assert_eq!(fs::read(&provider_prior).unwrap(), b"provider authority");
