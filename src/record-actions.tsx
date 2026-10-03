@@ -107,4 +107,3 @@ export function ReviewedSharePanel({ dossier }: { dossier: RunDossierView | null
 function PublicTextField({ label, value, disabled, onChange }: { label: string; value: string; disabled: boolean; onChange: (value: string) => void }) {
   return <label className="field"><span>{label}</span><textarea className="text-field" rows={3} value={value} disabled={disabled} onChange={(event) => onChange(event.target.value)} /></label>;
 }
-

@@ -17,7 +17,7 @@ server=await createServer({server:{host:'127.0.0.1',port:0,hmr:false,watch:null}
 await writeFile(join(temp,'index.html'),'<div id="root"></div><script type="module" src="/scripts/frontend-fixtures/acceptance.tsx"></script>');
 await server.listen();
 const address=server.httpServer.address();
-const base=`http://127.0.0.1:${address.port}/${relative(process.cwd(),temp).split('\\').join('/')}/index.html`; 
+const base=`http://127.0.0.1:${address.port}/${relative(process.cwd(),temp).split('\\').join('/')}/index.html`;
 browser=await chromium.launch({headless:true,...(process.env.FRONTEND_TEST_BROWSER ? {executablePath:process.env.FRONTEND_TEST_BROWSER} : {channel:'chrome'})});
 page=await browser.newPage();const errors=[];page.on('pageerror',e=>errors.push(e.message));
 
