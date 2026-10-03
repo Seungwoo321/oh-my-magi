@@ -435,7 +435,7 @@ export default function App() {
   latestRunRef.current = activeRun;
   const [newDraftFromRunId, setNewDraftFromRunId] = useState<string | null>(null);
   const newDraftRunRef = useRef<string | null>(null);
-  const retainsNewDraft = (runId: string, status: string, route: ScreenId) => newDraftRunRef.current === runId && ["completed", "cancelled", "failed"].includes(status) && ["input", "intake", "confirmation"].includes(route);
+  const retainsNewDraft = (runId: string, status: string, route: ScreenId) => newDraftRunRef.current === runId && ["completed", "cancelled", "failed"].includes(status) && ["input", "intake", "confirmation", "connections", "settings"].includes(route);
   const currentRunId = activeRun?.id ?? acceptedRunId;
   const [dispatchProjection, setDispatchProjection] = useState<CoreDispatchProjection | null>(null);
   const dispatchRequest = useRef(0);
@@ -507,8 +507,9 @@ export default function App() {
     : liveRunTextDeltas.map((delta) => delta.text).join("");
   const selectedRolePreset = rolePresets.find((preset) => preset.id === selectedRolePresetId);
   const currentClarificationDraft = clarificationDraft?.parent.runId === currentRunId && currentRunDossier?.status === "paused" && verifiedClarificationParent?.runId === clarificationDraft.parent.runId && verifiedClarificationParent.revision === clarificationDraft.parent.revision && verifiedClarificationParent.inputDigest === clarificationDraft.parent.inputDigest && verifiedClarificationParent.generation === clarificationDraft.parent.generation ? clarificationDraft : null;
-  const newDraftView = Boolean(activeRun && newDraftFromRunId === activeRun.id && ["completed", "cancelled", "failed"].includes(activeRun.status) && ["input", "intake", "confirmation"].includes(screen));
-  const shownQuestion = currentClarificationDraft && ["input", "confirmation", "intake"].includes(screen) ? currentClarificationDraft.question : newDraftView ? question : activeRun?.question ?? question;
+  const retainedDraftIdentity = Boolean(activeRun && newDraftFromRunId === activeRun.id && ["completed", "cancelled", "failed"].includes(activeRun.status));
+  const newDraftView = retainedDraftIdentity && ["input", "intake", "confirmation"].includes(screen);
+  const shownQuestion = currentClarificationDraft && ["input", "confirmation", "intake"].includes(screen) ? currentClarificationDraft.question : retainedDraftIdentity ? question : activeRun?.question ?? question;
   const isDraft = screen === "input" && (!activeRun || newDraftView);
 
   useEffect(() => {
@@ -2235,7 +2236,7 @@ export default function App() {
         <div className="agenda-actions">
           <div className="agenda-source-status">
             <span className="source-symbol" aria-hidden="true">▤</span>
-            <span>{activeRun && !newDraftView ? `자료 ${activeRun.sourceCount}개` : contextSelection ? `자료 ${contextSelection.sources.filter((source) => source.status === "captured").length}개 접수` : t("자료 0개")}</span>
+            <span>{activeRun && !retainedDraftIdentity ? `자료 ${activeRun.sourceCount}개` : contextSelection ? `자료 ${contextSelection.sources.filter((source) => source.status === "captured").length}개 접수` : t("자료 0개")}</span>
             <button type="button" className="text-action" onClick={() => navigate("intake")}>{t("자료 보기")}</button>
           </div>
           <button type="button" className="button button-primary agenda-primary" onClick={confirmQuestion} disabled={!isDraft}>
