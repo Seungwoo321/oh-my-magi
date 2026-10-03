@@ -1842,6 +1842,7 @@ struct SavedDeliberationUiState {
     nonce: Mutex<Option<String>>,
     progress: Mutex<Option<SavedDeliberationUiPhase>>,
     connection_step: Mutex<Option<ConnectionDiagnostic>>,
+    core_step: Mutex<Option<CoreDiagnostic>>,
     outcome: Mutex<Option<Result<serde_json::Value, String>>>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize)]
@@ -1895,9 +1896,93 @@ fn validate_connection_diagnostic(
     }
     Ok(())
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CoreDiagnosticStep {
+    SelectionRequested,
+    SelectionConfirmed,
+    SaveRequested,
+    SaveAcknowledged,
+    FieldSettled,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CoreDiagnostic {
+    core_index: u8,
+    step: CoreDiagnosticStep,
+}
+fn validate_core_diagnostic(
+    phase: SavedDeliberationUiPhase,
+    prior: Option<CoreDiagnostic>,
+    next: CoreDiagnostic,
+) -> Result<(), String> {
+    if phase != SavedDeliberationUiPhase::CoreReconfirmation
+        || next.core_index > 2
+        || prior.is_some_and(|previous| next < previous)
+    {
+        return Err("UI core diagnostic fenced".into());
+    }
+    Ok(())
+}
 #[cfg(test)]
 mod connection_diagnostic_tests {
     use super::*;
+
+    #[test]
+    fn closed_core_steps_reject_wrong_phase_index_and_backward_progress() {
+        let first = CoreDiagnostic {
+            core_index: 0,
+            step: CoreDiagnosticStep::SelectionRequested,
+        };
+        let saved = CoreDiagnostic {
+            core_index: 0,
+            step: CoreDiagnosticStep::SaveAcknowledged,
+        };
+        assert!(
+            validate_core_diagnostic(
+                SavedDeliberationUiPhase::CoreReconfirmation,
+                Some(first),
+                saved
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_core_diagnostic(
+                SavedDeliberationUiPhase::CoreReconfirmation,
+                Some(saved),
+                saved
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_core_diagnostic(
+                SavedDeliberationUiPhase::CoreReconfirmation,
+                Some(saved),
+                first
+            )
+            .is_err()
+        );
+        assert!(
+            validate_core_diagnostic(SavedDeliberationUiPhase::ConsentReady, None, first).is_err()
+        );
+        assert!(
+            validate_core_diagnostic(
+                SavedDeliberationUiPhase::CoreReconfirmation,
+                None,
+                CoreDiagnostic {
+                    core_index: 3,
+                    ..first
+                }
+            )
+            .is_err()
+        );
+        for value in [
+            serde_json::json!({"coreIndex":0,"step":"unknown"}),
+            serde_json::json!({"coreIndex":0,"step":"save_requested","ready":true}),
+        ] {
+            assert!(serde_json::from_value::<CoreDiagnostic>(value).is_err());
+        }
+    }
 
     #[test]
     fn closed_connection_steps_reject_unknown_fields_and_backward_progress() {
@@ -1964,6 +2049,8 @@ struct SavedDeliberationUiProgress {
     phase: SavedDeliberationUiPhase,
     #[serde(default)]
     connection_step: Option<ConnectionDiagnostic>,
+    #[serde(default)]
+    core_step: Option<CoreDiagnostic>,
 }
 #[tauri::command]
 fn saved_deliberation_ui_progress(
@@ -1995,6 +2082,20 @@ fn saved_deliberation_ui_progress(
             eprintln!(
                 "native actual UI connection: profile_index={}; step={:?}",
                 next.profile_index, next.step
+            );
+            *step = Some(next);
+        }
+    }
+    if let Some(next) = input.core_step {
+        let mut step = state
+            .core_step
+            .lock()
+            .map_err(|_| "UI core diagnostic lock")?;
+        validate_core_diagnostic(input.phase, *step, next)?;
+        if *step != Some(next) {
+            eprintln!(
+                "native actual UI core: core_index={}; step={:?}",
+                next.core_index, next.step
             );
             *step = Some(next);
         }

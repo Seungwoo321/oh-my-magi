@@ -44,6 +44,7 @@
   const button = labels => Array.from(document.querySelectorAll("button")).find(el => usable(el) && labels.some(label => el.textContent.trim().includes(label)));
   const readonly = (command, args) => bounded(() => original(command, args));
   const connectionStep = (profileIndex, step) => bounded(() => original("saved_deliberation_ui_progress", { input: { nonce: config.nonce, phase, connectionStep: { profileIndex, step } } }));
+  const coreStep = (coreIndex, step) => bounded(() => original("saved_deliberation_ui_progress", { input: { nonce: config.nonce, phase, coreStep: { coreIndex, step } } }));
   try {
     const bridge = await wait(() => typeof window.__TAURI_INTERNALS__?.invoke === "function" && window.__TAURI_INTERNALS__);
     original = bridge.invoke.bind(bridge);
@@ -107,9 +108,12 @@
       await wait(() => !Array.from(document.querySelectorAll("button")).some(el => ["저장 중…", "Saving…"].includes(el.textContent.trim())) && row()?.textContent.includes(choice.modelId) && !row()?.textContent.includes("저장한 모델 선택을 다시 확인하십시오"));
     }
     await mark("core_reconfirmation");
-    for (const choice of config.selections) {
+    for (const [coreIndex, choice] of config.selections.entries()) {
+      await coreStep(coreIndex, "selection_requested");
       const select = await wait(() => { const el = document.getElementById(`core-${choice.coreId}`); return usable(el) ? el : null; });
       changeSelect(select, choice.providerProfileId);
+      await wait(() => usable(select) && select.value === choice.providerProfileId);
+      await coreStep(coreIndex, "selection_confirmed");
       const field = select.closest(".field");
       const save = await wait(() => Array.from(field.querySelectorAll("button")).find(el => usable(el) && ["코어 연결 저장", "Save core connection"].includes(el.textContent.trim())));
       const beforeRows = await readonly("load_core_model_selections", {});
@@ -117,6 +121,7 @@
       if (!Number.isSafeInteger(beforeCore?.selectionRevision)) throw Error("missing prior core revision");
       const profileRevision = Number(Array.from(document.querySelectorAll("li[data-profile-id]")).find(el => el.dataset.profileId === choice.providerProfileId)?.dataset.profileRevision);
       const selectedModel = await readonly("load_provider_catalog", { profileId: choice.providerProfileId, expectedRevision: profileRevision });
+      await coreStep(coreIndex, "save_requested");
       click(save);
       await wait(async () => {
         const rows = await readonly("load_core_model_selections", {});
@@ -125,8 +130,10 @@
         const selection = after?.selection;
         return after?.selectionState === "selected" && after.selectionRevision === beforeCore.selectionRevision + 1 && selection?.selectionRevision === after.selectionRevision && selection.providerProfileId === choice.providerProfileId && selection.profileRevision === profileRevision && selection.modelSelectionRevision === selectedModel.modelSelectionRevision;
       });
+      await coreStep(coreIndex, "save_acknowledged");
       await rendered();
       await wait(() => !field.textContent.includes("저장된 모델 선택을 다시 확인하십시오.") && !field.textContent.includes("Recheck the saved model selection.") && !field.textContent.includes("저장 중…") && !field.textContent.includes("Saving…"));
+      await coreStep(coreIndex, "field_settled");
     }
     await mark("draft_restored");
     click((await wait(() => button(["원래 화면으로 돌아가기", "Return to the previous screen"]))));
