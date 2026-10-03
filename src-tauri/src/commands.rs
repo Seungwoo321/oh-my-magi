@@ -1331,6 +1331,40 @@ impl LiveRunControl {
         Ok(request)
     }
 
+    pub(crate) fn cancel_publication<T>(
+        &self,
+        operation: impl FnOnce() -> (T, bool),
+    ) -> Result<T, magi_provider::ProviderError> {
+        let admission = self
+            .admission_request
+            .lock()
+            .map_err(|_| magi_provider::ProviderError::Cancelled)?
+            .clone();
+        if let Some(admission) = admission {
+            // Admission operations already acquire state before the publication fence.
+            let mut state = admission
+                .state
+                .lock()
+                .map_err(|_| magi_provider::ProviderError::Cancelled)?;
+            admission.verification.revoke_conditionally(|| {
+                let (result, revoke) = operation();
+                if revoke {
+                    state.revoked = true;
+                    self.cancellation_requested.store(true, Ordering::Release);
+                }
+                (result, revoke)
+            })
+        } else {
+            self.effect_root.revoke_conditionally(|| {
+                let (result, revoke) = operation();
+                if revoke {
+                    self.cancellation_requested.store(true, Ordering::Release);
+                }
+                (result, revoke)
+            })
+        }
+    }
+
     pub(crate) fn revoke_effects(&self) {
         self.cancellation_requested.store(true, Ordering::Release);
         self.effect_root.revoke();
@@ -3566,28 +3600,33 @@ pub(crate) mod resource_quiescence_tests {
         release_tx.send(()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let ready = matches!(
-                *state.application_shutdown.lock().unwrap(),
-                ApplicationShutdownState::Frozen(_)
-            ) && state.resource_coordinator.state.lock().unwrap().operations == 0;
-            if ready {
+            let phase = match &*state.application_shutdown.lock().unwrap() {
+                ApplicationShutdownState::Open => "open",
+                ApplicationShutdownState::Preparing => "preparing",
+                ApplicationShutdownState::Frozen(_) => "frozen",
+            };
+            let operations = state.resource_coordinator.state.lock().unwrap().operations;
+            if phase != "preparing" && operations == 0 {
                 break;
             }
             assert!(
                 Instant::now() < deadline,
-                "actual preparation worker did not settle"
+                "actual preparation worker did not settle: phase={phase}, operations={operations}"
             );
             std::thread::yield_now();
         }
+        // An expired first worker may safely return to Open after configuration contention.
+        // Completion is distinct from successful preparation; the fresh retry must prove success.
+        let retry_deadline = Instant::now() + Duration::from_secs(5);
         let prepared = application_runtime()
-            .block_on(state.prepare_application_shutdown(deadline, true))
-            .unwrap();
+            .block_on(state.prepare_application_shutdown(retry_deadline, true))
+            .expect("settled same-epoch retry must prepare actual cancellation");
         assert_eq!(prepared.permission.epoch, 1);
         assert_eq!(prepared.pending_runs, vec![run_id.clone()]);
         assert!(prepared.durable_cancellation_prepared);
         assert!(prepared.permission.validate().is_ok());
         let retried = application_runtime()
-            .block_on(state.freeze_resource_consumers(deadline, None))
+            .block_on(state.freeze_resource_consumers(retry_deadline, None))
             .unwrap();
         assert_eq!(retried.epoch, prepared.permission.epoch);
         assert!(retried.validate().is_ok());

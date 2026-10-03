@@ -2674,16 +2674,28 @@ async fn cancel_run_inner(
                     .get(&run_id)
                     .is_some_and(|current| Arc::ptr_eq(&current, &control));
                 if is_current {
-                    Some(match expected_revision {
-                        Some(revision) => storage.begin_live_run_cancel(
-                            &command_id,
-                            &idempotency_key,
-                            &run_id,
-                            revision,
-                            &now_rfc3339(),
-                        ),
-                        None => storage.begin_deliberation_cancel(&run_id, &now_rfc3339()),
-                    })
+                    Some(
+                        control
+                            .cancel_publication(|| {
+                                let result = match expected_revision {
+                                    Some(revision) => storage.begin_live_run_cancel(
+                                        &command_id,
+                                        &idempotency_key,
+                                        &run_id,
+                                        revision,
+                                        &now_rfc3339(),
+                                    ),
+                                    None => {
+                                        storage.begin_deliberation_cancel(&run_id, &now_rfc3339())
+                                    }
+                                };
+                                let revoke = result
+                                    .as_ref()
+                                    .is_ok_and(|accepted| accepted.0 == LiveRunStatus::Cancelling);
+                                (result, revoke)
+                            })
+                            .map_err(LiveRunError::provider)?,
+                    )
                 } else {
                     None
                 }
@@ -9669,6 +9681,87 @@ mod provider_operation_boundary_tests {
         fn drop(&mut self) {
             self.0.abort();
         }
+    }
+
+    #[test]
+    fn durable_cancel_cas_revokes_only_after_successful_publication_decision() {
+        let prepared = catalog_selection_ipc_tests::publication_fault_fixture();
+        let _root = OwnedRoot(prepared.0.clone());
+        let (_path, storage, _aggregate, claim) = prepared;
+        let storage = Arc::new(storage);
+        let controls = LiveRunControlRegistry::default();
+        let control = controls.register(&claim.run_id);
+        control
+            .bind_execution(
+                crate::commands::NativeExecutionAuthority::capture(storage.clone()).unwrap(),
+            )
+            .unwrap();
+        let registry = crate::commands::AdmissionRequestRegistry::default();
+        let admission = registry.reference("bound-cancellation").unwrap();
+        {
+            let mut state = admission.state.lock().unwrap();
+            state.admitted_run = Some(claim.run_id.clone());
+            state.execution =
+                Some(crate::commands::NativeExecutionAuthority::capture(storage.clone()).unwrap());
+        }
+        *control.admission_request.lock().unwrap() = Some(admission.clone());
+        let effect = control.effect_request().unwrap();
+        assert!(effect.shares_authority(&admission.verification));
+        let revision = storage
+            .get_live_run_snapshot(&claim.run_id, 0)
+            .unwrap()
+            .revision;
+        let rejected = control
+            .cancel_publication(|| {
+                let result = storage.begin_live_run_cancel(
+                    "stale-cancel",
+                    "stale-cancel",
+                    &claim.run_id,
+                    revision + 1,
+                    "2026-10-02T00:00:01Z",
+                );
+                let revoke = result
+                    .as_ref()
+                    .is_ok_and(|accepted| accepted.0 == LiveRunStatus::Cancelling);
+                (result, revoke)
+            })
+            .unwrap();
+        assert!(rejected.is_err());
+        assert!(effect.check().is_ok());
+        assert!(control.effect_request().is_ok());
+        assert!(admission.check().is_ok());
+        assert!(admission.verification.check().is_ok());
+        let accepted = control
+            .cancel_publication(|| {
+                let result = storage.begin_live_run_cancel(
+                    "accepted-cancel",
+                    "accepted-cancel",
+                    &claim.run_id,
+                    revision,
+                    "2026-10-02T00:00:02Z",
+                );
+                let revoke = result
+                    .as_ref()
+                    .is_ok_and(|accepted| accepted.0 == LiveRunStatus::Cancelling);
+                (result, revoke)
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(accepted.0, LiveRunStatus::Cancelling);
+        assert!(effect.check().is_err());
+        assert!(control.effect_request().is_err());
+        assert!(admission.check().is_err());
+        assert!(admission.verification.check().is_err());
+        let cleaning = control.clone();
+        let (done, completed) = std::sync::mpsc::channel();
+        let cleanup = std::thread::spawn(move || {
+            cleaning.revoke_effects();
+            done.send(()).unwrap();
+        });
+        completed
+            .recv_timeout(Duration::from_secs(2))
+            .expect("secondary revocation must not recursively deadlock");
+        cleanup.join().unwrap();
     }
 
     #[test]

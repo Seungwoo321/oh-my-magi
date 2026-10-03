@@ -3,7 +3,7 @@ import { ReviewedSharePanel, RestoreDataPanel } from "./record-actions";
 import { ContextPreview } from "./context-preview";
 import { SignedUpdatePanel } from "./native-settings";
 import { RoleTransfer } from "./role-transfer";
-import { t, type Locale } from "./lib/locale";
+import { getLocale, t, type Locale } from "./lib/locale";
 import { Button, Panel } from "./ui-controls";
 import { RunClarificationPanel } from "./clarification";
 import { PdfRangeCapture } from "./pdf-range-capture";
@@ -966,7 +966,7 @@ function ProviderPage({ coreBindings, onCheckConnection, onBack, adaptersState, 
             <p className="field-help">{t("인증 홈 ·")}<code>{profile.credentialHome?.displayPath ?? t("저장된 경로 없음 · 편집 필요")}</code></p>
             <p className="field-help">{t("저장 모델 ·")}<code>{catalogProjection === "pending" ? t("저장된 모델 확인 중…") : catalogProjection === "error" ? t("저장된 모델 확인 실패") : savedModel?.modelId ?? t("선택하지 않음")}</code>{savedModel?.modeId ? <>{t("· 모드")}<code>{savedModel.modeId}</code></> : null}{savedModelStale ? t(" · 저장한 모델 선택을 다시 확인하십시오") : ""}</p>
             <p className="field-help">{t("인증 상태 ·")}{authenticationLabel}</p>
-            <p className="field-help">{t("마지막 인증 확인 ·")}{verifiedAt ? <time dateTime={verifiedAt}>{new Date(verifiedAt).toLocaleString("ko-KR")}</time> : authentication || checkState !== "not_checked" ? t("시간 미확인") : t("확인 기록 없음")}</p>
+            <p className="field-help">{t("마지막 인증 확인 ·")}{verifiedAt ? <time dateTime={verifiedAt}>{new Date(verifiedAt).toLocaleString(getLocale() === "en" ? "en-US" : "ko-KR")}</time> : authentication || checkState !== "not_checked" ? t("시간 미확인") : t("확인 기록 없음")}</p>
 
             <div className="acp-profile-actions">
               <Button data-profile-edit-id={profile.id} data-profile-edit-revision={profile.revision} onClick={(event) => { profileDialogInvoker.current = event.currentTarget; onBeginEdit(profile.id); }} disabled={liveRequestState === "starting" || profilesState !== "ready" || writeState === "saving"}>{t("편집")}</Button>
