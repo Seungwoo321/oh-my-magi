@@ -282,26 +282,24 @@ pub fn list_provider_source_scopes(
 #[tauri::command]
 pub async fn pick_provider_source_directory(
     window: WebviewWindow,
-    app: AppHandle,
 ) -> Result<Option<String>, String> {
     ensure_main_window(&window)?;
-    let selected = async_runtime::spawn_blocking(move || {
-        use tauri_plugin_dialog::DialogExt;
-        app.dialog().file().blocking_pick_folder()
-    })
+    let selected = crate::native_source_picker::select_request(
+        &window,
+        crate::native_source_picker::PickerRequest::Directory,
+    )
     .await
-    .map_err(|_| "The source folder picker could not be opened.")?;
-    selected
-        .map(|file_path| {
-            let path = file_path
-                .into_path()
-                .map_err(|_| "The selected folder path could not be read safely.".to_owned())?;
-            if !path.is_absolute() {
-                return Err("The selected folder path is not absolute.".to_owned());
-            }
-            Ok(display_source_scope_path(&path))
-        })
-        .transpose()
+    .map_err(|error| error.message().to_owned())?;
+    let path = match selected {
+        crate::native_source_picker::PickerOutcome::Cancelled => return Ok(None),
+        crate::native_source_picker::PickerOutcome::Selected(mut paths)
+            if paths.len() == 1 && paths[0].is_absolute() =>
+        {
+            paths.remove(0)
+        }
+        _ => return Err("The selected local path is unavailable.".to_owned()),
+    };
+    Ok(Some(display_source_scope_path(&path)))
 }
 
 #[tauri::command]

@@ -4,11 +4,10 @@ use magi_storage::Storage;
 use serde::Serialize;
 use std::{
     collections::HashMap,
-    sync::{Mutex, OnceLock, mpsc},
+    sync::{Mutex, OnceLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tauri::{AppHandle, State, WebviewWindow};
-use tauri_plugin_dialog::DialogExt;
+use tauri::{State, WebviewWindow};
 
 const GRANT_LIFETIME: Duration = Duration::from_secs(30 * 60);
 const MAX_GRANTS: usize = 64;
@@ -113,7 +112,6 @@ fn unchecked(reason: &'static str) -> FreshnessRead {
 #[tauri::command]
 pub(crate) async fn select_source_freshness_file(
     window: WebviewWindow,
-    app: AppHandle,
     state: State<'_, DesktopState>,
     run_id: String,
     source_id: String,
@@ -121,23 +119,22 @@ pub(crate) async fn select_source_freshness_file(
     main_only(&window)?;
     let storage = state.storage()?;
     let (captured, name) = source(&storage, &run_id, &source_id)?;
-    let (tx, rx) = mpsc::sync_channel(1);
-    app.dialog()
-        .file()
-        .set_title(format!("Select the current file for {name}"))
-        .pick_file(move |path| {
-            let _ = tx.send(path);
-        });
-    let selected = tauri::async_runtime::spawn_blocking(move || rx.recv())
-        .await
-        .map_err(|_| "Source selection failed.")?
-        .map_err(|_| "Source selection closed unexpectedly.")?;
-    let Some(selected) = selected else {
-        return Ok(None);
+    let selected = crate::native_source_picker::select_request_with_title(
+        &window,
+        crate::native_source_picker::PickerRequest::SingleFile { filters: vec![] },
+        format!("Select the current file for {name}"),
+    )
+    .await
+    .map_err(|error| error.message().to_owned())?;
+    let path = match selected {
+        crate::native_source_picker::PickerOutcome::Cancelled => return Ok(None),
+        crate::native_source_picker::PickerOutcome::Selected(mut paths)
+            if paths.len() == 1 && paths[0].is_absolute() =>
+        {
+            paths.remove(0)
+        }
+        _ => return Err("The selected local path is unavailable.".to_owned()),
     };
-    let path = selected
-        .into_path()
-        .map_err(|_| "Only a user-selected local file can be observed.")?;
     tauri::async_runtime::spawn_blocking(move || {
         let time = now();
         let grant = FreshnessGrant::selected_file(&path, magi_context::CaptureLimits::default_policy().max_file_bytes, time.saturating_add(GRANT_LIFETIME.as_millis() as u64)).map_err(|_| "The selected current file cannot be authorized safely. Select a readable regular file outside credential-sensitive locations.")?;

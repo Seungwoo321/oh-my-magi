@@ -13,12 +13,10 @@ use std::{
     sync::{
         Mutex, OnceLock,
         atomic::{AtomicUsize, Ordering},
-        mpsc,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Manager, State, WebviewWindow};
-use tauri_plugin_dialog::DialogExt;
 
 const TOKEN_TTL: Duration = Duration::from_secs(600);
 const MAX_PENDING: usize = 4;
@@ -216,23 +214,26 @@ pub(crate) async fn prepare_pdf_range_capture(
     let storage = state.storage()?;
     let draft_id = draft_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     check_revision(&storage, &draft_id, context_revision)?;
-    let (sender, receiver) = mpsc::sync_channel(1);
-    app.dialog()
-        .file()
-        .add_filter("PDF", &["pdf"])
-        .pick_file(move |path| {
-            let _ = sender.send(path);
-        });
-    let selected = tauri::async_runtime::spawn_blocking(move || receiver.recv())
-        .await
-        .map_err(|_| "The PDF selection could not be processed safely.")?
-        .map_err(|_| "The PDF selection could not be processed safely.")?;
-    let Some(selected) = selected else {
-        return Ok(None);
+    let selected = crate::native_source_picker::select_request(
+        &window,
+        crate::native_source_picker::PickerRequest::SingleFile {
+            filters: vec![crate::native_source_picker::PickerFilter {
+                label: "PDF".into(),
+                extensions: vec!["pdf".into()],
+            }],
+        },
+    )
+    .await
+    .map_err(|error| error.message().to_owned())?;
+    let path = match selected {
+        crate::native_source_picker::PickerOutcome::Cancelled => return Ok(None),
+        crate::native_source_picker::PickerOutcome::Selected(mut paths)
+            if paths.len() == 1 && paths[0].is_absolute() =>
+        {
+            paths.remove(0)
+        }
+        _ => return Err("The selected local path is unavailable.".to_owned()),
     };
-    let path = selected
-        .into_path()
-        .map_err(|_| "The selected PDF is unavailable.")?;
     let resource_root = app
         .path()
         .resource_dir()

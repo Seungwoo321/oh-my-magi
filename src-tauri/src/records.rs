@@ -12,11 +12,9 @@ use std::{
     io::{Read, Write},
     path::Path,
     path::PathBuf,
-    sync::mpsc,
     time::SystemTime,
 };
 use tauri::{AppHandle, Emitter, State, WebviewWindow};
-use tauri_plugin_dialog::DialogExt;
 
 fn require_main(label: &str) -> Result<(), String> {
     if label == "main" {
@@ -408,37 +406,49 @@ fn read_selected_replay(path: &Path) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-async fn choose_file(app: &AppHandle, folder: bool) -> Result<Option<PathBuf>, String> {
-    let (sender, receiver) = mpsc::sync_channel(1);
-    let dialog = app.dialog().file();
-    if folder {
-        dialog.pick_folder(move |path| {
-            let _ = sender.send(path);
-        });
-    } else {
-        dialog
-            .add_filter("MAGI replay", &["json"])
-            .pick_file(move |path| {
-                let _ = sender.send(path);
-            });
+fn record_picker_path(
+    result: Result<
+        crate::native_source_picker::PickerOutcome,
+        crate::native_source_picker::PickerError,
+    >,
+) -> Result<Option<PathBuf>, String> {
+    use crate::native_source_picker::{PickerError, PickerOutcome};
+    match result {
+        Ok(PickerOutcome::Cancelled) => Ok(None),
+        Ok(PickerOutcome::Selected(mut paths)) if paths.len() == 1 && paths[0].is_absolute() => {
+            Ok(paths.pop())
+        }
+        Ok(PickerOutcome::Selected(_)) | Err(PickerError::InvalidSelection) => {
+            Err("record_file_denied".into())
+        }
+        Err(PickerError::TimedOut) => Err("record_dialog_timed_out".into()),
+        Err(PickerError::Unavailable) => Err("record_dialog_failed".into()),
     }
-    let path = tauri::async_runtime::spawn_blocking(move || receiver.recv())
-        .await
-        .map_err(|_| "record_dialog_failed")?
-        .map_err(|_| "record_dialog_failed")?;
-    path.map(|path| path.into_path().map_err(|_| "record_file_denied".into()))
-        .transpose()
+}
+
+async fn choose_file(window: &WebviewWindow, folder: bool) -> Result<Option<PathBuf>, String> {
+    use crate::native_source_picker::{PickerFilter, PickerRequest, select_request};
+    let request = if folder {
+        PickerRequest::Directory
+    } else {
+        PickerRequest::SingleFile {
+            filters: vec![PickerFilter {
+                label: "MAGI replay".into(),
+                extensions: vec!["json".into()],
+            }],
+        }
+    };
+    record_picker_path(select_request(window, request).await)
 }
 
 #[tauri::command]
 pub async fn import_shared_replay(
     window: WebviewWindow,
-    app: AppHandle,
     state: State<'_, DesktopState>,
 ) -> Result<Option<ExternalReplay>, String> {
     require_main(window.label())?;
     let storage = state.storage()?;
-    let Some(path) = choose_file(&app, false).await? else {
+    let Some(path) = choose_file(&window, false).await? else {
         return Ok(None);
     };
     tauri::async_runtime::spawn_blocking(move || {
@@ -494,12 +504,11 @@ pub fn list_external_replays(
 #[tauri::command]
 pub async fn create_local_backup(
     window: WebviewWindow,
-    app: AppHandle,
     state: State<'_, DesktopState>,
 ) -> Result<Option<BackupManifest>, String> {
     require_main(window.label())?;
     let storage = state.storage()?;
-    let Some(path) = choose_file(&app, true).await? else {
+    let Some(path) = choose_file(&window, true).await? else {
         return Ok(None);
     };
     tauri::async_runtime::spawn_blocking(move || {
@@ -510,15 +519,12 @@ pub async fn create_local_backup(
 }
 
 #[tauri::command]
-pub async fn restore_local_backup(
-    window: WebviewWindow,
-    app: AppHandle,
-) -> Result<Option<RestoreReceipt>, String> {
+pub async fn restore_local_backup(window: WebviewWindow) -> Result<Option<RestoreReceipt>, String> {
     require_main(window.label())?;
-    let Some(backup) = choose_file(&app, true).await? else {
+    let Some(backup) = choose_file(&window, true).await? else {
         return Ok(None);
     };
-    let Some(destination) = choose_file(&app, true).await? else {
+    let Some(destination) = choose_file(&window, true).await? else {
         return Ok(None);
     };
     tauri::async_runtime::spawn_blocking(move || {
@@ -1198,7 +1204,6 @@ pub fn preview_shared_replay(
 #[tauri::command]
 pub async fn export_shared_replay(
     window: WebviewWindow,
-    app: AppHandle,
     state: State<'_, DesktopState>,
     run_id: String,
     public_content: ReplayPublicContent,
@@ -1209,19 +1214,20 @@ pub async fn export_shared_replay(
     if replay.file_digest.as_str() != expected_digest {
         return Err("The public preview changed. Review it again before export.".into());
     }
-    let (tx, rx) = mpsc::sync_channel(1);
-    app.dialog()
-        .file()
-        .set_file_name("magi-replay.json")
-        .save_file(move |p| {
-            let _ = tx.send(p);
-        });
-    let p = tauri::async_runtime::spawn_blocking(move || rx.recv())
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())?;
-    let Some(p) = p else { return Ok(None) };
-    let p = p.into_path().map_err(|e| e.to_string())?;
+    let selected = crate::native_source_picker::select_request(
+        &window,
+        crate::native_source_picker::PickerRequest::SaveFile {
+            default_name: "magi-replay.json".into(),
+            filters: vec![crate::native_source_picker::PickerFilter {
+                label: "MAGI replay".into(),
+                extensions: vec!["json".into()],
+            }],
+        },
+    )
+    .await;
+    let Some(p) = record_picker_path(selected)? else {
+        return Ok(None);
+    };
     let b = serde_json::to_vec(&replay.data).map_err(|e| e.to_string())?;
     tauri::async_runtime::spawn_blocking(move || write_export(p, &b))
         .await

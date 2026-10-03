@@ -7,11 +7,10 @@ use std::{
     fs::{self, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock, mpsc},
+    sync::{Mutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
-use tauri::{AppHandle, State, WebviewWindow};
-use tauri_plugin_dialog::DialogExt;
+use tauri::{State, WebviewWindow};
 
 const MAX_BYTES: usize = 8 * 1024 * 1024;
 #[derive(Clone, Serialize)]
@@ -212,26 +211,28 @@ fn read_file(path: &Path) -> Result<Vec<u8>, String> {
 #[tauri::command]
 pub async fn preview_role_preset_import(
     window: WebviewWindow,
-    app: AppHandle,
 ) -> Result<Option<RoleImportPreview>, String> {
     main_only(&window)?;
-    let (tx, rx) = mpsc::sync_channel(1);
-    app.dialog()
-        .file()
-        .add_filter("Role preset", &["json"])
-        .pick_file(move |p| {
-            let _ = tx.send(p);
-        });
-    let selected = tauri::async_runtime::spawn_blocking(move || rx.recv())
-        .await
-        .map_err(|_| "The role file dialog failed.")?
-        .map_err(|_| "The role file dialog closed unexpectedly.")?;
-    let Some(path) = selected else {
-        return Ok(None);
+    let selected = crate::native_source_picker::select_request(
+        &window,
+        crate::native_source_picker::PickerRequest::SingleFile {
+            filters: vec![crate::native_source_picker::PickerFilter {
+                label: "Role preset".into(),
+                extensions: vec!["json".into()],
+            }],
+        },
+    )
+    .await
+    .map_err(|error| error.message().to_owned())?;
+    let path = match selected {
+        crate::native_source_picker::PickerOutcome::Cancelled => return Ok(None),
+        crate::native_source_picker::PickerOutcome::Selected(mut paths)
+            if paths.len() == 1 && paths[0].is_absolute() =>
+        {
+            paths.remove(0)
+        }
+        _ => return Err("The selected local path is unavailable.".to_owned()),
     };
-    let path = path
-        .into_path()
-        .map_err(|_| "The role file is not local.")?;
     let bytes = tauri::async_runtime::spawn_blocking(move || read_file(&path))
         .await
         .map_err(|_| "The role file reader failed.")??;
@@ -376,7 +377,6 @@ fn export_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
 #[tauri::command]
 pub async fn export_role_preset(
     window: WebviewWindow,
-    app: AppHandle,
     state: State<'_, DesktopState>,
     preset_id: String,
     revision: u64,
@@ -388,23 +388,24 @@ pub async fn export_role_preset(
         .map_err(|_| "The selected role revision is unavailable.")?
         .ok_or("The selected role revision is unavailable.")?;
     let bytes = canonical_json(&preset).map_err(|_| "The role export could not be encoded.")?;
-    let (tx, rx) = mpsc::sync_channel(1);
-    app.dialog()
-        .file()
-        .set_file_name("magi-roles.json")
-        .save_file(move |p| {
-            let _ = tx.send(p);
-        });
-    let selected = tauri::async_runtime::spawn_blocking(move || rx.recv())
-        .await
-        .map_err(|_| "The role export dialog failed.")?
-        .map_err(|_| "The role export dialog closed unexpectedly.")?;
-    let Some(path) = selected else {
-        return Ok(None);
+    let selected = crate::native_source_picker::select_request(
+        &window,
+        crate::native_source_picker::PickerRequest::SaveFile {
+            default_name: "magi-roles.json".into(),
+            filters: vec![],
+        },
+    )
+    .await
+    .map_err(|error| error.message().to_owned())?;
+    let path = match selected {
+        crate::native_source_picker::PickerOutcome::Cancelled => return Ok(None),
+        crate::native_source_picker::PickerOutcome::Selected(mut paths)
+            if paths.len() == 1 && paths[0].is_absolute() =>
+        {
+            paths.remove(0)
+        }
+        _ => return Err("The selected local path is unavailable.".to_owned()),
     };
-    let path = path
-        .into_path()
-        .map_err(|_| "The export destination is not local.")?;
     let digest = Digest::from_bytes(&bytes);
     tauri::async_runtime::spawn_blocking(move || export_new(&path, &bytes))
         .await
