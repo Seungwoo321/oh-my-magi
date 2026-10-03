@@ -1,14 +1,10 @@
-import type { ReactNode } from "react";
+import type { ButtonHTMLAttributes, ReactNode } from "react";
 
-export function Button({ children, onClick, tone = "secondary", disabled = false, type = "button", title }: {
+export function Button({ children, tone = "secondary", disabled = false, type = "button", className, ...attributes }: ButtonHTMLAttributes<HTMLButtonElement> & {
   children: ReactNode;
-  onClick?: () => void;
   tone?: "primary" | "secondary" | "danger";
-  disabled?: boolean;
-  type?: "button" | "submit";
-  title?: string;
 }) {
-  return <button className={`button button-${tone}`} type={type} onClick={onClick} disabled={disabled} title={title}>{children}</button>;
+  return <button {...attributes} className={`button button-${tone}${className ? ` ${className}` : ""}`} type={type} disabled={disabled}>{children}</button>;
 }
 
 export function Panel({ title, kicker, children, className = "" }: { title: string; kicker?: string; children: ReactNode; className?: string }) {

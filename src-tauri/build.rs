@@ -163,6 +163,7 @@ fn hold_build_ancestor(
 #[derive(Debug, PartialEq, Eq)]
 enum BuildPurpose {
     Verify,
+    Admit,
     Publish,
 }
 
@@ -170,6 +171,7 @@ impl BuildPurpose {
     fn parse(value: Option<&str>) -> io::Result<Self> {
         match value {
             None | Some("verify") => Ok(Self::Verify),
+            Some("admit") => Ok(Self::Admit),
             Some("publish-quiescent") => Ok(Self::Publish),
             _ => Err(io::Error::other("Unknown resource build purpose")),
         }
@@ -190,6 +192,7 @@ fn main() -> io::Result<()> {
         .transpose()?;
     match BuildPurpose::parse(purpose.as_deref())? {
         BuildPurpose::Verify => verify_existing_resources(Path::new(&out_dir)),
+        BuildPurpose::Admit => admit_existing_resources(Path::new(&out_dir)),
         BuildPurpose::Publish => {
             require_publication_authority()?;
             prepare_extraction_resources(Path::new(&out_dir))?;
@@ -216,6 +219,14 @@ fn require_publication_authority() -> io::Result<()> {
     ))
 }
 
+fn target_from_out_dir(out_dir: &Path) -> io::Result<PathBuf> {
+    out_dir
+        .ancestors()
+        .nth(3)
+        .map(Path::to_path_buf)
+        .ok_or_else(|| io::Error::other("Cargo target directory is unavailable"))
+}
+
 fn verify_existing_resources(out_dir: &Path) -> io::Result<()> {
     let manifest = Path::new(
         &std::env::var_os("CARGO_MANIFEST_DIR")
@@ -233,6 +244,395 @@ fn verify_existing_resources(out_dir: &Path) -> io::Result<()> {
     )
 }
 
+fn admit_existing_resources(out_dir: &Path) -> io::Result<()> {
+    use magi_provider::VerificationRequest;
+    use std::time::{Duration, Instant};
+
+    let out_dir = out_dir.canonicalize()?;
+    let target = target_from_out_dir(&out_dir)?;
+    let manifest = Path::new(
+        &std::env::var_os("CARGO_MANIFEST_DIR")
+            .ok_or_else(|| io::Error::other("Manifest directory is unavailable"))?,
+    )
+    .canonicalize()?;
+    let repository = manifest
+        .parent()
+        .ok_or_else(|| io::Error::other("Resource input root missing"))?;
+    let source = repository.join(
+        ".local/provider-build/codex-http-ca-preserve-backend-v1-package/codex-acp-tauri-resources",
+    );
+    let request = VerificationRequest::until(Instant::now() + Duration::from_secs(60));
+    let release_inputs = verify_release_manifest_inputs(
+        &manifest,
+        &source.join("darwin-arm64/build-manifest.json"),
+        &request,
+    )
+    .map_err(|error| io::Error::new(error.kind(), format!("provider release input: {error}")))?;
+    admit_provider_resource_tree(&source, &target, &request)
+        .map_err(|error| io::Error::new(error.kind(), format!("provider admission: {error}")))?;
+    let extraction_source = repository.join(".local/native-build/extraction");
+    admit_extraction_resource_tree(&extraction_source, &target, &manifest, &request)
+        .map_err(|error| io::Error::new(error.kind(), format!("extraction admission: {error}")))?;
+    for input in release_inputs {
+        input
+            .check()
+            .map_err(|_| io::Error::other("Provider release input changed during admission"))?;
+    }
+    Ok(())
+}
+
+struct OwnedAdmissionResource {
+    path: PathBuf,
+    identity: (u64, u64),
+    committed: bool,
+}
+
+impl OwnedAdmissionResource {
+    fn create(path: PathBuf) -> io::Result<Self> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        fs::create_dir(&path)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != unsafe { libc::geteuid() }
+        {
+            return Err(io::Error::other(
+                "Provider admission staging directory is invalid",
+            ));
+        }
+        Ok(Self {
+            path,
+            identity: (metadata.dev(), metadata.ino()),
+            committed: false,
+        })
+    }
+
+    fn publish(&mut self, destination: &Path) -> io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        match fs::symlink_metadata(destination) {
+            Ok(_) => {
+                return Err(io::Error::other(
+                    "Provider admission destination already exists",
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        fs::rename(&self.path, destination)?;
+        self.path = destination.to_owned();
+        let metadata = fs::symlink_metadata(destination)?;
+        self.identity = (metadata.dev(), metadata.ino());
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != unsafe { libc::geteuid() }
+        {
+            return Err(io::Error::other(
+                "Provider admission destination is invalid",
+            ));
+        }
+        Ok(())
+    }
+
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+
+    fn cleanup(&mut self) -> io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        if self.committed {
+            return Ok(());
+        }
+        let metadata = match fs::symlink_metadata(&self.path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.committed = true;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || (metadata.dev(), metadata.ino()) != self.identity
+        {
+            return Err(io::Error::other(
+                "Provider admission cleanup identity changed",
+            ));
+        }
+        remove_retired_resources(&self.path)?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for OwnedAdmissionResource {
+    fn drop(&mut self) {
+        if self.cleanup().is_err() {
+            eprintln!("Provider admission cleanup remains unresolved");
+        }
+    }
+}
+
+fn validate_admission_directory(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err(io::Error::other(
+            "Provider admission directory is untrusted",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_admission_directory(path: &Path, parent: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => validate_admission_directory(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            validate_admission_directory(parent)?;
+            fs::create_dir(path)?;
+            validate_admission_directory(path)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn copy_resource_tree(
+    source: &Path,
+    destination: &Path,
+    request: &magi_provider::VerificationRequest,
+    source_directories: &mut Vec<HeldBuildInput>,
+) -> io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let source_metadata = fs::symlink_metadata(source)?;
+    if !source_metadata.is_dir()
+        || source_metadata.file_type().is_symlink()
+        || source_metadata.uid() != unsafe { libc::geteuid() }
+        || source_metadata.mode() & 0o022 != 0
+    {
+        return Err(io::Error::other(
+            "Provider source resource tree is untrusted",
+        ));
+    }
+    let source_directory = HeldBuildInput::directory(source)
+        .map_err(|_| io::Error::other("Provider source directory unavailable"))?;
+    let source_directory_index = source_directories.len();
+    source_directories.push(source_directory);
+    let mut entries = fs::read_dir(source)?.collect::<io::Result<Vec<_>>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        request
+            .check()
+            .map_err(|_| io::Error::other("Provider admission expired"))?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let metadata = fs::symlink_metadata(&source_path)?;
+        if metadata.file_type().is_symlink()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o022 != 0
+        {
+            return Err(io::Error::other("Untrusted provider admission input"));
+        }
+        let mode = metadata.mode() & 0o7777 & !0o222;
+        if metadata.is_dir() {
+            fs::create_dir(&destination_path)?;
+            copy_resource_tree(&source_path, &destination_path, request, source_directories)?;
+            fs::set_permissions(&destination_path, fs::Permissions::from_mode(mode))?;
+        } else if metadata.is_file() {
+            let input = HeldBuildInput::open_with_request(&source_path, 256 * 1024 * 1024, request)
+                .map_err(|_| io::Error::other("Provider admission input unavailable"))?;
+            let mut output = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .mode(mode)
+                .open(&destination_path)?;
+            output.write_all(input.bytes())?;
+            output.sync_all()?;
+            fs::set_permissions(&destination_path, fs::Permissions::from_mode(mode))?;
+            input
+                .check()
+                .map_err(|_| io::Error::other("Provider source changed during admission"))?;
+        } else {
+            return Err(io::Error::other("Nonregular provider admission input"));
+        }
+    }
+    source_directories
+        .get(source_directory_index)
+        .expect("source directory was pushed before traversal")
+        .check()
+        .map_err(|_| io::Error::other("Provider source directory changed during admission"))?;
+    fs::set_permissions(
+        destination,
+        fs::Permissions::from_mode(source_metadata.mode() & 0o7777 & !0o222),
+    )?;
+    Ok(())
+}
+
+fn verify_fresh_resource_inodes(source: &Path, admitted: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let source_metadata = fs::symlink_metadata(source)?;
+    let admitted_metadata = fs::symlink_metadata(admitted)?;
+    if (source_metadata.dev(), source_metadata.ino())
+        == (admitted_metadata.dev(), admitted_metadata.ino())
+    {
+        return Err(io::Error::other(
+            "Provider admission reused a source directory inode",
+        ));
+    }
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let admitted_path = admitted.join(entry.file_name());
+        let source_metadata = fs::symlink_metadata(&source_path)?;
+        let admitted_metadata = fs::symlink_metadata(&admitted_path)?;
+        if source_metadata.is_dir() {
+            verify_fresh_resource_inodes(&source_path, &admitted_path)?;
+        } else if source_metadata.is_file()
+            && (source_metadata.dev(), source_metadata.ino())
+                == (admitted_metadata.dev(), admitted_metadata.ino())
+        {
+            return Err(io::Error::other(
+                "Provider admission reused a source file inode",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn admit_provider_resource_tree(
+    source: &Path,
+    target: &Path,
+    request: &magi_provider::VerificationRequest,
+) -> io::Result<()> {
+    let provider_parent = target.join("provider");
+    ensure_admission_directory(&provider_parent, target)?;
+    admit_resource_tree(source, &provider_parent.join("codex-acp"), request)
+}
+
+fn admit_extraction_resource_tree(
+    source: &Path,
+    target: &Path,
+    manifest: &Path,
+    request: &magi_provider::VerificationRequest,
+) -> io::Result<()> {
+    let source_resource = extraction_authority::verify_resource(
+        source
+            .parent()
+            .ok_or_else(|| io::Error::other("Extraction source root missing"))?,
+        |path| extraction_authority::verify_signature_with_request(path, request.clone()),
+    )
+    .map_err(|_| io::Error::other("Extraction source authority is unavailable"))?;
+    let source_input = HeldBuildInput::open_with_request(
+        &manifest.join("native/extract.swift"),
+        1024 * 1024,
+        request,
+    )
+    .map_err(|_| io::Error::other("Extraction input authority is unavailable"))?;
+    extraction_authority::validate_source_binding(&source_resource, source_input.bytes())
+        .map_err(|_| io::Error::other("Extraction source authority is missing or changed"))?;
+    let destination = target.join("extraction");
+    admit_resource_tree(source, &destination, request).map_err(|error| {
+        io::Error::new(error.kind(), format!("extraction resource copy: {error}"))
+    })?;
+    let admitted_resource = extraction_authority::verify_resource(target, |path| {
+        extraction_authority::verify_signature_with_request(path, request.clone())
+    })
+    .map_err(|_| io::Error::other("Admitted extraction authority is unavailable"))?;
+    extraction_authority::validate_source_binding(&admitted_resource, source_input.bytes())
+        .map_err(|_| io::Error::other("Admitted extraction source binding is missing"))?;
+    source_resource
+        .check()
+        .map_err(|_| io::Error::other("Extraction source changed during admission"))?;
+    admitted_resource
+        .check()
+        .map_err(|_| io::Error::other("Admitted extraction changed during admission"))?;
+    source_input
+        .check()
+        .map_err(|_| io::Error::other("Extraction input changed during admission"))?;
+    Ok(())
+}
+
+fn admit_resource_tree(
+    source: &Path,
+    destination: &Path,
+    request: &magi_provider::VerificationRequest,
+) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut source_files = std::collections::BTreeSet::new();
+    let mut source_inventory_directories = Vec::new();
+    collect_configured_resource_tree(
+        source,
+        Path::new(""),
+        &mut source_files,
+        &mut source_inventory_directories,
+    )?;
+    if source_files.len() > 256 {
+        return Err(io::Error::other(
+            "Configured resource input exceeds bounded tree",
+        ));
+    }
+    let _total_bytes = source_files.iter().try_fold(0u64, |total, relative| {
+        total
+            .checked_add(fs::symlink_metadata(source.join(relative))?.len())
+            .filter(|value| *value <= 512 * 1024 * 1024)
+            .ok_or_else(|| io::Error::other("Configured resource bytes exceed bounded input"))
+    })?;
+    let source_mode = fs::symlink_metadata(source)?.mode() & 0o7777 & !0o222;
+    let destination_parent = destination
+        .parent()
+        .ok_or_else(|| io::Error::other("Admission destination parent missing"))?;
+    validate_admission_directory(destination_parent)?;
+    match fs::symlink_metadata(destination) {
+        Ok(_) => return Err(io::Error::other("Admission destination already exists")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(io::Error::other)?
+        .as_nanos();
+    let stage = destination_parent.join(format!(
+        ".resource-admission-{}-{nonce}",
+        std::process::id()
+    ));
+    let mut owned = OwnedAdmissionResource::create(stage)?;
+    let mut copied_source_directories = Vec::new();
+    copy_resource_tree(source, &owned.path, request, &mut copied_source_directories)?;
+    // Keep the staging root writable until publication; macOS requires write
+    // access on the source directory when renaming it into place.
+    fs::set_permissions(&owned.path, fs::Permissions::from_mode(0o700))?;
+    let staged_inputs = verify_resource_tree_pair(source, &owned.path, request)?;
+    verify_fresh_resource_inodes(source, &owned.path)?;
+    for input in staged_inputs {
+        input
+            .check()
+            .map_err(|_| io::Error::other("Provider admission tree changed before publish"))?;
+    }
+    for directory in copied_source_directories {
+        directory
+            .check()
+            .map_err(|_| io::Error::other("Provider source changed before publish"))?;
+    }
+    owned.publish(destination)?;
+    fs::set_permissions(destination, fs::Permissions::from_mode(source_mode))?;
+    let admitted_inputs = verify_resource_tree_pair(source, destination, request)?;
+    verify_fresh_resource_inodes(source, destination)?;
+    for input in admitted_inputs {
+        input
+            .check()
+            .map_err(|_| io::Error::other("Provider admission tree changed after publish"))?;
+    }
+    owned.commit();
+    Ok(())
+}
+
 fn verify_existing_resources_with(
     out_dir: &Path,
     manifest: &Path,
@@ -241,10 +641,7 @@ fn verify_existing_resources_with(
 ) -> io::Result<()> {
     validate_configuration_override(configuration_override)?;
     let out_dir = out_dir.canonicalize()?;
-    let target = out_dir
-        .ancestors()
-        .nth(3)
-        .ok_or_else(|| io::Error::other("Cargo target directory is unavailable"))?;
+    let target = target_from_out_dir(&out_dir)?;
     let helper_candidate = manifest
         .parent()
         .ok_or_else(|| io::Error::other("Resource input root missing"))?
@@ -252,8 +649,8 @@ fn verify_existing_resources_with(
     verify_existing_authorities(
         &out_dir,
         manifest,
-        target,
-        target,
+        &target,
+        &target,
         &helper_candidate,
         codegen,
     )
@@ -538,63 +935,57 @@ fn verify_configured_helper_inputs(
     Ok(held)
 }
 
-fn verify_configured_candidate_inputs(
-    manifest: &Path,
-    target: &Path,
+fn collect_configured_resource_tree(
+    path: &Path,
+    relative: &Path,
+    files: &mut std::collections::BTreeSet<std::path::PathBuf>,
+    directories: &mut Vec<HeldBuildInput>,
+) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err(io::Error::other("Untrusted configured resource input"));
+    }
+    if files.len() + directories.len() >= 256 || relative.components().count() > 16 {
+        return Err(io::Error::other(
+            "Configured resource input exceeds bounded tree",
+        ));
+    }
+    if metadata.is_file() {
+        files.insert(relative.to_owned());
+    } else if metadata.is_dir() {
+        directories.push(
+            HeldBuildInput::directory(path)
+                .map_err(|_| io::Error::other("Configured resource directory unavailable"))?,
+        );
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            collect_configured_resource_tree(
+                &entry.path(),
+                &relative.join(entry.file_name()),
+                files,
+                directories,
+            )?;
+        }
+    } else {
+        return Err(io::Error::other("Nonregular configured resource input"));
+    }
+    Ok(())
+}
+
+fn verify_resource_tree_pair(
+    source: &Path,
+    admitted: &Path,
     request: &magi_provider::VerificationRequest,
 ) -> io::Result<Vec<HeldBuildInput>> {
-    fn visit(
-        path: &Path,
-        relative: &Path,
-        files: &mut std::collections::BTreeSet<std::path::PathBuf>,
-        directories: &mut Vec<HeldBuildInput>,
-    ) -> io::Result<()> {
-        use std::os::unix::fs::MetadataExt;
-        let metadata = fs::symlink_metadata(path)?;
-        if metadata.file_type().is_symlink()
-            || metadata.uid() != unsafe { libc::geteuid() }
-            || metadata.mode() & 0o022 != 0
-        {
-            return Err(io::Error::other("Untrusted configured resource input"));
-        }
-        if files.len() + directories.len() >= 256 || relative.components().count() > 16 {
-            return Err(io::Error::other(
-                "Configured resource input exceeds bounded tree",
-            ));
-        }
-        if metadata.is_file() {
-            files.insert(relative.to_owned());
-        } else if metadata.is_dir() {
-            directories.push(
-                HeldBuildInput::directory(path)
-                    .map_err(|_| io::Error::other("Configured resource directory unavailable"))?,
-            );
-            for entry in fs::read_dir(path)? {
-                let entry = entry?;
-                visit(
-                    &entry.path(),
-                    &relative.join(entry.file_name()),
-                    files,
-                    directories,
-                )?;
-            }
-        } else {
-            return Err(io::Error::other("Nonregular configured resource input"));
-        }
-        Ok(())
-    }
-    let repository = manifest
-        .parent()
-        .ok_or_else(|| io::Error::other("Resource input root missing"))?;
-    let source = repository.join(
-        ".local/provider-build/codex-http-ca-preserve-backend-v1-package/codex-acp-tauri-resources",
-    );
-    let admitted = target.join("provider/codex-acp");
     let mut source_files = std::collections::BTreeSet::new();
     let mut admitted_files = std::collections::BTreeSet::new();
     let mut held = Vec::new();
-    visit(&source, Path::new(""), &mut source_files, &mut held)?;
-    visit(&admitted, Path::new(""), &mut admitted_files, &mut held)?;
+    collect_configured_resource_tree(source, Path::new(""), &mut source_files, &mut held)?;
+    collect_configured_resource_tree(admitted, Path::new(""), &mut admitted_files, &mut held)?;
     if source_files != admitted_files || source_files.len() > 256 {
         return Err(io::Error::other("Configured provider resource set differs"));
     }
@@ -644,20 +1035,43 @@ fn verify_configured_candidate_inputs(
     Ok(held)
 }
 
-fn verify_release_inputs(
+fn verify_configured_candidate_inputs(
     manifest: &Path,
     target: &Path,
     request: &magi_provider::VerificationRequest,
 ) -> io::Result<Vec<HeldBuildInput>> {
     let repository = manifest
         .parent()
-        .ok_or_else(|| io::Error::other("Release input root missing"))?;
-    let authority = HeldBuildInput::open_with_request(
+        .ok_or_else(|| io::Error::other("Resource input root missing"))?;
+    let source = repository.join(
+        ".local/provider-build/codex-http-ca-preserve-backend-v1-package/codex-acp-tauri-resources",
+    );
+    let admitted = target.join("provider/codex-acp");
+    verify_resource_tree_pair(&source, &admitted, request)
+}
+
+fn verify_release_inputs(
+    manifest: &Path,
+    target: &Path,
+    request: &magi_provider::VerificationRequest,
+) -> io::Result<Vec<HeldBuildInput>> {
+    verify_release_manifest_inputs(
+        manifest,
         &target.join("provider/codex-acp/darwin-arm64/build-manifest.json"),
-        65_536,
         request,
     )
-    .map_err(|_| io::Error::other("Provider manifest input unavailable"))?;
+}
+
+fn verify_release_manifest_inputs(
+    manifest: &Path,
+    authority_path: &Path,
+    request: &magi_provider::VerificationRequest,
+) -> io::Result<Vec<HeldBuildInput>> {
+    let repository = manifest
+        .parent()
+        .ok_or_else(|| io::Error::other("Release input root missing"))?;
+    let authority = HeldBuildInput::open_with_request(authority_path, 65_536, request)
+        .map_err(|_| io::Error::other("Provider manifest input unavailable"))?;
     let signed: serde_json::Value = serde_json::from_slice(authority.bytes())?;
     if signed.get("schema_version") != Some(&serde_json::json!(5)) {
         return Err(io::Error::other(
@@ -700,7 +1114,8 @@ fn verify_release_inputs(
 fn validate_resource_configuration(config: &serde_json::Value) -> io::Result<()> {
     let expected = serde_json::json!({
         "../.local/provider-build/codex-http-ca-preserve-backend-v1-package/codex-acp-tauri-resources/": "provider/codex-acp/",
-        "../.local/native-build/extraction/": "extraction/"
+        "../.local/native-build/extraction/": "extraction/",
+        "../docs/SECURITY.md": "policy/SECURITY.md"
     });
     if config.pointer("/bundle/resources") != Some(&expected)
         || config

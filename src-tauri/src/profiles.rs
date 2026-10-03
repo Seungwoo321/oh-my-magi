@@ -58,6 +58,9 @@ const CODEX_ACP_RESOURCE_RELATIVE_PATH: &str = "provider/codex-acp";
 const CODEX_ACP_ARM64_UPSTREAM_ARTIFACT_SHA256: &str =
     "69a7752a9092ea7734518e59ddcba808bcf4b216737539b50382005055b6aa01";
 const PROFILE_REVISION_LOCK_FILE: &str = ".magi-provider-profile-revision.lock";
+const MALFORMED_OUTPUT_CORRECTION_LIMIT: u8 = 1;
+const MAX_LIVE_RUN_APP_TURN_REQUESTS: u16 =
+    (LIVE_RUN_DISPATCH_CAPACITY as u16) * (1 + MALFORMED_OUTPUT_CORRECTION_LIMIT as u16);
 
 fn provider_source_scope_gate(profile_id: &str) -> Arc<Mutex<()>> {
     static GATES: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
@@ -3190,8 +3193,14 @@ async fn spawn_verified_client_for_authority(
         .ok_or(ProviderError::Unauthenticated)?;
     let subscription =
         credential_homes::broker(authority).map_err(|_| ProviderError::Unauthenticated)?;
-    let profile_home = inspect_profile_home(app, &profile.runtime_home_id)
+    let provisioned_home = ensure_profile_home(app, &profile.runtime_home_id)
         .map_err(|_| ProviderError::ProfileHomeUnavailable)?;
+    let inspected_profile_home = inspect_profile_home(app, &profile.runtime_home_id)
+        .map_err(|_| ProviderError::ProfileHomeUnavailable)?;
+    if inspected_profile_home != provisioned_home.path {
+        return Err(ProviderError::ProfileHomeUnavailable);
+    }
+    let profile_home = provisioned_home.path;
     let storage = app
         .state::<DesktopState>()
         .storage()
@@ -3928,6 +3937,281 @@ struct DeliberationSource<'a> {
     content: &'a str,
 }
 
+const MAX_AGGREGATE_TRANSITION_DIAGNOSTIC_BYTES: usize = 2_048;
+const MAX_AGGREGATE_TRANSITION_DIAGNOSTIC_TOKEN_CHARS: usize = 96;
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AggregateValidationCounters {
+    claims: u16,
+    assumptions: u16,
+    information_gaps: u16,
+    counterarguments: u16,
+    claim_responses: u16,
+    position_changes: u16,
+    proposal_claims: u16,
+    conditions: u16,
+    alternatives: u16,
+    open_objections: u16,
+    objection_refs: u16,
+}
+
+impl AggregateValidationCounters {
+    fn for_assessment(assessment: &RoleAssessment) -> Self {
+        Self {
+            claims: bounded_diagnostic_count(assessment.claims.len()),
+            assumptions: bounded_diagnostic_count(assessment.assumptions.len()),
+            information_gaps: bounded_diagnostic_count(assessment.information_gaps.len()),
+            counterarguments: bounded_diagnostic_count(assessment.counterarguments.len()),
+            claim_responses: bounded_diagnostic_count(assessment.claim_responses.len()),
+            position_changes: bounded_diagnostic_count(assessment.position_changes.len()),
+            proposal_claims: 0,
+            conditions: 0,
+            alternatives: 0,
+            open_objections: 0,
+            objection_refs: 0,
+        }
+    }
+
+    fn for_proposal(proposal: &ProposalSnapshot) -> Self {
+        Self {
+            claims: 0,
+            assumptions: 0,
+            information_gaps: 0,
+            counterarguments: 0,
+            claim_responses: 0,
+            position_changes: 0,
+            proposal_claims: bounded_diagnostic_count(proposal.claims.len()),
+            conditions: bounded_diagnostic_count(proposal.conditions.len()),
+            alternatives: bounded_diagnostic_count(proposal.alternatives.len()),
+            open_objections: bounded_diagnostic_count(proposal.open_objections.len()),
+            objection_refs: 0,
+        }
+    }
+
+    fn for_ballot(ballot: &Ballot) -> Self {
+        Self {
+            claims: 0,
+            assumptions: 0,
+            information_gaps: 0,
+            counterarguments: 0,
+            claim_responses: 0,
+            position_changes: 0,
+            proposal_claims: 0,
+            conditions: 0,
+            alternatives: 0,
+            open_objections: 0,
+            objection_refs: bounded_diagnostic_count(ballot.objection_refs.len()),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AggregateTransitionDiagnostic {
+    domain_code: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    domain_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    validation_code: Option<&'static str>,
+    validation_issue_count: u16,
+    stage: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    core_id: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile_revision: Option<u64>,
+    slot: u8,
+    revision: u64,
+    validation_counters: AggregateValidationCounters,
+}
+
+fn bounded_diagnostic_count(count: usize) -> u16 {
+    count.min(usize::from(u16::MAX)) as u16
+}
+
+fn bounded_diagnostic_path(path: &str) -> Option<String> {
+    let path = path
+        .chars()
+        .filter(|character| {
+            matches!(
+                character,
+                'a'..='z'
+                    | 'A'..='Z'
+                    | '0'..='9'
+                    | '.'
+                    | '_'
+                    | '-'
+                    | '['
+                    | ']'
+            )
+        })
+        .take(MAX_AGGREGATE_TRANSITION_DIAGNOSTIC_TOKEN_CHARS)
+        .collect::<String>();
+    (!path.is_empty()).then_some(path)
+}
+
+fn bounded_diagnostic_profile_id(profile_id: &str) -> Option<String> {
+    bounded_diagnostic_path(profile_id)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AggregateTransitionRejectionCode {
+    Validation,
+    InvalidTransition,
+    RevisionConflict,
+    IdempotencyConflict,
+    DuplicateResult,
+    Precondition,
+    ProposalAlreadyFrozen,
+    ProposalMissing,
+    TerminalRun,
+    Serialization,
+}
+
+impl AggregateTransitionRejectionCode {
+    const fn as_wire_name(self) -> &'static str {
+        match self {
+            Self::Validation => "validation",
+            Self::InvalidTransition => "invalid_transition",
+            Self::RevisionConflict => "revision_conflict",
+            Self::IdempotencyConflict => "idempotency_conflict",
+            Self::DuplicateResult => "duplicate_result",
+            Self::Precondition => "precondition",
+            Self::ProposalAlreadyFrozen => "proposal_already_frozen",
+            Self::ProposalMissing => "proposal_missing",
+            Self::TerminalRun => "terminal_run",
+            Self::Serialization => "serialization",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct AggregateTransitionRejection {
+    code: AggregateTransitionRejectionCode,
+    path: Option<String>,
+    validation_code: Option<&'static str>,
+    validation_issue_count: u16,
+}
+
+fn aggregate_transition_rejection(
+    error: &magi_domain::DomainError,
+) -> AggregateTransitionRejection {
+    match error {
+        magi_domain::DomainError::Validation(issues) => {
+            let first = issues.first();
+            AggregateTransitionRejection {
+                code: AggregateTransitionRejectionCode::Validation,
+                path: first.and_then(|issue| bounded_diagnostic_path(&issue.path)),
+                validation_code: first.map(|issue| issue.code),
+                validation_issue_count: bounded_diagnostic_count(issues.len()),
+            }
+        }
+        magi_domain::DomainError::InvalidTransition { .. } => AggregateTransitionRejection {
+            code: AggregateTransitionRejectionCode::InvalidTransition,
+            path: None,
+            validation_code: None,
+            validation_issue_count: 0,
+        },
+        magi_domain::DomainError::RevisionConflict { .. } => AggregateTransitionRejection {
+            code: AggregateTransitionRejectionCode::RevisionConflict,
+            path: None,
+            validation_code: None,
+            validation_issue_count: 0,
+        },
+        magi_domain::DomainError::IdempotencyConflict => AggregateTransitionRejection {
+            code: AggregateTransitionRejectionCode::IdempotencyConflict,
+            path: None,
+            validation_code: None,
+            validation_issue_count: 0,
+        },
+        magi_domain::DomainError::DuplicateResult(_) => AggregateTransitionRejection {
+            code: AggregateTransitionRejectionCode::DuplicateResult,
+            path: None,
+            validation_code: None,
+            validation_issue_count: 0,
+        },
+        magi_domain::DomainError::Precondition { .. } => AggregateTransitionRejection {
+            code: AggregateTransitionRejectionCode::Precondition,
+            path: None,
+            validation_code: None,
+            validation_issue_count: 0,
+        },
+        magi_domain::DomainError::ProposalAlreadyFrozen => AggregateTransitionRejection {
+            code: AggregateTransitionRejectionCode::ProposalAlreadyFrozen,
+            path: None,
+            validation_code: None,
+            validation_issue_count: 0,
+        },
+        magi_domain::DomainError::ProposalMissing => AggregateTransitionRejection {
+            code: AggregateTransitionRejectionCode::ProposalMissing,
+            path: None,
+            validation_code: None,
+            validation_issue_count: 0,
+        },
+        magi_domain::DomainError::TerminalRun => AggregateTransitionRejection {
+            code: AggregateTransitionRejectionCode::TerminalRun,
+            path: None,
+            validation_code: None,
+            validation_issue_count: 0,
+        },
+        magi_domain::DomainError::Serialization(_) => AggregateTransitionRejection {
+            code: AggregateTransitionRejectionCode::Serialization,
+            path: None,
+            validation_code: None,
+            validation_issue_count: 0,
+        },
+    }
+}
+
+fn aggregate_transition_failure(
+    state: &magi_domain::RunPersistenceState,
+    turn: DeliberationTurn,
+    error: magi_domain::DomainError,
+    validation_counters: AggregateValidationCounters,
+) -> LiveRunDispatchFailure {
+    let rejection = aggregate_transition_rejection(&error);
+    let failure_code = if rejection.code == AggregateTransitionRejectionCode::Validation {
+        "provider_output_invalid"
+    } else {
+        "aggregate_transition_rejected"
+    };
+    let profile_binding = state
+        .input
+        .role_set
+        .roles
+        .iter()
+        .find(|role| role.core_id == turn.binding_core())
+        .and_then(|role| role.catalog_binding.as_ref());
+    let diagnostic = AggregateTransitionDiagnostic {
+        domain_code: rejection.code.as_wire_name(),
+        domain_path: rejection.path,
+        validation_code: rejection.validation_code,
+        validation_issue_count: rejection.validation_issue_count,
+        stage: turn.stage(),
+        core_id: turn.core().map(CoreId::wire_name),
+        profile_id: profile_binding
+            .and_then(|binding| bounded_diagnostic_profile_id(&binding.provider_profile_id)),
+        profile_revision: profile_binding.map(|binding| binding.profile_revision),
+        slot: turn.slot(),
+        revision: state.run.revision,
+        validation_counters,
+    };
+    let detail = serde_json::to_string(&diagnostic)
+        .ok()
+        .filter(|encoded| encoded.len() <= MAX_AGGREGATE_TRANSITION_DIAGNOSTIC_BYTES)
+        .map(|encoded| {
+            format!(
+                "The frozen deliberation state rejected the typed transition. diagnostic={encoded}"
+            )
+        })
+        .unwrap_or_else(|| {
+            "The frozen deliberation state rejected the typed transition.".to_owned()
+        });
+    LiveRunDispatchFailure::new(failure_code, &detail, false, false)
+}
+
 fn deliberation_error(
     code: &'static str,
     detail: &'static str,
@@ -3949,6 +4233,16 @@ fn deliberation_output_schema(turn: DeliberationTurn) -> Result<String, LiveRunD
             false,
         )
     })
+}
+
+fn malformed_output_correction_prompt(
+    original_prompt: &str,
+    failure: &LiveRunDispatchFailure,
+) -> String {
+    format!(
+        "The previous JSON response for this same deliberation slot was rejected by the frozen output validator ({:?}). This is the one allowed correction attempt for this slot. Keep the frozen run input, role, stage, proposal digest, and JSON Schema unchanged. Re-read approved_sources and copy every source_fact source_id, object_digest, and locator byte-for-byte from one approved source tuple. Do not invent evidence; omit source_fact when no approved evidence exists. Return exactly one corrected JSON object with no prose or markdown.\n\nOriginal contract:\n{}",
+        failure.failure.code, original_prompt
+    )
 }
 
 fn deliberation_turn_prompt(
@@ -4037,6 +4331,7 @@ fn accept_deliberation_output(
     output: &str,
 ) -> Result<(), LiveRunDispatchFailure> {
     let state = aggregate.persistence_state();
+    let diagnostic_state = state.clone();
     let at = now_rfc3339();
     match turn {
         DeliberationTurn::Assessment(stage, core_id) => {
@@ -4074,13 +4369,17 @@ fn accept_deliberation_output(
                 position_changes: draft.position_changes,
                 created_at: at.clone(),
             };
-            aggregate.accept_assessment(assessment, at).map_err(|_| {
-                deliberation_error(
-                    "aggregate_transition_rejected",
-                    "The review could not be accepted by the frozen deliberation state.",
-                    false,
-                )
-            })
+            let validation_counters = AggregateValidationCounters::for_assessment(&assessment);
+            aggregate
+                .accept_assessment(assessment, at)
+                .map_err(|error| {
+                    aggregate_transition_failure(
+                        &diagnostic_state,
+                        turn,
+                        error,
+                        validation_counters,
+                    )
+                })
         }
         DeliberationTurn::Synthesis => {
             let draft: ProposalTurnOutput = serde_json::from_str(output).map_err(|_| {
@@ -4159,12 +4458,9 @@ fn accept_deliberation_output(
                     false,
                 )
             })?;
-            aggregate.freeze_proposal(proposal, at).map_err(|_| {
-                deliberation_error(
-                    "aggregate_transition_rejected",
-                    "The proposal could not be frozen by the deliberation state.",
-                    false,
-                )
+            let validation_counters = AggregateValidationCounters::for_proposal(&proposal);
+            aggregate.freeze_proposal(proposal, at).map_err(|error| {
+                aggregate_transition_failure(&diagnostic_state, turn, error, validation_counters)
             })
         }
         DeliberationTurn::Ballot(core_id) => {
@@ -4196,12 +4492,9 @@ fn accept_deliberation_output(
                 objection_refs: draft.objection_refs,
                 created_at: at.clone(),
             };
-            aggregate.accept_ballot(ballot, at).map_err(|_| {
-                deliberation_error(
-                    "aggregate_transition_rejected",
-                    "The private ballot could not be accepted by the frozen proposal.",
-                    false,
-                )
+            let validation_counters = AggregateValidationCounters::for_ballot(&ballot);
+            aggregate.accept_ballot(ballot, at).map_err(|error| {
+                aggregate_transition_failure(&diagnostic_state, turn, error, validation_counters)
             })
         }
     }
@@ -4528,6 +4821,7 @@ async fn dispatch_deliberation_run(
         return;
     }
 
+    let mut app_turn_requests = 0u16;
     for slot_ordinal in 0..LIVE_RUN_DISPATCH_CAPACITY {
         if control.check_effect_authority().is_err() {
             return;
@@ -4592,41 +4886,15 @@ async fn dispatch_deliberation_run(
                 return;
             }
         };
-        let output = run_deliberation_provider_turn(
-            ProviderRunContext {
-                app,
-                storage,
-                claim: &claim,
-            },
-            turn,
-            &prompt,
-            slot_ordinal == 0,
-            &provider_operations,
-            &control,
-        )
-        .await
-        .map_err(|failure| {
-            match aggregate
-                .input()
-                .role_set
-                .roles
-                .iter()
-                .find(|role| role.core_id == turn.binding_core())
-                .and_then(|role| role.catalog_binding.as_ref())
-            {
-                Some(binding) => failure
-                    .with_auth_profile(&binding.provider_profile_id, binding.profile_revision),
-                None => failure,
-            }
-        });
-        let output = match output {
-            Ok(output) => output,
-            Err(failure) => {
-                if control.check_effect_authority().is_err()
-                    || failure.failure.code == "dispatch_fenced"
-                {
-                    return;
-                }
+        let mut turn_prompt = prompt;
+        let mut correction_attempts = 0u8;
+        let expected_revision = loop {
+            if app_turn_requests >= MAX_LIVE_RUN_APP_TURN_REQUESTS {
+                let failure = deliberation_error(
+                    "dispatch_budget_exhausted",
+                    "The deliberation reached its bounded app-turn request budget.",
+                    false,
+                );
                 persist_deliberation_failure(
                     app,
                     storage,
@@ -4638,23 +4906,81 @@ async fn dispatch_deliberation_run(
                 emit_run_progress(app, &claim.run_id, turn, "failed", None);
                 return;
             }
+            app_turn_requests += 1;
+            let output = run_deliberation_provider_turn(
+                ProviderRunContext {
+                    app,
+                    storage,
+                    claim: &claim,
+                },
+                turn,
+                &turn_prompt,
+                slot_ordinal == 0 && correction_attempts == 0,
+                &provider_operations,
+                &control,
+            )
+            .await
+            .map_err(|failure| {
+                match aggregate
+                    .input()
+                    .role_set
+                    .roles
+                    .iter()
+                    .find(|role| role.core_id == turn.binding_core())
+                    .and_then(|role| role.catalog_binding.as_ref())
+                {
+                    Some(binding) => failure
+                        .with_auth_profile(&binding.provider_profile_id, binding.profile_revision),
+                    None => failure,
+                }
+            });
+            let output = match output {
+                Ok(output) => output,
+                Err(failure) => {
+                    if control.check_effect_authority().is_err()
+                        || failure.failure.code == "dispatch_fenced"
+                    {
+                        return;
+                    }
+                    persist_deliberation_failure(
+                        app,
+                        storage,
+                        &claim,
+                        &mut aggregate,
+                        Some(slot_ordinal),
+                        failure,
+                    );
+                    emit_run_progress(app, &claim.run_id, turn, "failed", None);
+                    return;
+                }
+            };
+            if control.check_effect_authority().is_err() {
+                return;
+            }
+            let expected_revision = aggregate.run().revision;
+            match accept_deliberation_output(&mut aggregate, turn, &output) {
+                Ok(()) => break expected_revision,
+                Err(failure)
+                    if failure.failure.code == "provider_output_invalid"
+                        && correction_attempts < MALFORMED_OUTPUT_CORRECTION_LIMIT =>
+                {
+                    correction_attempts += 1;
+                    turn_prompt = malformed_output_correction_prompt(&turn_prompt, &failure);
+                }
+                Err(failure) => {
+                    persist_deliberation_failure(
+                        app,
+                        storage,
+                        &claim,
+                        &mut aggregate,
+                        Some(slot_ordinal),
+                        failure,
+                    );
+                    emit_run_progress(app, &claim.run_id, turn, "failed", None);
+                    return;
+                }
+            }
         };
-        if control.check_effect_authority().is_err() {
-            return;
-        }
-        let expected_revision = aggregate.run().revision;
-        if let Err(failure) = accept_deliberation_output(&mut aggregate, turn, &output) {
-            persist_deliberation_failure(
-                app,
-                storage,
-                &claim,
-                &mut aggregate,
-                Some(slot_ordinal),
-                failure,
-            );
-            emit_run_progress(app, &claim.run_id, turn, "failed", None);
-            return;
-        }
         if storage
             .commit_aggregate_dispatch_transition(
                 &claim,
@@ -6023,6 +6349,7 @@ fn require_durable_stream_equality(
     }
 }
 
+#[derive(Debug)]
 struct LiveRunDispatchFailure {
     failure: LiveRunFailure,
     security_violation: bool,
@@ -6497,6 +6824,18 @@ fn ensure_profile_home(app: &AppHandle, runtime_home_id: &str) -> Result<Provisi
         .map_err(|_| "The application data location is unavailable.")?;
     let data_root = fs::canonicalize(data_root)
         .map_err(|_| "The application data location could not be inspected safely.")?;
+    ensure_profile_home_at(&data_root, runtime_home_id)
+}
+
+fn ensure_profile_home_at(
+    data_root: &Path,
+    runtime_home_id: &str,
+) -> Result<ProvisionedHome, String> {
+    if !is_safe_path_component(runtime_home_id) {
+        return Err("The local provider home binding is invalid.".into());
+    }
+    let data_root = fs::canonicalize(data_root)
+        .map_err(|_| "The application data location could not be inspected safely.")?;
     let provider_root = data_root.join("provider-homes");
     ensure_private_directory(&provider_root)?;
     let canonical_provider_root = fs::canonicalize(&provider_root)
@@ -6527,6 +6866,15 @@ fn inspect_profile_home(app: &AppHandle, runtime_home_id: &str) -> Result<PathBu
         .path()
         .app_data_dir()
         .map_err(|_| "The application data location is unavailable.")?;
+    let data_root = fs::canonicalize(data_root)
+        .map_err(|_| "The application data location could not be inspected safely.")?;
+    inspect_profile_home_at(&data_root, runtime_home_id)
+}
+
+fn inspect_profile_home_at(data_root: &Path, runtime_home_id: &str) -> Result<PathBuf, String> {
+    if !is_safe_path_component(runtime_home_id) {
+        return Err("The provider home binding is invalid.".into());
+    }
     let data_root = fs::canonicalize(data_root)
         .map_err(|_| "The application data location could not be inspected safely.")?;
     let provider_root = data_root.join("provider-homes");
@@ -6593,6 +6941,100 @@ fn is_safe_path_component(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+#[cfg(test)]
+mod profile_home_tests {
+    use super::*;
+
+    struct TestRoot(PathBuf);
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn restored_profile_rows_materialize_missing_and_existing_homes_safely() {
+        let root = std::env::temp_dir().join(format!("profile-home-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let _cleanup = TestRoot(root.clone());
+        let source = root.join("source");
+        let storage = Storage::open_or_create(&source).unwrap();
+        let runtime_home_ids = [
+            "runtime-restored-0",
+            "runtime-restored-1",
+            "runtime-restored-2",
+        ];
+        for (index, runtime_home_id) in runtime_home_ids.iter().enumerate() {
+            storage
+                .save_provider_profile(
+                    &ProviderProfileInput {
+                        provider_profile_id: format!("profile-{index}"),
+                        provider_id: CODEX_ACP_PROVIDER.into(),
+                        display_name: format!("Profile {index}"),
+                        account_alias: format!("account-{index}"),
+                        authentication_method: ProviderAuthenticationMethod::LocalSubscription,
+                        secret_reference: None,
+                        runtime_home_id: (*runtime_home_id).into(),
+                        credential_home: None,
+                    },
+                    None,
+                    "2026-10-03T00:00:00Z",
+                )
+                .unwrap();
+        }
+        let backup = root.join("backup");
+        storage.create_backup(&backup).unwrap();
+        drop(storage);
+
+        let restored = root.join("restored");
+        Storage::restore_backup(&backup, &restored).unwrap();
+        let restored_storage = Storage::open_or_create(&restored).unwrap();
+        for (index, runtime_home_id) in runtime_home_ids.iter().enumerate() {
+            let profile = restored_storage
+                .load_provider_profile(&format!("profile-{index}"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(profile.runtime_home_id, *runtime_home_id);
+        }
+        drop(restored_storage);
+
+        let provider_root = restored.join("provider-homes");
+        assert!(!provider_root.exists());
+        let first = ensure_profile_home_at(&restored, runtime_home_ids[0]).unwrap();
+        assert!(first.created);
+        assert!(first.path.is_dir());
+        assert_eq!(
+            first.path,
+            inspect_profile_home_at(&restored, runtime_home_ids[0]).unwrap()
+        );
+
+        let existing_path = provider_root.join(runtime_home_ids[1]);
+        fs::create_dir(&existing_path).unwrap();
+        let second = ensure_profile_home_at(&restored, runtime_home_ids[1]).unwrap();
+        assert!(!second.created);
+        assert_eq!(second.path, fs::canonicalize(existing_path).unwrap());
+        assert_eq!(
+            fs::symlink_metadata(&second.path).unwrap().mode() & 0o777,
+            0o700
+        );
+
+        let third = ensure_profile_home_at(&restored, runtime_home_ids[2]).unwrap();
+        assert!(third.created);
+        assert_eq!(
+            third.path,
+            inspect_profile_home_at(&restored, runtime_home_ids[2]).unwrap()
+        );
+
+        assert!(ensure_profile_home_at(&restored, "../outside").is_err());
+        assert!(inspect_profile_home_at(&restored, "runtime/escape").is_err());
+        let outside = root.join("outside");
+        fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, provider_root.join("runtime-symlink")).unwrap();
+        assert!(ensure_profile_home_at(&restored, "runtime-symlink").is_err());
+    }
 }
 
 #[cfg(test)]
@@ -8377,6 +8819,179 @@ pub(crate) mod catalog_selection_ipc_tests {
             RunStatus::Completed { .. }
         ));
         assert_eq!(aggregate.snapshot(0).ballots_revealed.unwrap().len(), 3);
+    }
+
+    #[test]
+    fn aggregate_transition_diagnostics_preserve_domain_causes_without_payload_logging() {
+        let independent =
+            DeliberationTurn::Assessment(AssessmentStage::IndependentReview, CoreId::Melchior1);
+        let parse_diagnostic = |failure: &LiveRunDispatchFailure| {
+            let encoded = failure
+                .failure
+                .detail
+                .split_once("diagnostic=")
+                .map(|(_, encoded)| encoded)
+                .expect("aggregate rejection must include a typed diagnostic");
+            serde_json::from_str::<serde_json::Value>(encoded).unwrap()
+        };
+
+        let mut invalid_aggregate = typed_turn_aggregate();
+        let invalid_before = invalid_aggregate.persistence_state();
+        let mut invalid_output = lawful_review();
+        invalid_output["claims"][0]["kind"] = serde_json::json!("source_fact");
+        invalid_output["claims"][0]["text"] = serde_json::json!("secret-body-canary");
+        let validation_failure = accept_deliberation_output(
+            &mut invalid_aggregate,
+            independent,
+            &invalid_output.to_string(),
+        )
+        .unwrap_err();
+        let validation_diagnostic = parse_diagnostic(&validation_failure);
+        assert_eq!(validation_failure.failure.code, "provider_output_invalid");
+        assert_eq!(validation_diagnostic["domainCode"], "validation");
+        assert_eq!(
+            validation_diagnostic["domainPath"],
+            "claims[0].evidence_refs"
+        );
+        assert_eq!(
+            validation_diagnostic["validationCode"],
+            "source_fact_without_evidence"
+        );
+        assert_eq!(validation_diagnostic["validationIssueCount"], 1);
+        assert_eq!(validation_diagnostic["stage"], "independent_review");
+        assert_eq!(validation_diagnostic["coreId"], "MELCHIOR-1");
+        assert_eq!(validation_diagnostic["profileId"], "profile-MELCHIOR-1");
+        assert_eq!(validation_diagnostic["profileRevision"], 0);
+        assert_eq!(validation_diagnostic["slot"], 0);
+        assert_eq!(
+            validation_diagnostic["revision"],
+            invalid_before.run.revision
+        );
+        assert_eq!(validation_diagnostic["validationCounters"]["claims"], 1);
+        assert_eq!(invalid_aggregate.persistence_state(), invalid_before);
+        assert!(!validation_failure.failure.external_effect_unknown);
+        assert!(
+            !validation_failure
+                .failure
+                .detail
+                .contains("secret-body-canary")
+        );
+        assert!(!validation_failure.failure.detail.contains("typed-question"));
+
+        let mut duplicate_aggregate = typed_turn_aggregate();
+        let valid_output = lawful_review().to_string();
+        accept_deliberation_output(&mut duplicate_aggregate, independent, &valid_output).unwrap();
+        let duplicate_before = duplicate_aggregate.persistence_state();
+        let duplicate_failure =
+            accept_deliberation_output(&mut duplicate_aggregate, independent, &valid_output)
+                .unwrap_err();
+        let duplicate_diagnostic = parse_diagnostic(&duplicate_failure);
+        assert_eq!(
+            duplicate_failure.failure.code,
+            "aggregate_transition_rejected"
+        );
+        assert_eq!(duplicate_diagnostic["domainCode"], "duplicate_result");
+        assert!(duplicate_diagnostic.get("domainPath").is_none());
+        assert!(duplicate_diagnostic.get("validationCode").is_none());
+        assert_eq!(duplicate_diagnostic["stage"], "independent_review");
+        assert_eq!(duplicate_diagnostic["coreId"], "MELCHIOR-1");
+        assert_eq!(duplicate_diagnostic["slot"], 0);
+        assert_eq!(
+            duplicate_diagnostic["revision"],
+            duplicate_before.run.revision
+        );
+        assert_eq!(duplicate_diagnostic["validationIssueCount"], 0);
+        assert_eq!(duplicate_diagnostic["validationCounters"]["claims"], 1);
+        assert_eq!(duplicate_aggregate.persistence_state(), duplicate_before);
+        assert!(!duplicate_failure.failure.external_effect_unknown);
+        assert!(
+            !duplicate_failure
+                .failure
+                .detail
+                .contains("Explicit consent reduces accidental sharing")
+        );
+        assert_ne!(
+            validation_diagnostic["domainCode"],
+            duplicate_diagnostic["domainCode"]
+        );
+
+        let mut precondition_aggregate = typed_turn_aggregate();
+        let precondition_before = precondition_aggregate.persistence_state();
+        let proposal_output = serde_json::json!({
+            "body": "secret-proposal-body-canary",
+            "claims": [{
+                "key": "consent",
+                "kind": "inference",
+                "text": "secret-claim-canary",
+                "evidence_refs": [],
+                "limitations": []
+            }],
+            "conditions": [],
+            "alternatives": [],
+            "open_objections": []
+        });
+        let precondition_failure = accept_deliberation_output(
+            &mut precondition_aggregate,
+            DeliberationTurn::Synthesis,
+            &proposal_output.to_string(),
+        )
+        .unwrap_err();
+        let precondition_diagnostic = parse_diagnostic(&precondition_failure);
+        assert_eq!(
+            precondition_failure.failure.code,
+            "aggregate_transition_rejected"
+        );
+        assert_eq!(precondition_diagnostic["domainCode"], "precondition");
+        assert!(precondition_diagnostic.get("coreId").is_none());
+        assert_eq!(precondition_diagnostic["stage"], "synthesis");
+        assert_eq!(precondition_diagnostic["profileId"], "profile-MELCHIOR-1");
+        assert_eq!(precondition_diagnostic["slot"], 6);
+        assert_eq!(
+            precondition_diagnostic["revision"],
+            precondition_before.run.revision
+        );
+        assert_eq!(precondition_diagnostic["validationIssueCount"], 0);
+        assert_eq!(
+            precondition_diagnostic["validationCounters"]["proposalClaims"],
+            1
+        );
+        assert_eq!(
+            precondition_aggregate.persistence_state(),
+            precondition_before
+        );
+        assert!(!precondition_failure.failure.external_effect_unknown);
+        assert!(
+            precondition_aggregate
+                .persistence_state()
+                .proposal
+                .is_none()
+        );
+        assert!(matches!(
+            precondition_aggregate.run().status,
+            RunStatus::IndependentReview
+        ));
+        assert!(
+            !precondition_failure
+                .failure
+                .detail
+                .contains("secret-proposal-body-canary")
+        );
+        assert!(
+            !precondition_failure
+                .failure
+                .detail
+                .contains("secret-claim-canary")
+        );
+        assert!(
+            !precondition_failure
+                .failure
+                .detail
+                .contains("typed-question")
+        );
+        assert_ne!(
+            duplicate_diagnostic["domainCode"],
+            precondition_diagnostic["domainCode"]
+        );
     }
 
     #[test]

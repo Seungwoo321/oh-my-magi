@@ -1814,12 +1814,27 @@ impl DesktopState {
             .runtime_verification
             .get()
             .ok_or(magi_provider::ProviderError::ArtifactVerification)?;
-        tokio::time::timeout_at(
-            tokio::time::Instant::from_std(deadline),
-            service.close_custody(),
-        )
-        .await
-        .map_err(|_| magi_provider::ProviderError::Timeout)??;
+        loop {
+            match tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                service.close_custody(),
+            )
+            .await
+            {
+                Ok(Ok(())) => break,
+                Ok(Err(magi_provider::ProviderError::ArtifactVerification))
+                    if Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(
+                        Duration::from_millis(5)
+                            .min(deadline.saturating_duration_since(Instant::now())),
+                    )
+                    .await;
+                }
+                Ok(Err(error)) => return Err(error),
+                Err(_) => return Err(magi_provider::ProviderError::Timeout),
+            }
+        }
         permission.check_settlement()?;
         permission.extraction = Some(
             extraction_helper::retired_authority()
@@ -1858,6 +1873,13 @@ impl DesktopState {
                 Some(StorageUnavailableDiagnostic::app_data_unavailable()),
             ),
         };
+        Self::from_storage_parts(storage, storage_diagnostic)
+    }
+
+    pub(crate) fn from_storage_parts(
+        storage: Option<Arc<Storage>>,
+        storage_diagnostic: Option<StorageUnavailableDiagnostic>,
+    ) -> Self {
         let provider_operations = ProviderOperationRegistry::default();
         let provider_authentications = ProviderAuthenticationRegistry::default();
         let live_run_controls = LiveRunControlRegistry::default();
@@ -1892,6 +1914,11 @@ impl DesktopState {
                 .map(|diagnostic| format!("{} ({})", diagnostic.message, diagnostic.code))
                 .unwrap_or_else(|| "Local storage is unavailable.".to_owned())
         })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn release_storage_owner(self) {
+        drop(self.storage);
     }
 
     pub(crate) fn provider_operation_for_home(
@@ -1952,7 +1979,7 @@ pub struct ConsoleSnapshot {
 
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct StorageUnavailableDiagnostic {
+pub(crate) struct StorageUnavailableDiagnostic {
     code: &'static str,
     message: &'static str,
     action: &'static str,

@@ -25,6 +25,7 @@ function savedModelReady(state: ProviderCatalogState | undefined, profile: AcpPr
 type ConnectionCheck = { profileId: string; profileRevision: number; request: number; state: "checking" | "failed" | "ready"; authentication?: AuthProfileResult; catalog?: ProviderCatalogSnapshot };
 
 export function useCoreBindings(profiles: AcpProfile[], enabled: boolean) {
+  const [catalogProjections, setCatalogProjections] = useState<Record<string, { revision: number; state: "pending" | "ready" | "error" }>>({});
   const [catalogs, setCatalogs] = useState<Record<string, ProviderCatalogState>>({});
   const [witnesses, setWitnesses] = useState<CoreExecutionWitnesses | null>(null);
   const currentWitnesses = useRef<CoreExecutionWitnesses | null>(null);
@@ -73,6 +74,10 @@ export function useCoreBindings(profiles: AcpProfile[], enabled: boolean) {
     if (check.profileRevision !== profile?.revision) return "stale";
     return check.state;
   };
+  const profileCatalogProjection = (profile: AcpProfile): "pending" | "ready" | "error" => {
+    const projection = catalogProjections[profile.id];
+    return projection?.revision === profile.revision ? projection.state : "pending";
+  };
   const connectionReady = (profile: AcpProfile | undefined) => Boolean(profile
     && currentProfiles.current.some(current => current.id === profile.id && current.revision === profile.revision)
     && currentChecks.current[profile.id]?.profileRevision === profile.revision
@@ -96,6 +101,8 @@ export function useCoreBindings(profiles: AcpProfile[], enabled: boolean) {
     if (!enabled) return;
     const capturedSignature = currentProfiles.current.map(profile => `${profile.id}:${profile.revision}`).join("|");
     const captured = currentProfiles.current.filter(profile => profile.authenticationMethod === "local_subscription");
+    setCatalogProjections(Object.fromEntries(captured.map(profile => [profile.id, { revision: profile.revision, state: "pending" as const }])));
+    let coreProjectionReady = false;
     const results = await Promise.allSettled(captured.map(profile => loadProviderCatalog(profile.id, profile.revision)));
     const next: Record<string, ProviderCatalogState> = {};
     const failures: Record<string, string> = {};
@@ -108,8 +115,10 @@ export function useCoreBindings(profiles: AcpProfile[], enabled: boolean) {
       const rows = await loadCoreModelSelections();
       if (request !== epoch.current || capturedSignature !== currentProfiles.current.map(profile => `${profile.id}:${profile.revision}`).join("|")) return;
       if (!Array.isArray(rows) || rows.length !== 3 || CORE_IDS.some(coreId => rows.filter(row => row.coreId === coreId).length !== 1)) throw new Error("Invalid core selection set");
+      coreProjectionReady = true;
       setCatalogs(next);
       setCores(rows);
+      setCatalogProjections(Object.fromEntries(captured.map(profile => [profile.id, { revision: profile.revision, state: next[profile.id] ? "ready" as const : "error" as const }])));
       const references = CORE_IDS.map(coreId => {
         const row = rows.find(item => item.coreId === coreId);
         const saved = row?.selection;
@@ -124,7 +133,7 @@ export function useCoreBindings(profiles: AcpProfile[], enabled: boolean) {
       }
       setErrors(previous => ({ ...previous, ...failures, load: "" }));
     } catch {
-      if (request === epoch.current && capturedSignature === currentProfiles.current.map(profile => `${profile.id}:${profile.revision}`).join("|")) { setCatalogs(next); setErrors(previous => ({ ...previous, load: "세 코어의 저장된 연결을 확인하지 못했습니다." })); }
+      if (request === epoch.current && capturedSignature === currentProfiles.current.map(profile => `${profile.id}:${profile.revision}`).join("|")) { if (!coreProjectionReady) { setCatalogs({}); setCatalogProjections(Object.fromEntries(captured.map(profile => [profile.id, { revision: profile.revision, state: "error" as const }]))); } setErrors(previous => ({ ...previous, load: "세 코어의 저장된 연결을 확인하지 못했습니다." })); }
     }
   }, [enabled]);
   useEffect(() => { void reload(); return () => { epoch.current++; }; }, [reload, signature]);
@@ -192,7 +201,7 @@ export function useCoreBindings(profiles: AcpProfile[], enabled: boolean) {
     const reference: CoreBindingReference | null = ready && saved ? { coreId, providerProfileId: saved.providerProfileId, profileRevision: saved.profileRevision, modelSelectionRevision: saved.modelSelectionRevision, coreSelectionRevision: saved.selectionRevision } : null;
     return { coreId, profile, model: state?.modelSelection?.binding, dirty, ready, reference, connectionState: profile && connectionChecks[profile.id]?.profileRevision === profile.revision ? connectionChecks[profile.id].state : "not_checked" };
   });
-  return { catalogs, cores, drafts, busy, errors, destinations, ready: destinations.every(item => item.ready) && busy.length === 0, canStart: () => currentWitnesses.current === witnesses && destinations.every(item => item.ready && connectionReady(item.profile) && bindingCurrentlyVerified(item.profile, item.model)) && pending.current.size === 0, beginConnectionCheck, finishConnectionCheck, invalidateAuthentication, verifiedAuthentication, profileConnectionState, reload, saveModel, saveCore, setDraft: (coreId: CoreId, profileId: string) => setDrafts(previous => ({ ...previous, [coreId]: profileId })) };
+  return { catalogs, cores, drafts, busy, errors, destinations, ready: destinations.every(item => item.ready) && busy.length === 0, canStart: () => currentWitnesses.current === witnesses && destinations.every(item => item.ready && connectionReady(item.profile) && bindingCurrentlyVerified(item.profile, item.model)) && pending.current.size === 0, beginConnectionCheck, finishConnectionCheck, invalidateAuthentication, verifiedAuthentication, profileConnectionState, profileCatalogProjection, reload, saveModel, saveCore, setDraft: (coreId: CoreId, profileId: string) => setDrafts(previous => ({ ...previous, [coreId]: profileId })) };
 }
 export type CoreBindingsController = ReturnType<typeof useCoreBindings>;
 

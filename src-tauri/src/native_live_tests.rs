@@ -8,7 +8,7 @@ mod run_projection;
 
 use std::os::unix::fs::PermissionsExt;
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU8, Ordering},
@@ -20,6 +20,7 @@ use tauri::Manager;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProbePurpose {
     Deliberation,
+    SavedProfileDeliberation,
     CatalogDiagnostic,
     RecoveryCancel,
     PdfUi,
@@ -30,6 +31,7 @@ impl ProbePurpose {
     fn parse(value: Option<&str>) -> Result<Self, &'static str> {
         match value {
             None | Some("deliberation") => Ok(Self::Deliberation),
+            Some("saved-profile-deliberation") => Ok(Self::SavedProfileDeliberation),
             Some("catalog-diagnostic") => Ok(Self::CatalogDiagnostic),
             Some("pdf-ui") => Ok(Self::PdfUi),
             Some("connections-ui") => Ok(Self::ConnectionsUi),
@@ -40,14 +42,334 @@ impl ProbePurpose {
 
     fn profile_count(self) -> usize {
         match self {
-            Self::Deliberation => 3,
+            Self::Deliberation | Self::SavedProfileDeliberation => 3,
             Self::CatalogDiagnostic => 1,
             Self::PdfUi | Self::RecoveryCancel | Self::ConnectionsUi => 0,
         }
     }
 
     fn permits_admission(self) -> bool {
-        self == Self::Deliberation
+        matches!(self, Self::Deliberation | Self::SavedProfileDeliberation)
+    }
+}
+
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SavedProfileBinding {
+    core_id: magi_domain::CoreId,
+    provider_profile_id: String,
+    profile_revision: u64,
+    model_profile_revision: u64,
+    model_selection_revision: u64,
+    model_id: String,
+    mode_id: Option<String>,
+    core_selection_revision: Option<u64>,
+}
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SavedProfileInput {
+    schema_version: u16,
+    prepared_store_digest: String,
+    bindings: [SavedProfileBinding; 3],
+}
+impl SavedProfileInput {
+    fn validate(&self) -> Result<(), &'static str> {
+        let token = |value: &str, limit: usize| {
+            !value.is_empty() && value.len() <= limit && !value.chars().any(char::is_control)
+        };
+        let cores = self
+            .bindings
+            .iter()
+            .map(|binding| binding.core_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        let profiles = self
+            .bindings
+            .iter()
+            .map(|binding| binding.provider_profile_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        if self.schema_version != 1
+            || self.prepared_store_digest.len() != 64
+            || !self
+                .prepared_store_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            || cores.len() != 3
+            || profiles.len() != 3
+            || self.bindings.iter().any(|binding| {
+                !token(&binding.provider_profile_id, 128)
+                    || !token(&binding.model_id, 256)
+                    || binding
+                        .mode_id
+                        .as_ref()
+                        .is_some_and(|mode| !token(mode, 128))
+                    || binding.model_profile_revision > binding.profile_revision
+            })
+        {
+            return Err("saved profile input invalid");
+        }
+        Ok(())
+    }
+    fn binding(&self, core: magi_domain::CoreId) -> Result<&SavedProfileBinding, &'static str> {
+        self.bindings
+            .iter()
+            .find(|binding| binding.core_id == core)
+            .ok_or("saved core binding missing")
+    }
+}
+fn read_saved_profile_input(path: &std::path::Path) -> Result<SavedProfileInput, &'static str> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|_| "saved profile input unavailable")?;
+    let before = file
+        .metadata()
+        .map_err(|_| "saved profile input metadata")?;
+    if !before.is_file()
+        || before.nlink() != 1
+        || before.uid() != unsafe { libc::geteuid() }
+        || before.mode() & 0o777 != 0o600
+        || before.len() > 16384
+    {
+        return Err("saved profile input custody invalid");
+    }
+    let mut bytes = Vec::new();
+    file.take(16385)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "saved profile input read")?;
+    let after = std::fs::symlink_metadata(path).map_err(|_| "saved profile input replaced")?;
+    if (
+        before.dev(),
+        before.ino(),
+        before.mode(),
+        before.nlink(),
+        before.uid(),
+        before.len(),
+        before.mtime(),
+        before.mtime_nsec(),
+        before.ctime(),
+        before.ctime_nsec(),
+    ) != (
+        after.dev(),
+        after.ino(),
+        after.mode(),
+        after.nlink(),
+        after.uid(),
+        after.len(),
+        after.mtime(),
+        after.mtime_nsec(),
+        after.ctime(),
+        after.ctime_nsec(),
+    ) {
+        return Err("saved profile input changed");
+    }
+    let input: SavedProfileInput =
+        serde_json::from_slice(&bytes).map_err(|_| "saved profile input shape")?;
+    input.validate()?;
+    Ok(input)
+}
+fn validate_saved_profile_records(
+    storage: &magi_storage::Storage,
+    input: &SavedProfileInput,
+) -> Result<(), &'static str> {
+    input.validate()?;
+    for binding in &input.bindings {
+        let profile = storage
+            .load_provider_profile(&binding.provider_profile_id)
+            .map_err(|_| "saved profile unavailable")?
+            .ok_or("saved profile missing")?;
+        let model = storage
+            .load_historical_model_selection_metadata(
+                &binding.provider_profile_id,
+                binding.model_profile_revision,
+                binding.model_selection_revision,
+            )
+            .map_err(|_| "saved model unavailable")?
+            .ok_or("saved model missing")?;
+        if profile.revision != binding.profile_revision
+            || profile.provider_id != "codex-acp"
+            || model.selection_revision != binding.model_selection_revision
+            || model.binding.provider_profile_id != binding.provider_profile_id
+            || model.binding.profile_revision != binding.model_profile_revision
+            || model.binding.model_id != binding.model_id
+            || model.binding.mode_id != binding.mode_id
+        {
+            return Err("saved profile reference drift");
+        }
+        let core = storage
+            .load_core_model_selection(binding.core_id)
+            .map_err(|_| "saved core unavailable")?;
+        match (core, binding.core_selection_revision) {
+            (None, None) => {}
+            (Some(core), Some(revision))
+                if core.selection_revision == revision
+                    && core.provider_profile_id == binding.provider_profile_id
+                    && core.profile_revision == binding.model_profile_revision
+                    && core.model_selection_revision == binding.model_selection_revision => {}
+            _ => return Err("saved core reference drift"),
+        }
+    }
+    Ok(())
+}
+
+fn derive_saved_profile_bindings(
+    storage: &magi_storage::Storage,
+    input: &SavedProfileInput,
+) -> Result<[SavedProfileBinding; 3], &'static str> {
+    validate_saved_profile_records(storage, input)?;
+    let bindings = input
+        .bindings
+        .iter()
+        .map(|reference| {
+            let profile = storage
+                .load_provider_profile(&reference.provider_profile_id)
+                .map_err(|_| "saved profile unavailable")?
+                .ok_or("saved profile missing")?;
+            let model = storage
+                .load_historical_model_selection_metadata(
+                    &reference.provider_profile_id,
+                    reference.model_profile_revision,
+                    reference.model_selection_revision,
+                )
+                .map_err(|_| "saved model unavailable")?
+                .ok_or("saved model missing")?;
+            let core = storage
+                .load_core_model_selection(reference.core_id)
+                .map_err(|_| "saved core unavailable")?;
+            let core_selection_revision = match core {
+                None if reference.core_selection_revision.is_none() => None,
+                Some(core)
+                    if Some(core.selection_revision) == reference.core_selection_revision
+                        && core.provider_profile_id == reference.provider_profile_id
+                        && core.profile_revision == model.binding.profile_revision
+                        && core.model_selection_revision == model.selection_revision =>
+                {
+                    Some(core.selection_revision)
+                }
+                _ => return Err("saved core reference drift"),
+            };
+            Ok(SavedProfileBinding {
+                core_id: reference.core_id,
+                provider_profile_id: profile.provider_profile_id,
+                profile_revision: profile.revision,
+                model_profile_revision: model.binding.profile_revision,
+                model_selection_revision: model.selection_revision,
+                model_id: model.binding.model_id,
+                mode_id: model.binding.mode_id,
+                core_selection_revision,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    bindings.try_into().map_err(|_| "saved core binding count")
+}
+
+fn saved_store_digest(root: &Path) -> Result<String, &'static str> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let database = root.join("state/magi.sqlite");
+    if root.join("state/magi.sqlite-wal").exists() || root.join("state/magi.sqlite-shm").exists() {
+        return Err("active saved store has open SQLite sidecars");
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&database)
+        .map_err(|_| "active saved store unavailable")?;
+    let before = file.metadata().map_err(|_| "active saved store metadata")?;
+    if !before.is_file()
+        || before.nlink() != 1
+        || before.uid() != unsafe { libc::geteuid() }
+        || before.len() > 20 * 1024 * 1024
+    {
+        return Err("active saved store custody invalid");
+    }
+    let mut bytes = Vec::new();
+    file.take(20 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "active saved store read")?;
+    if bytes.len() > 20 * 1024 * 1024 {
+        return Err("active saved store exceeds bound");
+    }
+    let after = std::fs::symlink_metadata(&database).map_err(|_| "active saved store replaced")?;
+    if before.dev() != after.dev()
+        || before.ino() != after.ino()
+        || before.mode() != after.mode()
+        || before.nlink() != after.nlink()
+        || before.len() != after.len()
+        || before.mtime() != after.mtime()
+        || before.mtime_nsec() != after.mtime_nsec()
+        || before.ctime() != after.ctime()
+        || before.ctime_nsec() != after.ctime_nsec()
+    {
+        return Err("active saved store changed during digest");
+    }
+    Ok(magi_domain::Digest::from_bytes(&bytes).as_str().to_owned())
+}
+
+fn write_saved_profile_input(path: &Path, input: &SavedProfileInput) -> Result<(), &'static str> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    input.validate()?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .mode(0o600)
+        .open(path)
+        .map_err(|_| "saved binding output unavailable")?;
+    file.write_all(&serde_json::to_vec_pretty(input).map_err(|_| "saved binding output encoding")?)
+        .map_err(|_| "saved binding output write")?;
+    file.sync_all()
+        .map_err(|_| "saved binding output synchronization")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeFrontendMode {
+    DebugServer,
+    EmbeddedAssets,
+}
+
+impl ProbeFrontendMode {
+    fn select_os(
+        mode: Option<&std::ffi::OsStr>,
+        url: Option<&std::ffi::OsStr>,
+        has_index: bool,
+    ) -> Result<Self, &'static str> {
+        let mode = mode
+            .map(|value| value.to_str().ok_or("invalid probe frontend mode encoding"))
+            .transpose()?;
+        let url = url
+            .map(|value| value.to_str().ok_or("invalid probe frontend URL encoding"))
+            .transpose()?;
+        Self::select(mode, url, has_index)
+    }
+
+    fn select(
+        mode: Option<&str>,
+        url: Option<&str>,
+        has_index: bool,
+    ) -> Result<Self, &'static str> {
+        match mode {
+            None | Some("debug-server") => {
+                if url == Some("http://127.0.0.1:1427") {
+                    Ok(Self::DebugServer)
+                } else {
+                    Err("probe debug frontend requires exact dedicated server URL")
+                }
+            }
+            Some("embedded-assets") => {
+                if url.is_some() {
+                    Err("embedded probe frontend refuses external URL")
+                } else if !has_index {
+                    Err("embedded probe frontend assets unavailable")
+                } else {
+                    Ok(Self::EmbeddedAssets)
+                }
+            }
+            _ => Err("invalid probe frontend mode"),
+        }
     }
 }
 
@@ -58,7 +380,9 @@ struct ConnectionsUiState {
     nonce: String,
     checkpoints: Mutex<Vec<serde_json::Value>>,
     cores: Mutex<Option<serde_json::Value>>,
+    progress: Mutex<Vec<serde_json::Value>>,
     failed: AtomicU8,
+    failure_checkpoint: Mutex<Option<serde_json::Value>>,
 }
 impl Default for ConnectionsUiState {
     fn default() -> Self {
@@ -67,7 +391,9 @@ impl Default for ConnectionsUiState {
             nonce: uuid::Uuid::new_v4().to_string(),
             checkpoints: Mutex::new(Vec::new()),
             cores: Mutex::new(None),
+            progress: Mutex::new(Vec::new()),
             failed: AtomicU8::new(0),
+            failure_checkpoint: Mutex::new(None),
         }
     }
 }
@@ -82,6 +408,166 @@ struct ConnectionUiRow {
     label_matched: bool,
 }
 #[derive(serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ConnectionUiFailureStage {
+    ProfileQuery,
+    Connections,
+    RowProjection,
+    DraftReturn,
+    ModalAdd,
+    ModalEdit,
+    ModalSave,
+    IpcIntegrity,
+    Complete,
+}
+impl ConnectionUiFailureStage {
+    fn progress_position(&self) -> (usize, usize) {
+        match self {
+            Self::ProfileQuery => (0, 0),
+            Self::Connections => (1, 0),
+            Self::RowProjection => (2, 0),
+            Self::DraftReturn => (3, 1),
+            Self::ModalAdd => (4, 2),
+            Self::ModalEdit => (5, 2),
+            Self::ModalSave => (6, 2),
+            Self::IpcIntegrity => (7, 3),
+            Self::Complete => (8, 3),
+        }
+    }
+}
+fn validate_ui_progress(
+    stage: &ConnectionUiFailureStage,
+    count: usize,
+    accepted: usize,
+    previous: usize,
+) -> Result<(), &'static str> {
+    let (position, required) = stage.progress_position();
+    if position == previous && required == count && count == accepted {
+        Ok(())
+    } else {
+        Err("UI progress order mismatch")
+    }
+}
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ConnectionUiPhase {
+    ScriptInitialized,
+    HomeWait,
+    HomeReady,
+    ProfileListReady,
+    ProjectionPending,
+    ProjectionReady,
+    ProjectionError,
+    Comparison,
+    EditControlWait,
+    EditControlFound,
+    EditClicked,
+    EditDialogFound,
+    EditDialogFocusWait,
+    EditDialogFocusReady,
+    EditTriggerFocusRestored,
+    EditFocusFailed,
+}
+fn validate_ui_phase(
+    stage: &ConnectionUiFailureStage,
+    phase: &ConnectionUiPhase,
+    count: usize,
+    accepted: usize,
+    progress: &[serde_json::Value],
+) -> Result<(), &'static str> {
+    let modal_edit = matches!(
+        phase,
+        ConnectionUiPhase::EditControlWait
+            | ConnectionUiPhase::EditControlFound
+            | ConnectionUiPhase::EditClicked
+            | ConnectionUiPhase::EditDialogFound
+            | ConnectionUiPhase::EditDialogFocusWait
+            | ConnectionUiPhase::EditDialogFocusReady
+            | ConnectionUiPhase::EditTriggerFocusRestored
+            | ConnectionUiPhase::EditFocusFailed
+    );
+    if count != accepted
+        || progress.len() >= 64
+        || (matches!(phase, ConnectionUiPhase::ScriptInitialized)
+            && (!matches!(stage, ConnectionUiFailureStage::ProfileQuery) || !progress.is_empty()))
+        || (matches!(
+            phase,
+            ConnectionUiPhase::ProjectionPending
+                | ConnectionUiPhase::ProjectionReady
+                | ConnectionUiPhase::ProjectionError
+                | ConnectionUiPhase::Comparison
+        ) && !matches!(stage, ConnectionUiFailureStage::RowProjection))
+        || (modal_edit && (!matches!(stage, ConnectionUiFailureStage::ModalEdit) || count != 2))
+    {
+        Err("UI phase authority mismatch")
+    } else {
+        Ok(())
+    }
+}
+fn ui_script_initialized(progress: &[serde_json::Value]) -> bool {
+    progress
+        .iter()
+        .any(|item| item["kind"] == "phase" && item["phase"] == "script_initialized")
+}
+fn write_ui_observation(
+    root: &std::path::Path,
+    name: &str,
+    body: &serde_json::Value,
+) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .mode(0o600)
+        .open(root.join(name))
+        .map_err(|_| "UI observation output unavailable")?;
+    file.write_all(&serde_json::to_vec_pretty(body).map_err(|_| "UI observation encoding")?)
+        .map_err(|_| "UI observation write")?;
+    file.sync_all()
+        .map_err(|_| "UI observation synchronization".into())
+}
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ConnectionUiFailureCode {
+    BoundedUiWait,
+    ProfileCount,
+    ProfileLabel,
+    SavedModel,
+    CatalogProjectionError,
+    AuthenticationTime,
+    DraftReturn,
+    ProfileSaveReadback,
+    InvokeReplaced,
+    NativeReportRejected,
+    UnexpectedException,
+}
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConnectionUiModelMismatch {
+    actual_model_id: Option<String>,
+    actual_mode_id: Option<String>,
+    expected_model_id: Option<String>,
+    expected_mode_id: Option<String>,
+}
+impl ConnectionUiModelMismatch {
+    fn valid(&self) -> bool {
+        [
+            &self.actual_model_id,
+            &self.actual_mode_id,
+            &self.expected_model_id,
+            &self.expected_mode_id,
+        ]
+        .into_iter()
+        .all(|token| {
+            token.as_ref().is_none_or(|token| {
+                !token.is_empty() && token.len() <= 256 && !token.chars().any(char::is_control)
+            })
+        })
+    }
+}
+#[derive(serde::Deserialize, serde::Serialize)]
 #[serde(
     tag = "kind",
     rename_all = "snake_case",
@@ -89,6 +575,15 @@ struct ConnectionUiRow {
     deny_unknown_fields
 )]
 enum ConnectionUiCheckpoint {
+    Phase {
+        stage: ConnectionUiFailureStage,
+        phase: ConnectionUiPhase,
+        checkpoint_count: usize,
+    },
+    Progress {
+        stage: ConnectionUiFailureStage,
+        checkpoint_count: usize,
+    },
     Rows {
         rows: Vec<ConnectionUiRow>,
     },
@@ -113,7 +608,41 @@ enum ConnectionUiCheckpoint {
         save_committed: bool,
     },
     Complete {},
-    Failed {},
+    Failed {
+        stage: ConnectionUiFailureStage,
+        code: ConnectionUiFailureCode,
+        checkpoint_count: usize,
+        model_mismatch: Option<ConnectionUiModelMismatch>,
+    },
+}
+impl ConnectionUiCheckpoint {
+    fn validate_failure_count(&self, accepted: usize) -> Result<(), &'static str> {
+        match self {
+            Self::Failed {
+                checkpoint_count,
+                stage,
+                code,
+                model_mismatch,
+            } if *checkpoint_count == accepted
+                && accepted <= 3
+                && match model_mismatch {
+                    Some(tokens) => {
+                        matches!(stage, ConnectionUiFailureStage::RowProjection)
+                            && matches!(code, ConnectionUiFailureCode::SavedModel)
+                            && tokens.valid()
+                    }
+                    None => {
+                        !matches!(code, ConnectionUiFailureCode::SavedModel)
+                            && (!matches!(code, ConnectionUiFailureCode::CatalogProjectionError)
+                                || matches!(stage, ConnectionUiFailureStage::RowProjection))
+                    }
+                } =>
+            {
+                Ok(())
+            }
+            _ => Err("UI failure checkpoint count mismatch"),
+        }
+    }
 }
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -153,6 +682,41 @@ fn connections_ui_probe_report(
         .lock()
         .map_err(|_| "UI state unavailable")?;
     match &input.checkpoint {
+        ConnectionUiCheckpoint::Phase {
+            stage,
+            phase,
+            checkpoint_count,
+        } => {
+            let mut progress = report
+                .progress
+                .lock()
+                .map_err(|_| "UI progress state unavailable")?;
+            validate_ui_phase(stage, phase, *checkpoint_count, accepted.len(), &progress)?;
+            progress
+                .push(serde_json::to_value(&input.checkpoint).map_err(|_| "UI phase encoding")?);
+            return Ok(());
+        }
+        ConnectionUiCheckpoint::Progress {
+            stage,
+            checkpoint_count,
+        } => {
+            let mut progress = report
+                .progress
+                .lock()
+                .map_err(|_| "UI progress state unavailable")?;
+            validate_ui_progress(
+                stage,
+                *checkpoint_count,
+                accepted.len(),
+                progress
+                    .iter()
+                    .filter(|item| item["kind"] == "progress")
+                    .count(),
+            )?;
+            progress
+                .push(serde_json::to_value(&input.checkpoint).map_err(|_| "UI progress encoding")?);
+            return Ok(());
+        }
         ConnectionUiCheckpoint::Rows { rows } => {
             if !accepted.is_empty() || rows.is_empty() || rows.len() > 100 {
                 return Err("UI row count invalid");
@@ -276,7 +840,14 @@ fn connections_ui_probe_report(
                 return Err("UI checkpoints incomplete");
             }
         }
-        ConnectionUiCheckpoint::Failed {} => {
+        ConnectionUiCheckpoint::Failed { .. } => {
+            input.checkpoint.validate_failure_count(accepted.len())?;
+            let safe_checkpoint =
+                serde_json::to_value(&input.checkpoint).map_err(|_| "UI failure encoding")?;
+            *report
+                .failure_checkpoint
+                .lock()
+                .map_err(|_| "UI failure state unavailable")? = Some(safe_checkpoint);
             report.failed.store(1, Ordering::Release);
             return Ok(());
         }
@@ -301,12 +872,59 @@ async fn connections_ui_probe(
             include_str!("../native/connection-ui-probe.js")
         ))
         .map_err(|_| "UI script initialization")?;
+    let mut persisted_progress = 0;
     loop {
-        monitor
-            .lifecycle
-            .check()
-            .map_err(|_| "UI absolute deadline")?;
+        let progress = state
+            .progress
+            .lock()
+            .map_err(|_| "UI progress state")?
+            .clone();
+        let storage = app.state::<commands::DesktopState>().storage()?;
+        for (index, checkpoint) in progress.iter().enumerate().skip(persisted_progress) {
+            write_ui_observation(
+                root,
+                &format!("connections-ui-progress-{index}.json"),
+                &serde_json::json!({"schemaVersion":1,"pid":std::process::id(),"window":"main","nonce":state.nonce,"store":storage.identity(),"checkpoint":checkpoint,"providerActions":false}),
+            )?;
+            persisted_progress += 1;
+        }
+        if monitor.lifecycle.check().is_err() {
+            let accepted = state
+                .checkpoints
+                .lock()
+                .map_err(|_| "UI checkpoint state")?
+                .len();
+            write_ui_observation(
+                root,
+                "connections-ui-deadline.json",
+                &serde_json::json!({"schemaVersion":1,"pid":std::process::id(),"window":"main","nonce":state.nonce,"store":storage.identity(),"lastProgress":progress.last(),"scriptInitialized":ui_script_initialized(&progress),"acceptedCheckpointCount":accepted,"failureReceived":state.failed.load(Ordering::Acquire)!=0,"providerActions":false}),
+            )?;
+            return Err("UI absolute deadline".into());
+        }
         if state.failed.load(Ordering::Acquire) != 0 {
+            let checkpoint = state
+                .failure_checkpoint
+                .lock()
+                .map_err(|_| "UI failure state unavailable")?
+                .clone()
+                .ok_or("UI failure checkpoint missing")?;
+            let storage = app.state::<commands::DesktopState>().storage()?;
+            let body = serde_json::to_vec_pretty(&serde_json::json!({"schemaVersion":1,"pid":std::process::id(),"window":"main","nonce":state.nonce,"store":storage.identity(),"checkpoint":checkpoint,"providerActions":false})).map_err(|_| "UI failure output encoding")?;
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut output = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .mode(0o600)
+                .open(root.join("connections-ui-failure.json"))
+                .map_err(|_| "UI failure output unavailable")?;
+            output
+                .write_all(&body)
+                .map_err(|_| "UI failure output write")?;
+            output
+                .sync_all()
+                .map_err(|_| "UI failure output synchronization")?;
             return Err("physical UI checkpoint failed".into());
         }
         let complete = state
@@ -853,7 +1471,230 @@ fn prepare_connection_metadata(
     Ok(())
 }
 
+fn verified_policy_resource(
+    resource_root: &std::path::Path,
+    expected: &str,
+) -> Result<PathBuf, &'static str> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("invalid approved policy digest");
+    }
+    let directory = resource_root.join("policy");
+    let directory_metadata =
+        std::fs::symlink_metadata(&directory).map_err(|_| "policy resource missing")?;
+    if !directory_metadata.is_dir() || directory_metadata.mode() & 0o222 != 0 {
+        return Err("policy resource directory unsealed");
+    }
+    let path = directory.join("SECURITY.md");
+    let before = std::fs::symlink_metadata(&path).map_err(|_| "policy resource missing")?;
+    if !before.is_file()
+        || before.nlink() != 1
+        || before.mode() & 0o222 != 0
+        || before.len() > 1024 * 1024
+    {
+        return Err("policy resource unsealed");
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .map_err(|_| "policy resource unavailable")?;
+    let identity = |metadata: &std::fs::Metadata| {
+        (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.mode(),
+            metadata.nlink(),
+            metadata.uid(),
+            metadata.len(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        )
+    };
+    if identity(&before) != identity(&file.metadata().map_err(|_| "policy resource identity")?) {
+        return Err("policy resource replaced");
+    }
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "policy resource read")?;
+    if magi_domain::Digest::from_bytes(&bytes).as_str() != expected {
+        return Err("approved policy resource mismatch");
+    }
+    if identity(&before) != identity(&file.metadata().map_err(|_| "policy resource identity")?)
+        || identity(&before)
+            != identity(&std::fs::symlink_metadata(&path).map_err(|_| "policy resource missing")?)
+        || (
+            directory_metadata.dev(),
+            directory_metadata.ino(),
+            directory_metadata.mode(),
+        ) != {
+            let after = std::fs::symlink_metadata(&directory)
+                .map_err(|_| "policy resource directory missing")?;
+            (after.dev(), after.ino(), after.mode())
+        }
+    {
+        return Err("policy resource replaced");
+    }
+    Ok(path)
+}
+
+struct SavedRunAdmissionActivationPermission {
+    prior: magi_storage::AdmissionExecutionAuthority,
+    quiescence: commands::NativeResourceQuiescence,
+    deadline: std::time::Instant,
+}
+impl magi_storage::AdmissionActivationPermission for SavedRunAdmissionActivationPermission {
+    fn validate(
+        &self,
+        previous: &magi_storage::AdmissionExecutionAuthority,
+    ) -> Result<(), magi_storage::StorageError> {
+        if previous != &self.prior || !previous.active || std::time::Instant::now() >= self.deadline
+        {
+            return Err(magi_storage::StorageError::DispatchFenced);
+        }
+        self.quiescence
+            .validate()
+            .map_err(|_| magi_storage::StorageError::DispatchFenced)
+    }
+}
+
+async fn retained_saved_preparation(
+    storage: magi_storage::Storage,
+    deadline: std::time::Instant,
+) -> Result<
+    (magi_storage::Storage, SavedRunAdmissionActivationPermission),
+    magi_provider::ProviderError,
+> {
+    let source = Arc::new(storage);
+    let prior = source
+        .admission_execution_authority()
+        .map_err(|_| magi_provider::ProviderError::ArtifactVerification)?;
+    if !prior.active {
+        return Err(magi_provider::ProviderError::ArtifactVerification);
+    }
+    let state = commands::DesktopState::from_storage_parts(Some(source.clone()), None);
+    let quiescence = state.freeze_resource_consumers(deadline, None).await?;
+    quiescence.validate()?;
+    state.release_storage_owner();
+    let source =
+        Arc::try_unwrap(source).map_err(|_| magi_provider::ProviderError::ArtifactVerification)?;
+    Ok((
+        source,
+        SavedRunAdmissionActivationPermission {
+            prior,
+            quiescence,
+            deadline,
+        },
+    ))
+}
+
+fn prepare_saved_profile_run_store() -> Result<(), String> {
+    let source = PathBuf::from(
+        std::env::var_os("MAGI_TEST_SAVED_PROFILE_SOURCE_ROOT")
+            .ok_or("saved source root required")?,
+    );
+    let backup = PathBuf::from(
+        std::env::var_os("MAGI_TEST_SAVED_PROFILE_BACKUP_ROOT")
+            .ok_or("saved backup root required")?,
+    );
+    let destination =
+        PathBuf::from(std::env::var_os("MAGI_TEST_DATA_ROOT").ok_or("saved destination required")?);
+    let input_path = std::env::var_os("MAGI_TEST_SAVED_PROFILE_BINDINGS_FILE")
+        .ok_or("saved bindings required")?;
+    let expected_store = std::env::var("MAGI_TEST_SAVED_PROFILE_SOURCE_STORE_ID")
+        .map_err(|_| "saved source identity required")?;
+    prepare_saved_profile_run_store_at(
+        &source,
+        &backup,
+        &destination,
+        Path::new(&input_path),
+        &expected_store,
+    )
+}
+
+fn prepare_saved_profile_run_store_at(
+    fence_source: &Path,
+    backup: &Path,
+    destination: &Path,
+    input_path: &Path,
+    expected_store: &str,
+) -> Result<(), String> {
+    let input = read_saved_profile_input(input_path)?;
+    if fence_source.exists() || !backup.is_dir() || destination.exists() {
+        return Err("fresh fence source, preserved backup, and fresh destination required".into());
+    }
+    let manifest: magi_storage::BackupManifest = serde_json::from_slice(
+        &std::fs::read(backup.join("manifest.json"))
+            .map_err(|_| "saved backup manifest unavailable")?,
+    )
+    .map_err(|_| "saved backup manifest invalid")?;
+    if manifest.store_id != expected_store {
+        return Err("saved backup identity mismatch".into());
+    }
+    let storage = magi_storage::Storage::open_or_create(fence_source)
+        .map_err(|_| "saved fence writer authority unavailable")?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let (mut source, permission) =
+        tauri::async_runtime::block_on(retained_saved_preparation(storage, deadline))
+            .map_err(|_| "saved fence native closure unavailable")?;
+    let receipt = magi_storage::Storage::restore_backup(backup, destination)
+        .map_err(|_| "saved backup restore failed")?;
+    if receipt.store_id != expected_store || receipt.store_id != manifest.store_id {
+        return Err("saved restored identity mismatch".into());
+    }
+    let mut restored = magi_storage::Storage::open_or_create(destination)
+        .map_err(|_| "saved restored authority unavailable")?;
+    let (active, retained_permission) = restored
+        .activate_restored_execution_checked(&mut source, |prior| {
+            magi_storage::AdmissionActivationPermission::validate(&permission, prior)?;
+            Ok(permission)
+        })
+        .map_err(|_| "saved restored activation denied")?;
+    if !active.active {
+        return Err("saved restored activation inactive".into());
+    }
+    let bindings = derive_saved_profile_bindings(&restored, &input)?;
+    drop(restored);
+    drop(source);
+    drop(retained_permission);
+    let prepared_input = SavedProfileInput {
+        schema_version: input.schema_version,
+        prepared_store_digest: saved_store_digest(destination)?,
+        bindings,
+    };
+    let bindings_path = destination.join("saved-profile-bindings.json");
+    write_saved_profile_input(&bindings_path, &prepared_input)?;
+    std::fs::write(
+        destination.join("saved-profile-preparation.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schemaVersion": 1,
+            "backup": manifest,
+            "restore": receipt,
+            "preparedStoreDigest": prepared_input.prepared_store_digest,
+            "bindings": prepared_input.bindings,
+            "bindingsFile": "saved-profile-bindings.json"
+        }))
+        .map_err(|_| "saved preparation encoding")?,
+    )
+    .map_err(|_| "saved preparation publication")?;
+    Ok(())
+}
+
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--prepare-saved-profile-run-store") {
+        assert_eq!(
+            std::env::args().count(),
+            2,
+            "closed saved preparation arguments required"
+        );
+        prepare_saved_profile_run_store().expect("saved profile preparation failed");
+        return;
+    }
     if std::env::args().nth(1).as_deref() == Some("--prepare-connections-ui-store") {
         assert_eq!(
             std::env::args().count(),
@@ -873,6 +1714,16 @@ fn main() {
     let root = PathBuf::from(
         std::env::var_os("MAGI_TEST_DATA_ROOT").expect("explicit disposable data root required"),
     );
+    let saved_input = if purpose == ProbePurpose::SavedProfileDeliberation {
+        let path = std::env::var_os("MAGI_TEST_SAVED_PROFILE_BINDINGS_FILE")
+            .expect("explicit saved profile bindings required");
+        Some(
+            read_saved_profile_input(std::path::Path::new(&path))
+                .expect("invalid saved profile bindings"),
+        )
+    } else {
+        None
+    };
     let recovery_run = if purpose == ProbePurpose::RecoveryCancel {
         let run = std::env::var("MAGI_TEST_CANCEL_RUN_ID").expect("explicit recovery run required");
         assert!(valid_recovery_run(&run), "invalid recovery run reference");
@@ -898,9 +1749,20 @@ fn main() {
             "valid explicit observed selection required"
         );
     }
+    if purpose == ProbePurpose::SavedProfileDeliberation {
+        let digest = std::env::var("MAGI_TEST_POLICY_SOURCE_DIGEST")
+            .expect("approved policy source digest required");
+        assert!(
+            digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "invalid policy source digest"
+        );
+    }
     let selected = if matches!(
         purpose,
-        ProbePurpose::PdfUi | ProbePurpose::RecoveryCancel | ProbePurpose::ConnectionsUi
+        ProbePurpose::PdfUi
+            | ProbePurpose::RecoveryCancel
+            | ProbePurpose::ConnectionsUi
+            | ProbePurpose::SavedProfileDeliberation
     ) {
         String::new()
     } else {
@@ -908,7 +1770,9 @@ fn main() {
     };
     if matches!(
         purpose,
-        ProbePurpose::RecoveryCancel | ProbePurpose::ConnectionsUi
+        ProbePurpose::RecoveryCancel
+            | ProbePurpose::ConnectionsUi
+            | ProbePurpose::SavedProfileDeliberation
     ) {
         assert!(
             root.is_dir() && root.join("state/magi.sqlite").is_file(),
@@ -920,7 +1784,10 @@ fn main() {
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
             .expect("private disposable data root");
     }
-    if purpose == ProbePurpose::ConnectionsUi {
+    if matches!(
+        purpose,
+        ProbePurpose::ConnectionsUi | ProbePurpose::SavedProfileDeliberation
+    ) {
         use std::io::Read;
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
         let metadata = std::fs::symlink_metadata(&root).expect("UI root metadata");
@@ -930,8 +1797,11 @@ fn main() {
                 && metadata.uid() == unsafe { libc::geteuid() },
             "private owned UI root required"
         );
-        let expected = std::env::var("MAGI_TEST_UI_STORE_DIGEST")
-            .expect("explicit prepared UI store digest required");
+        let expected = match &saved_input {
+            Some(input) => input.prepared_store_digest.clone(),
+            None => std::env::var("MAGI_TEST_UI_STORE_DIGEST")
+                .expect("explicit prepared UI store digest required"),
+        };
         assert!(
             expected.len() == 64 && expected.bytes().all(|byte| byte.is_ascii_hexdigit()),
             "valid UI store digest required"
@@ -967,20 +1837,40 @@ fn main() {
     let root = root.canonicalize().expect("canonical disposable data root");
     let mut context = tauri::generate_context!();
     if purpose == ProbePurpose::RecoveryCancel {
+        assert!(
+            std::env::var_os("MAGI_TEST_FRONTEND_MODE").is_none(),
+            "inert recovery refuses frontend mode"
+        );
         context.config_mut().build.dev_url = None;
         for window in &mut context.config_mut().app.windows {
             window.url =
                 tauri::WebviewUrl::External("about:blank".parse().expect("inert recovery URL"));
             window.visible = false;
         }
-    } else if cfg!(debug_assertions) {
-        let frontend = std::env::var("MAGI_TEST_FRONTEND_URL")
-            .expect("explicit child frontend URL required for debug probe");
-        assert_eq!(
-            frontend, "http://127.0.0.1:1427",
-            "probe debug frontend must be its dedicated local server"
-        );
-        context.config_mut().build.dev_url = Some(frontend.parse().expect("child frontend URL"));
+    } else if cfg!(debug_assertions) || std::env::var_os("MAGI_TEST_FRONTEND_MODE").is_some() {
+        let mode = std::env::var_os("MAGI_TEST_FRONTEND_MODE");
+        let frontend = std::env::var_os("MAGI_TEST_FRONTEND_URL");
+        let has_index = context
+            .assets()
+            .get(&"index.html".into())
+            .is_some_and(|bytes| !bytes.is_empty());
+        match ProbeFrontendMode::select_os(mode.as_deref(), frontend.as_deref(), has_index)
+            .expect("invalid explicit probe frontend authority")
+        {
+            ProbeFrontendMode::DebugServer => {
+                context.config_mut().build.dev_url = Some(
+                    "http://127.0.0.1:1427"
+                        .parse()
+                        .expect("dedicated frontend URL"),
+                );
+            }
+            ProbeFrontendMode::EmbeddedAssets => {
+                context.config_mut().build.dev_url = None;
+                for window in &mut context.config_mut().app.windows {
+                    window.url = tauri::WebviewUrl::App("index.html".into());
+                }
+            }
+        }
     }
     context.config_mut().identifier = format!("local.magi.probe.p{}", std::process::id());
     context.config_mut().app.app_directories_override = Some(
@@ -1060,6 +1950,7 @@ fn main() {
         ])
         .setup(move |app| {
             setup_monitor.mark("setup");
+            app.manage(saved_input.clone());
             app.manage(commands::ExitAuthorization::new());
             app.manage(
                 if matches!(
@@ -1097,7 +1988,7 @@ fn main() {
             let handle = app.handle().clone();
             let selected = selected.clone();
             let root = root.clone();
-            if purpose == ProbePurpose::Deliberation {
+            if purpose.permits_admission() {
                 start_probe_control_bridge(handle.clone(), setup_monitor.clone(), root.clone())?;
             }
             let watchdog_root = root.clone();
@@ -1243,16 +2134,30 @@ async fn probe(
     if purpose == ProbePurpose::ConnectionsUi {
         return connections_ui_probe(app, &window, &root, monitor).await;
     }
+    let mut saved_input = if purpose == ProbePurpose::SavedProfileDeliberation {
+        Some(
+            app.state::<Option<SavedProfileInput>>()
+                .inner()
+                .clone()
+                .ok_or("saved profile bindings missing")?,
+        )
+    } else {
+        None
+    };
+    if let Some(input) = &saved_input {
+        validate_saved_profile_records(
+            app.state::<commands::DesktopState>().storage()?.as_ref(),
+            input,
+        )?;
+    }
+    if saved_input.is_some() {
+        monitor
+            .lifecycle
+            .bind_execution(app.state::<commands::DesktopState>().storage()?)
+            .map_err(|_| "saved profile execution authority unavailable")?;
+    }
     let mut core_bindings = Vec::new();
     let mut observed_selections = Vec::new();
-    monitor
-        .lifecycle
-        .bind_execution(
-            app.state::<commands::DesktopState>()
-                .storage()
-                .map_err(|_| "execution store unavailable")?,
-        )
-        .map_err(|_| "execution authority unavailable")?;
     monitor.ensure_running()?;
     let _probe_operation = monitor
         .lifecycle
@@ -1264,20 +2169,36 @@ async fn probe(
         .take(purpose.profile_count())
     {
         monitor.ensure_running()?;
-        let draft = serde_json::from_value(serde_json::json!({"credentialHomePath":selected,"profileId":null,"expectedRevision":null,"displayName":format!("Subscription Review {}", index + 1),"adapterId":"codex-acp"})).map_err(|_| "profile draft encoding")?;
-        monitor.mark("saving_profile");
-        let profile =
-            profiles::save_provider_profile(window.clone(), app.clone(), app.state(), draft)
-                .await?;
-        monitor.ensure_running()?;
-        let profile = serde_json::to_value(profile).map_err(|_| "profile receipt encoding")?;
-        let profile_id = profile["providerProfileId"]
-            .as_str()
-            .ok_or("profile id missing")?
-            .to_owned();
-        let revision = profile["revision"]
-            .as_u64()
-            .ok_or("profile revision missing")?;
+        let saved_binding = saved_input
+            .as_ref()
+            .map(|input| input.binding(core_id).cloned())
+            .transpose()?;
+        let (profile_id, revision) = if let Some(binding) = &saved_binding {
+            validate_saved_profile_records(
+                app.state::<commands::DesktopState>().storage()?.as_ref(),
+                saved_input.as_ref().ok_or("saved input missing")?,
+            )?;
+            (
+                binding.provider_profile_id.clone(),
+                binding.profile_revision,
+            )
+        } else {
+            let draft = serde_json::from_value(serde_json::json!({"credentialHomePath":selected,"profileId":null,"expectedRevision":null,"displayName":format!("Subscription Review {}", index + 1),"adapterId":"codex-acp"})).map_err(|_| "profile draft encoding")?;
+            monitor.mark("saving_profile");
+            let profile =
+                profiles::save_provider_profile(window.clone(), app.clone(), app.state(), draft)
+                    .await?;
+            monitor.ensure_running()?;
+            let profile = serde_json::to_value(profile).map_err(|_| "profile receipt encoding")?;
+            let profile_id = profile["providerProfileId"]
+                .as_str()
+                .ok_or("profile id missing")?
+                .to_owned();
+            let revision = profile["revision"]
+                .as_u64()
+                .ok_or("profile revision missing")?;
+            (profile_id, revision)
+        };
         monitor.mark("reading_catalog");
         let catalog = profiles::refresh_provider_model_catalog_inner(
             window.clone(),
@@ -1300,8 +2221,11 @@ async fn probe(
             monitor.mark("catalog_diagnostic_completed");
             return Ok(());
         }
-        let requested =
-            std::env::var("MAGI_TEST_MODEL_ID").map_err(|_| "explicit observed model required")?;
+        let requested = match &saved_binding {
+            Some(binding) => binding.model_id.clone(),
+            None => std::env::var("MAGI_TEST_MODEL_ID")
+                .map_err(|_| "explicit observed model required")?,
+        };
         let model = catalog
             .models
             .iter()
@@ -1311,8 +2235,18 @@ async fn probe(
             .negotiated_modes
             .as_ref()
             .ok_or("actual mode evidence missing")?;
-        let requested_mode =
-            std::env::var("MAGI_TEST_MODE_ID").map_err(|_| "explicit observed mode required")?;
+        let requested_mode = match &saved_binding {
+            Some(binding) => binding.mode_id.clone().unwrap_or_default(),
+            None => {
+                std::env::var("MAGI_TEST_MODE_ID").map_err(|_| "explicit observed mode required")?
+            }
+        };
+        if let Some(input) = &saved_input {
+            validate_saved_profile_records(
+                app.state::<commands::DesktopState>().storage()?.as_ref(),
+                input,
+            )?;
+        }
         let mode_id = if facility.modes.is_empty() {
             if !requested_mode.is_empty() {
                 return Err("mode requested for attested absent facility".into());
@@ -1329,15 +2263,25 @@ async fn probe(
                     .clone(),
             )
         };
-        let selection_input = serde_json::from_value(serde_json::json!({"providerProfileId":profile_id,"profileRevision":revision,"catalogSnapshotId":catalog.catalog_snapshot_id,"catalogDigest":catalog.catalog_digest,"modelId":model.model_id,"modeId":mode_id,"expectedSelectionRevision":null})).map_err(|_| "model selection input encoding")?;
+        let selection_input = serde_json::from_value(serde_json::json!({"providerProfileId":profile_id,"profileRevision":revision,"catalogSnapshotId":catalog.catalog_snapshot_id,"catalogDigest":catalog.catalog_digest,"modelId":model.model_id,"modeId":mode_id,"expectedSelectionRevision":saved_binding.as_ref().map(|binding| binding.model_selection_revision)})).map_err(|_| "model selection input encoding")?;
         let selected_model =
             profiles::select_provider_model(window.clone(), app.state(), selection_input)
                 .map_err(|_| "explicit provider model selection")?;
-        let selection_input = serde_json::from_value(serde_json::json!({"coreId":core_id,"providerProfileId":profile_id,"profileRevision":revision,"modelSelectionRevision":selected_model.selection_revision,"expectedSelectionRevision":null})).map_err(|_| "core selection input encoding")?;
+        let selection_input = serde_json::from_value(serde_json::json!({"coreId":core_id,"providerProfileId":profile_id,"profileRevision":revision,"modelSelectionRevision":selected_model.selection_revision,"expectedSelectionRevision":saved_binding.as_ref().and_then(|binding| binding.core_selection_revision)})).map_err(|_| "core selection input encoding")?;
         let selected_core =
             profiles::select_core_model(window.clone(), app.state(), selection_input)
                 .map_err(|_| "independent core selection")?;
-        observed_selections.push(serde_json::json!({"coreId":core_id,"providerProfileId":profile_id,"catalogSnapshotId":catalog.catalog_snapshot_id,"artifactSetDigest":catalog.artifact_set_digest,"acpExecutableSha256":catalog.adapter_digest,"modelId":model.model_id,"modeId":mode_id,"modelPolicy":"explicit_environment_member","modePolicy":"explicit_environment_member"}));
+        if let Some(input) = &mut saved_input {
+            let binding = input
+                .bindings
+                .iter_mut()
+                .find(|binding| binding.core_id == core_id)
+                .ok_or("saved core missing")?;
+            binding.model_profile_revision = revision;
+            binding.model_selection_revision = selected_model.selection_revision;
+            binding.core_selection_revision = Some(selected_core.selection_revision);
+        }
+        observed_selections.push(serde_json::json!({"coreId":core_id,"providerProfileId":profile_id,"catalogSnapshotId":catalog.catalog_snapshot_id,"artifactSetDigest":catalog.artifact_set_digest,"acpExecutableSha256":catalog.adapter_digest,"modelId":model.model_id,"modeId":mode_id,"modelPolicy":if saved_binding.is_some() {"durable_saved_member"} else {"explicit_environment_member"},"modePolicy":if saved_binding.is_some() {"durable_saved_member"} else {"explicit_environment_member"}}));
         core_bindings.push(magi_storage::CoreBindingReference {
             core_id,
             provider_profile_id: profile_id,
@@ -1389,7 +2333,6 @@ async fn probe(
     let draft_id = uuid::Uuid::new_v4().to_string();
     let capture_storage = storage.clone();
     let capture_draft = draft_id.clone();
-    let approved_source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../docs/SECURITY.md");
     let expected_source_digest = std::env::var("MAGI_TEST_POLICY_SOURCE_DIGEST")
         .map_err(|_| "explicit approved canonical source digest required")?;
     if expected_source_digest.len() != 64
@@ -1419,11 +2362,8 @@ async fn probe(
         _capture_operation
             .check()
             .map_err(|_| "source capture resources frozen".to_owned())?;
-        let bytes =
-            std::fs::read(&approved_source).map_err(|_| "approved canonical source unavailable")?;
-        if magi_domain::Digest::from_bytes(&bytes).as_str() != expected_source_digest {
-            return Err("approved canonical source changed".to_owned());
-        }
+        let approved_source = verified_policy_resource(&resource_root, &expected_source_digest)
+            .map_err(str::to_owned)?;
         commands::capture_context_files(
             capture_storage,
             capture_draft,
@@ -1473,7 +2413,7 @@ async fn probe(
             .map_err(|_| "source capture evidence encoding")?,
     )
     .map_err(|_| "source capture evidence")?;
-    let question = "Using the explicitly captured product security contract as the factual basis, evaluate the explicit-confirmation policy for this desktop product. Users manually select local subscription profiles; inference is performed by the selected external provider, not locally merely because the app is local. Source grants restrict explicitly selected representations. Disclosure includes the question, roles and authorized sources, followed by permitted sharing of reviews and the common proposal. App diagnostics exclude body contents and there is no app-operator LLM gateway. Decide the confirmation contents and when a scope change requires reconfirmation. Treat unknown provider retention/training/deletion policy as an explicit limitation, not an assumed guarantee. Do not assume a file-type distribution, user-test results or jurisdiction-specific compliance. This is an application safeguard policy decision, not a declaration that any particular provider/account is safe for all data. Preserve legitimate meaning-changing essential gaps; distinguish conditional deployment limitations from facts needed to decide the stated application policy.";
+    let question = "Using only the explicitly captured product security contract, produce the confirmation checklist for this desktop product before a saved subscription profile sends an approved source representation to its selected external provider. Identify the fields that must be disclosed and the changes that require reconfirmation. The captured contract already defines the decision scope: do not request additional user data, do not infer facts outside the source, and record unknown provider retention, training, deletion, or cancellation behavior as a non-essential limitation of the policy. Return a complete policy decision grounded in the approved source so the review can proceed to cross-review, synthesis, and private ballots.";
     let mut request = serde_json::json!({"commandId":command_id,"idempotencyKey":command_id,"question":question,"contextDraftId":draft_id,"contextRevision":context_revision,"coreBindings":core_bindings,"rolePresetId":role.preset_id,"roleRevision":role.revision,"disclosureConfirmed":true});
     monitor.ensure_running()?;
     *monitor.active_request.lock().map_err(|_| "request reference lock")? = Some(serde_json::from_value(serde_json::json!({"request":request,"commandId":uuid::Uuid::new_v4().to_string(),"idempotencyKey":uuid::Uuid::new_v4().to_string()})).map_err(|_| "cancellation intent encoding")?);
@@ -1731,7 +2671,11 @@ async fn probe(
 
 #[cfg(test)]
 mod purpose_tests {
-    use super::{ConnectionUiReport, PdfUiReport, ProbePurpose, valid_recovery_run};
+    use super::{
+        ConnectionUiFailureStage, ConnectionUiReport, PdfUiReport, ProbeFrontendMode, ProbePurpose,
+        ui_script_initialized, valid_recovery_run, validate_ui_phase, validate_ui_progress,
+        write_ui_observation,
+    };
 
     struct MetadataTestCleanup(Vec<(std::path::PathBuf, u64, u64)>);
     impl MetadataTestCleanup {
@@ -1758,6 +2702,172 @@ mod purpose_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn installed_policy_resource_requires_sealed_exact_approved_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("policy-resource-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let mut cleanup = MetadataTestCleanup(Vec::new());
+        cleanup.track(&root);
+        let bytes = b"Explicit approved policy";
+        let digest = magi_domain::Digest::from_bytes(bytes);
+        assert!(super::verified_policy_resource(&root, digest.as_str()).is_err());
+        let policy = root.join("policy");
+        std::fs::create_dir(&policy).unwrap();
+        let path = policy.join("SECURITY.md");
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        std::fs::set_permissions(&policy, std::fs::Permissions::from_mode(0o555)).unwrap();
+        assert_eq!(
+            super::verified_policy_resource(&root, digest.as_str()).unwrap(),
+            path
+        );
+        assert!(
+            super::verified_policy_resource(
+                &root,
+                magi_domain::Digest::from_bytes(b"changed").as_str()
+            )
+            .is_err()
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(super::verified_policy_resource(&root, digest.as_str()).is_err());
+        std::fs::set_permissions(&policy, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn saved_profile_intake_historical_metadata_never_authorizes_current_execution() {
+        let (root, storage, _, _) =
+            crate::profiles::catalog_selection_ipc_tests::publication_fault_fixture();
+        let mut cleanup = MetadataTestCleanup(Vec::new());
+        cleanup.track(&root);
+        let id = "pause-profile-0";
+        let profile = storage.load_provider_profile(id).unwrap().unwrap();
+        let model = storage.load_provider_model_selection(id).unwrap().unwrap();
+        let input = magi_domain::ProviderProfileInput {
+            provider_profile_id: id.into(),
+            provider_id: profile.provider_id,
+            display_name: "Observed renamed profile".into(),
+            account_alias: profile.account_alias,
+            authentication_method: profile.authentication_method,
+            secret_reference: None,
+            runtime_home_id: profile.runtime_home_id,
+            credential_home: profile.credential_home,
+        };
+        let head = storage
+            .save_provider_profile(&input, Some(0), "2026-10-02T18:00:00Z")
+            .unwrap();
+        assert_eq!(head.revision, 1);
+        assert!(storage.load_provider_model_selection(id).is_err());
+        let historical = storage
+            .load_historical_model_selection_metadata(id, 0, model.selection_revision)
+            .unwrap()
+            .unwrap();
+        assert_eq!(historical.binding.model_id, model.binding.model_id);
+        assert_eq!(historical.binding.mode_id, model.binding.mode_id);
+        assert!(
+            storage
+                .load_historical_model_selection_metadata(id, 1, model.selection_revision)
+                .is_err()
+        );
+        assert!(
+            storage
+                .load_historical_model_selection_metadata(id, 0, model.selection_revision + 1)
+                .is_err()
+        );
+        assert!(
+            storage
+                .load_historical_model_selection_metadata("missing-profile", 0, 0)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn saved_profile_intake_preserves_exact_durable_routing_and_rejects_drift() {
+        let (root, storage, _, _) =
+            crate::profiles::catalog_selection_ipc_tests::publication_fault_fixture();
+        let mut cleanup = MetadataTestCleanup(Vec::new());
+        cleanup.track(&root);
+        let bindings = magi_domain::CoreId::ALL.map(|core_id| {
+            let core = storage.load_core_model_selection(core_id).unwrap().unwrap();
+            let profile = storage
+                .load_provider_profile(&core.provider_profile_id)
+                .unwrap()
+                .unwrap();
+            let model = storage
+                .load_provider_model_selection(&core.provider_profile_id)
+                .unwrap()
+                .unwrap();
+            super::SavedProfileBinding {
+                core_id,
+                provider_profile_id: profile.provider_profile_id,
+                profile_revision: profile.revision,
+                model_profile_revision: model.binding.profile_revision,
+                model_selection_revision: model.selection_revision,
+                model_id: model.binding.model_id,
+                mode_id: model.binding.mode_id,
+                core_selection_revision: Some(core.selection_revision),
+            }
+        });
+        let input = super::SavedProfileInput {
+            schema_version: 1,
+            prepared_store_digest: "a".repeat(64),
+            bindings,
+        };
+        assert!(super::validate_saved_profile_records(&storage, &input).is_ok());
+        let backup = root.with_file_name(format!("saved-backup-{}", uuid::Uuid::new_v4()));
+        let restored = root.with_file_name(format!("saved-restored-{}", uuid::Uuid::new_v4()));
+        let manifest = storage.create_backup(&backup).unwrap();
+        cleanup.track(&backup);
+        assert_eq!(manifest.store_id, storage.identity().store_id);
+        let receipt = magi_storage::Storage::restore_backup(&backup, &restored).unwrap();
+        cleanup.track(&restored);
+        assert_eq!(receipt.store_id, manifest.store_id);
+        let restored_storage = magi_storage::Storage::open_or_create(&restored).unwrap();
+        for binding in &input.bindings {
+            let profile = restored_storage
+                .load_provider_profile(&binding.provider_profile_id)
+                .unwrap()
+                .unwrap();
+            let model = restored_storage
+                .load_provider_model_selection(&binding.provider_profile_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(profile.revision, binding.profile_revision);
+            assert_eq!(model.binding.model_id, binding.model_id);
+            assert_eq!(model.binding.mode_id, binding.mode_id);
+        }
+        drop(restored_storage);
+
+        for kind in 0..6 {
+            let mut bad = input.clone();
+            match kind {
+                0 => bad.bindings[0].provider_profile_id = "missing-profile".into(),
+                1 => bad.bindings[0].profile_revision += 1,
+                2 => bad.bindings[0].model_selection_revision += 1,
+                3 => bad.bindings[0].model_id = "different-model".into(),
+                4 => bad.bindings.swap(0, 1),
+                _ => bad.bindings[0].mode_id = Some("different-mode".into()),
+            }
+            if kind == 4 {
+                bad.bindings[0].core_id = input.bindings[0].core_id;
+                bad.bindings[1].core_id = input.bindings[1].core_id;
+            }
+            assert!(super::validate_saved_profile_records(&storage, &bad).is_err());
+        }
+        let mut duplicate = input.clone();
+        duplicate.bindings[1].provider_profile_id =
+            duplicate.bindings[0].provider_profile_id.clone();
+        assert!(duplicate.validate().is_err());
+        duplicate = input.clone();
+        duplicate.bindings[1].core_id = duplicate.bindings[0].core_id;
+        assert!(duplicate.validate().is_err());
+        let mut value = serde_json::to_value(&input).unwrap();
+        value["fallbackModel"] = serde_json::json!("global-model");
+        assert!(serde_json::from_value::<super::SavedProfileInput>(value).is_err());
+        assert!(serde_json::from_str::<super::SavedProfileInput>("{}").is_err());
     }
 
     #[test]
@@ -2138,6 +3248,185 @@ mod purpose_tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("history capacity exceeded"));
+    }
+
+    #[test]
+    fn connections_ui_phase_distinguishes_missing_script_from_stalled_projection() {
+        assert!(!ui_script_initialized(&[]));
+        let initialized = serde_json::json!({"kind":"phase","stage":"profile_query","phase":"script_initialized","checkpointCount":0});
+        let stalled = serde_json::json!({"kind":"phase","stage":"row_projection","phase":"projection_pending","checkpointCount":0});
+        assert!(ui_script_initialized(&[initialized, stalled.clone()]));
+        let value =
+            serde_json::json!({"schemaVersion":1,"nonce":"bound","pid":7,"checkpoint":stalled});
+        assert!(serde_json::from_value::<ConnectionUiReport>(value.clone()).is_ok());
+        for field in ["phase", "stage"] {
+            let mut bad = value.clone();
+            bad["checkpoint"][field] = serde_json::json!("private_canary");
+            assert!(serde_json::from_value::<ConnectionUiReport>(bad).is_err());
+        }
+        let mut bad = value;
+        bad["checkpoint"]["rawDom"] = serde_json::json!("private_canary");
+        assert!(serde_json::from_value::<ConnectionUiReport>(bad).is_err());
+    }
+
+    #[test]
+    fn connections_ui_modal_edit_phases_are_closed_and_stage_bound() {
+        for phase in [
+            "edit_control_wait",
+            "edit_control_found",
+            "edit_clicked",
+            "edit_dialog_found",
+            "edit_dialog_focus_wait",
+            "edit_dialog_focus_ready",
+            "edit_trigger_focus_restored",
+            "edit_focus_failed",
+        ] {
+            let checkpoint = serde_json::json!({"kind":"phase","stage":"modal_edit","phase":phase,"checkpointCount":2});
+            let value = serde_json::json!({"schemaVersion":1,"nonce":"bound","pid":7,"checkpoint":checkpoint});
+            let report: ConnectionUiReport = serde_json::from_value(value.clone()).unwrap();
+            let super::ConnectionUiCheckpoint::Phase {
+                stage,
+                phase,
+                checkpoint_count,
+            } = report.checkpoint
+            else {
+                panic!("expected phase")
+            };
+            assert!(validate_ui_phase(&stage, &phase, checkpoint_count, 2, &[]).is_ok());
+            assert!(
+                validate_ui_phase(&ConnectionUiFailureStage::ModalAdd, &phase, 2, 2, &[]).is_err()
+            );
+            assert!(validate_ui_phase(&stage, &phase, 1, 1, &[]).is_err());
+            assert!(validate_ui_phase(&stage, &phase, 2, 1, &[]).is_err());
+            assert!(
+                validate_ui_phase(&stage, &phase, 2, 2, &vec![serde_json::Value::Null; 64])
+                    .is_err()
+            );
+            for field in ["html", "rawDom", "rawError"] {
+                let mut invalid = value.clone();
+                invalid["checkpoint"][field] = serde_json::json!("private_canary");
+                assert!(serde_json::from_value::<ConnectionUiReport>(invalid).is_err());
+            }
+        }
+        for phase in ["edit_unknown", "edit_control_wait\n", "<div>private</div>"] {
+            let value = serde_json::json!({"schemaVersion":1,"nonce":"bound","pid":7,"checkpoint":{"kind":"phase","stage":"modal_edit","phase":phase,"checkpointCount":2}});
+            assert!(serde_json::from_value::<ConnectionUiReport>(value).is_err());
+        }
+    }
+
+    #[test]
+    fn connections_ui_progress_is_closed_and_deadline_retains_stage() {
+        assert!(validate_ui_progress(&ConnectionUiFailureStage::ProfileQuery, 0, 0, 0).is_ok());
+        assert!(validate_ui_progress(&ConnectionUiFailureStage::DraftReturn, 1, 1, 3).is_ok());
+        assert!(validate_ui_progress(&ConnectionUiFailureStage::DraftReturn, 0, 0, 3).is_err());
+        assert!(validate_ui_progress(&ConnectionUiFailureStage::ModalAdd, 2, 2, 3).is_err());
+        let value = serde_json::json!({"schemaVersion":1,"nonce":"bound","pid":7,"checkpoint":{"kind":"progress","stage":"row_projection","checkpointCount":0}});
+        assert!(serde_json::from_value::<ConnectionUiReport>(value.clone()).is_ok());
+        let mut unknown = value.clone();
+        unknown["checkpoint"]["stage"] = serde_json::json!("private_canary");
+        assert!(serde_json::from_value::<ConnectionUiReport>(unknown).is_err());
+        let mut extra = value;
+        extra["checkpoint"]["html"] = serde_json::json!("private_canary");
+        assert!(serde_json::from_value::<ConnectionUiReport>(extra).is_err());
+        let root =
+            std::env::temp_dir().join(format!("deadline-observation-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let body = serde_json::json!({"lastProgress":{"kind":"progress","stage":"row_projection","checkpointCount":0},"acceptedCheckpointCount":0,"failureReceived":false});
+        write_ui_observation(&root, "connections-ui-deadline.json", &body).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                &std::fs::read(root.join("connections-ui-deadline.json")).unwrap()
+            )
+            .unwrap(),
+            body
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn connections_ui_failure_is_allowlisted_and_count_bound() {
+        let value = serde_json::json!({"schemaVersion":1,"nonce":"bound","pid":7,"checkpoint":{"kind":"failed","stage":"row_projection","code":"saved_model","checkpointCount":0,"modelMismatch":{"actualModelId":"選択","actualModeId":null,"expectedModelId":"model","expectedModeId":"mode"}}});
+        let report: ConnectionUiReport = serde_json::from_value(value.clone()).unwrap();
+        assert!(report.validates_authority(true, "bound", 7, "main"));
+        assert!(report.checkpoint.validate_failure_count(0).is_ok());
+        assert!(report.checkpoint.validate_failure_count(1).is_err());
+        for field in ["stage", "code"] {
+            let mut invalid = value.clone();
+            invalid["checkpoint"][field] = serde_json::json!("private_canary");
+            assert!(serde_json::from_value::<ConnectionUiReport>(invalid).is_err());
+        }
+        let mut extra = value.clone();
+        extra["checkpoint"]["rawError"] = serde_json::json!("private_canary");
+        assert!(serde_json::from_value::<ConnectionUiReport>(extra).is_err());
+        for field in ["actualModelId", "expectedModeId"] {
+            for token in [
+                serde_json::json!(""),
+                serde_json::json!("x".repeat(257)),
+                serde_json::json!("private\ncanary"),
+            ] {
+                let mut invalid = value.clone();
+                invalid["checkpoint"]["modelMismatch"][field] = token;
+                let report: ConnectionUiReport = serde_json::from_value(invalid).unwrap();
+                assert!(report.checkpoint.validate_failure_count(0).is_err());
+            }
+        }
+        let mut extra_tokens = value.clone();
+        extra_tokens["checkpoint"]["modelMismatch"]["html"] = serde_json::json!("private_canary");
+        assert!(serde_json::from_value::<ConnectionUiReport>(extra_tokens).is_err());
+        let mut wrong_stage = value.clone();
+        wrong_stage["checkpoint"]["stage"] = serde_json::json!("connections");
+        let report: ConnectionUiReport = serde_json::from_value(wrong_stage).unwrap();
+        assert!(report.checkpoint.validate_failure_count(0).is_err());
+        let mut projection = value.clone();
+        projection["checkpoint"]["code"] = serde_json::json!("catalog_projection_error");
+        projection["checkpoint"]["modelMismatch"] = serde_json::Value::Null;
+        let report: ConnectionUiReport = serde_json::from_value(projection.clone()).unwrap();
+        assert!(report.checkpoint.validate_failure_count(0).is_ok());
+        let mut with_tokens = projection.clone();
+        with_tokens["checkpoint"]["modelMismatch"] = value["checkpoint"]["modelMismatch"].clone();
+        let report: ConnectionUiReport = serde_json::from_value(with_tokens).unwrap();
+        assert!(report.checkpoint.validate_failure_count(0).is_err());
+        projection["checkpoint"]["stage"] = serde_json::json!("connections");
+        let report: ConnectionUiReport = serde_json::from_value(projection).unwrap();
+        assert!(report.checkpoint.validate_failure_count(0).is_err());
+        let mut excessive = value;
+        excessive["checkpoint"]["checkpointCount"] = serde_json::json!(4);
+        let report: ConnectionUiReport = serde_json::from_value(excessive).unwrap();
+        assert!(report.checkpoint.validate_failure_count(4).is_err());
+    }
+
+    #[test]
+    fn probe_frontend_mode_is_closed_and_embedded_assets_are_required() {
+        use std::os::unix::ffi::OsStrExt;
+        let invalid = std::ffi::OsStr::from_bytes(&[0xff]);
+        let server = std::ffi::OsStr::new("http://127.0.0.1:1427");
+        assert!(ProbeFrontendMode::select_os(Some(invalid), Some(server), true).is_err());
+        assert!(
+            ProbeFrontendMode::select_os(
+                Some(std::ffi::OsStr::new("embedded-assets")),
+                Some(invalid),
+                true
+            )
+            .is_err()
+        );
+
+        assert_eq!(
+            ProbeFrontendMode::select(None, Some("http://127.0.0.1:1427"), false),
+            Ok(ProbeFrontendMode::DebugServer)
+        );
+        assert_eq!(
+            ProbeFrontendMode::select(Some("embedded-assets"), None, true),
+            Ok(ProbeFrontendMode::EmbeddedAssets)
+        );
+        assert!(ProbeFrontendMode::select(Some("embedded-assets"), None, false).is_err());
+        assert!(
+            ProbeFrontendMode::select(Some("embedded-assets"), Some("http://127.0.0.1:1427"), true)
+                .is_err()
+        );
+        for mode in ["", "automatic", "https://example.com"] {
+            assert!(ProbeFrontendMode::select(Some(mode), None, true).is_err());
+        }
+        assert!(ProbeFrontendMode::select(None, Some("http://127.0.0.1:1420"), true).is_err());
     }
 
     #[test]
@@ -2790,5 +4079,254 @@ mod terminal_stream_settlement_tests {
         tauri::async_runtime::block_on(
             aborted_delivery_caller_cannot_publish_zero_settlement_before_worker_exit(),
         );
+    }
+}
+
+#[cfg(test)]
+mod saved_activation_tests {
+    use super::*;
+    use magi_storage::Storage;
+    use std::{
+        fs,
+        time::{Duration, Instant},
+    };
+    use tauri::async_runtime;
+    struct ApplicationFixture(PathBuf);
+    impl Drop for ApplicationFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn saved_profile_fixture(root: &std::path::Path) -> (Storage, SavedProfileInput) {
+        let storage = Storage::open_or_create(root).unwrap();
+        let bindings = magi_domain::CoreId::ALL.map(|core_id| {
+            let index = core_id as usize;
+            let provider_profile_id = format!("saved-profile-{index}");
+            let profile = storage
+                .save_provider_profile(
+                    &magi_domain::ProviderProfileInput {
+                        provider_profile_id: provider_profile_id.clone(),
+                        provider_id: "codex-acp".into(),
+                        display_name: provider_profile_id.clone(),
+                        account_alias: "fixture-account".into(),
+                        authentication_method:
+                            magi_domain::ProviderAuthenticationMethod::LocalSubscription,
+                        secret_reference: None,
+                        runtime_home_id: format!("runtime-{provider_profile_id}"),
+                        credential_home: None,
+                    },
+                    None,
+                    "2026-10-03T00:00:00Z",
+                )
+                .unwrap();
+            let catalog = magi_domain::ProviderCatalogSnapshot::new(
+                magi_domain::ProviderCatalogInput {
+                    catalog_snapshot_id: format!("saved-catalog-{index}"),
+                    provider_id: profile.provider_id.clone(),
+                    provider_profile_id: profile.provider_profile_id.clone(),
+                    profile_revision: profile.revision,
+                    adapter_id: "codex-acp".into(),
+                    adapter_version: "1".into(),
+                    adapter_digest: magi_domain::Digest::from_bytes(b"saved-adapter"),
+                    fetched_at: "2026-10-03T00:00:00Z".into(),
+                },
+                vec![magi_domain::ProviderCatalogModel {
+                    model_id: "saved-model".into(),
+                    name: Some("Saved model".into()),
+                    description: None,
+                    context_window_tokens: Some(4096),
+                    max_output_tokens: Some(1024),
+                }],
+            )
+            .unwrap()
+            .with_negotiated_modes(magi_domain::NegotiatedModeState {
+                current_mode_id: Some("agent".into()),
+                modes: vec![magi_domain::ProviderCatalogMode {
+                    mode_id: "agent".into(),
+                    name: "Agent".into(),
+                    description: None,
+                }],
+            })
+            .unwrap()
+            .with_artifact_set_digest(magi_domain::Digest::from_bytes(b"saved-catalog-set"))
+            .unwrap();
+            storage.save_provider_catalog_snapshot(&catalog).unwrap();
+            let selection = storage
+                .select_provider_model(&magi_storage::ProviderModelSelectionInput {
+                    provider_profile_id: provider_profile_id.clone(),
+                    profile_revision: profile.revision,
+                    catalog_snapshot_id: catalog.catalog_snapshot_id.clone(),
+                    catalog_digest: catalog.catalog_digest.clone(),
+                    model_id: "saved-model".into(),
+                    mode_id: Some("agent".into()),
+                    expected_selection_revision: None,
+                    updated_at: "2026-10-03T00:00:00Z".into(),
+                })
+                .unwrap();
+            let core = storage
+                .select_core_model(&magi_storage::CoreModelSelectionInput {
+                    core_id,
+                    provider_profile_id: provider_profile_id.clone(),
+                    profile_revision: profile.revision,
+                    model_selection_revision: selection.selection_revision,
+                    expected_selection_revision: None,
+                    updated_at: "2026-10-03T00:00:00Z".into(),
+                })
+                .unwrap();
+            SavedProfileBinding {
+                core_id,
+                provider_profile_id,
+                profile_revision: profile.revision,
+                model_profile_revision: selection.binding.profile_revision,
+                model_selection_revision: selection.selection_revision,
+                model_id: selection.binding.model_id,
+                mode_id: selection.binding.mode_id,
+                core_selection_revision: Some(core.selection_revision),
+            }
+        });
+        let input = SavedProfileInput {
+            schema_version: 1,
+            prepared_store_digest: "a".repeat(64),
+            bindings,
+        };
+        (storage, input)
+    }
+
+    #[test]
+    fn saved_profile_preparation_uses_fresh_active_fence_before_activation() {
+        let root = std::env::temp_dir().join(format!("saved-preparation-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let _cleanup = ApplicationFixture(root.clone());
+        let source_root = root.join("source");
+        let (storage, input) = saved_profile_fixture(&source_root);
+        let expected_store = storage.identity().store_id.clone();
+        let input_path = root.join("saved-input.json");
+        write_saved_profile_input(&input_path, &input).unwrap();
+        let backup = root.join("backup");
+        storage.create_backup(&backup).unwrap();
+        let backup_database = fs::read(backup.join("magi.sqlite")).unwrap();
+        drop(storage);
+        let inert_root = root.join("inert");
+        Storage::restore_backup(&backup, &inert_root).unwrap();
+        let inert = Storage::open_or_create(&inert_root).unwrap();
+        assert!(!inert.admission_execution_authority().unwrap().active);
+        assert!(
+            async_runtime::block_on(retained_saved_preparation(
+                inert,
+                Instant::now() + Duration::from_secs(30),
+            ))
+            .is_err()
+        );
+        let fence_root = root.join("fence");
+        let destination = root.join("destination");
+        prepare_saved_profile_run_store_at(
+            &fence_root,
+            &backup,
+            &destination,
+            &input_path,
+            &expected_store,
+        )
+        .unwrap();
+        let active = Storage::open_or_create(&destination).unwrap();
+        assert!(active.admission_execution_authority().unwrap().active);
+        drop(active);
+        assert_eq!(
+            fs::read(backup.join("magi.sqlite")).unwrap(),
+            backup_database
+        );
+        let fenced = Storage::open_or_create(&fence_root).unwrap();
+        assert!(!fenced.admission_execution_authority().unwrap().active);
+        assert!(destination.join("saved-profile-bindings.json").is_file());
+    }
+
+    #[test]
+    fn saved_run_activation_retains_native_closure_and_reopens_active() {
+        let root = std::env::temp_dir().join(format!("saved-activation-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let _cleanup = ApplicationFixture(root.clone());
+        let source_root = root.join("source");
+        let source = Storage::open_or_create(&source_root).unwrap();
+        let initial_prior = source.admission_execution_authority().unwrap();
+        source.create_backup(&root.join("backup")).unwrap();
+        Storage::restore_backup(&root.join("backup"), &root.join("target")).unwrap();
+        let mut target = Storage::open_or_create(root.join("target")).unwrap();
+        assert!(!target.admission_execution_authority().unwrap().active);
+        let (mut source, mut permission) = async_runtime::block_on(retained_saved_preparation(
+            source,
+            Instant::now() + Duration::from_secs(30),
+        ))
+        .unwrap();
+        assert_eq!(
+            permission.prior.store_generation,
+            initial_prior.store_generation
+        );
+        let expected_prior = permission.prior.clone();
+        let mut wrong = expected_prior.clone();
+        wrong.lineage_id.push_str("-wrong");
+        assert!(
+            magi_storage::AdmissionActivationPermission::validate(&permission, &wrong).is_err()
+        );
+        let deadline = permission.deadline;
+        permission.deadline = Instant::now();
+        assert!(
+            magi_storage::AdmissionActivationPermission::validate(&permission, &expected_prior)
+                .is_err()
+        );
+        permission.deadline = deadline;
+        let (active, permission) = target
+            .activate_restored_execution_checked(&mut source, |expected| {
+                magi_storage::AdmissionActivationPermission::validate(&permission, expected)?;
+                Ok(permission)
+            })
+            .unwrap();
+        assert!(active.active);
+        assert!(!source.admission_execution_authority().unwrap().active);
+        drop(target);
+        drop(source);
+        let reopened = Storage::open_or_create(root.join("target")).unwrap();
+        let current = reopened.admission_execution_authority().unwrap();
+        assert!(current.active);
+        assert_eq!(current.lineage_id, active.lineage_id);
+        permission.quiescence.validate().unwrap();
+        let lifecycle =
+            commands::AdmissionRequestLifecycle::until(Instant::now() + Duration::from_secs(30));
+        assert!(lifecycle.check_execution().is_err());
+        let lifecycle =
+            commands::AdmissionRequestLifecycle::until(Instant::now() + Duration::from_secs(30));
+        lifecycle.bind_execution(Arc::new(reopened)).unwrap();
+        lifecycle.check_execution().unwrap();
+    }
+
+    #[test]
+    fn saved_run_activation_rejects_real_unsettled_source_without_switch() {
+        let (root, source, _, _) =
+            crate::profiles::catalog_selection_ipc_tests::publication_fault_fixture();
+        let _cleanup = ApplicationFixture(root.clone());
+        source
+            .create_backup(&root.join("activation-backup"))
+            .unwrap();
+        Storage::restore_backup(
+            &root.join("activation-backup"),
+            &root.join("activation-target"),
+        )
+        .unwrap();
+        let mut target = Storage::open_or_create(root.join("activation-target")).unwrap();
+        let (mut source, permission) = async_runtime::block_on(retained_saved_preparation(
+            source,
+            Instant::now() + Duration::from_secs(30),
+        ))
+        .unwrap();
+        assert!(
+            target
+                .activate_restored_execution_checked(&mut source, |_| Ok(permission))
+                .is_err()
+        );
+        assert!(source.admission_execution_authority().unwrap().active);
+        assert!(!target.admission_execution_authority().unwrap().active);
+        let lifecycle =
+            commands::AdmissionRequestLifecycle::until(Instant::now() + Duration::from_secs(30));
+        assert!(lifecycle.bind_execution(Arc::new(target)).is_err());
+        assert!(lifecycle.check_execution().is_err());
     }
 }

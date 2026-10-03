@@ -58,6 +58,9 @@ export type AcpAdapterSummary = {
 };
 
 export type AcpAdapterState = "loading" | "ready" | "unavailable" | "error";
+function profileSetupSupported(adapterId: string, adapters: AcpAdapterSummary[], adaptersState: AcpAdapterState): boolean {
+  return adapterId === "codex-acp" || (adaptersState === "ready" && adapters.some(adapter => adapter.id === adapterId && adapter.id !== "openai-responses" && adapter.state === "supported"));
+}
 export type AcpProfileStoreState = "loading" | "ready" | "unavailable" | "error";
 export type AcpProfileBlockReason = ProviderAdmissionFailure;
 
@@ -869,6 +872,7 @@ function ProviderPage({ coreBindings, onCheckConnection, onBack, adaptersState, 
   onSelectedLiveModelIdChange: (modelId: string) => void;
 }) {
   const [modeId, setModeId] = useState("");
+  const profileDialogInvoker = useRef<HTMLButtonElement | null>(null);
   const subscriptionProfiles = profiles.filter(profile => profile.authenticationMethod === "local_subscription");
   const selectedProfile = subscriptionProfiles.find((profile) => profile.id === selectedProfileId);
   const selectedAdapter = selectedProfile && adapters.find((adapter) => adapter.id === selectedProfile.adapterId);
@@ -919,7 +923,8 @@ function ProviderPage({ coreBindings, onCheckConnection, onBack, adaptersState, 
           const verified = isProfileAdmissionValid(profile);
           const stateLabel = profileAdmissionLabel(profile, verified);
           const savedState = coreBindings.catalogs[profile.id];
-          const savedModel = savedState?.modelSelection?.binding;
+          const catalogProjection = coreBindings.profileCatalogProjection(profile);
+          const savedModel = catalogProjection === "ready" ? savedState?.modelSelection?.binding : undefined;
           const savedModelStale = Boolean(savedModel && (savedModel.profileRevision !== profile.revision || savedState.selectionState !== "selected"));
           const authentication = coreBindings.verifiedAuthentication(profile);
           const checkState = coreBindings.profileConnectionState(profile);
@@ -940,19 +945,19 @@ function ProviderPage({ coreBindings, onCheckConnection, onBack, adaptersState, 
           const authProgressLabel = authProgressForProfile
             ? authProgressForProfile.stage === "failed" ? "기존 인증 확인 실패" : authProgressForProfile.stage === "cancelled" ? "인증 확인 취소됨" : "기존 구독 인증 상태 확인 중"
             : null;
-          return <li className={`acp-profile-item ${profile.id === selectedProfileId ? "selected" : ""}`} key={profile.id}>
+          return <li className={`acp-profile-item ${profile.id === selectedProfileId ? "selected" : ""}`} key={profile.id} data-catalog-projection={catalogProjection} data-profile-id={profile.id} data-profile-revision={profile.revision}>
             <button type="button" className="acp-profile-select" aria-pressed={profile.id === selectedProfileId} disabled={liveRequestState === "starting"} onClick={() => onSelect(profile.id)}>
               <span className="acp-profile-mark" aria-hidden="true">{verified ? "✓" : "◇"}</span>
               <span className="acp-profile-copy"><strong>{profile.displayName}</strong><small>{adapter?.displayName ?? profile.adapterId} · {"기존 CLI 구독"}{profile.accountAlias ? ` · ${profile.accountAlias}` : ""}</small></span>
               <span className={`status-chip ${verified ? "chip-support" : "chip-unknown"}`}>{stateLabel}</span>
             </button>
             <p className="field-help">인증 홈 · <code>{profile.credentialHome?.displayPath ?? "저장된 경로 없음 · 편집 필요"}</code></p>
-            <p className="field-help">저장 모델 · <code>{savedModel?.modelId ?? "선택하지 않음"}</code>{savedModel?.modeId ? <> · 모드 <code>{savedModel.modeId}</code></> : null}{savedModelStale ? " · 저장한 모델 선택을 다시 확인하십시오" : ""}</p>
+            <p className="field-help">저장 모델 · <code>{catalogProjection === "pending" ? "저장된 모델 확인 중…" : catalogProjection === "error" ? "저장된 모델 확인 실패" : savedModel?.modelId ?? "선택하지 않음"}</code>{savedModel?.modeId ? <> · 모드 <code>{savedModel.modeId}</code></> : null}{savedModelStale ? " · 저장한 모델 선택을 다시 확인하십시오" : ""}</p>
             <p className="field-help">인증 상태 · {authenticationLabel}</p>
             <p className="field-help">마지막 인증 확인 · {verifiedAt ? <time dateTime={verifiedAt}>{new Date(verifiedAt).toLocaleString("ko-KR")}</time> : authentication || checkState !== "not_checked" ? "시간 미확인" : "확인 기록 없음"}</p>
 
             <div className="acp-profile-actions">
-              <Button onClick={() => onBeginEdit(profile.id)} disabled={liveRequestState === "starting" || profilesState !== "ready" || writeState === "saving"}>편집</Button>
+              <Button data-profile-edit-id={profile.id} data-profile-edit-revision={profile.revision} onClick={(event) => { profileDialogInvoker.current = event.currentTarget; onBeginEdit(profile.id); }} disabled={liveRequestState === "starting" || profilesState !== "ready" || writeState === "saving"}>편집</Button>
               <Button onClick={() => onCheckConnection(profile.id)} disabled={liveRequestState === "starting" || validationPendingForProfile || authenticatingProfileId !== null || liveCatalogState === "loading" || adaptersState !== "ready" || adapter?.state !== "supported" || writeState === "saving"}>{validationPendingForProfile || authenticatingProfileId === profile.id ? "연결 확인 중…" : "연결 확인"}</Button>
             </div>
             {validationPendingForProfile && <p className="field-help" role="status" aria-live="polite">실행 환경을 확인하고 있습니다.</p>}
@@ -961,7 +966,8 @@ function ProviderPage({ coreBindings, onCheckConnection, onBack, adaptersState, 
             {authErrorForProfile && <p className="live-acp-error" role="alert">{authErrorForProfile.message}</p>}
           </li>;
         })}</ul>}
-        {profilesState === "ready" && <div className="acp-profile-add"><Button tone="primary" onClick={onBeginCreate} disabled={liveRequestState === "starting" || writeState === "saving" || adaptersState !== "ready" || !adapters.some((adapter) => adapter.id !== "openai-responses" && adapter.state === "supported")}>새 ACP 프로필</Button></div>}
+        {adaptersState !== "ready" && <p className="field-help" role="status">{adaptersState === "loading" ? "실행 어댑터를 확인하고 있습니다. Codex ACP 프로필은 먼저 설정할 수 있습니다." : "실행 어댑터를 확인하지 못했습니다. Codex ACP 프로필 설정은 가능하지만 연결 확인과 실행은 차단됩니다."}</p>}
+        {profilesState === "ready" && <div className="acp-profile-add" data-adapters-state={adaptersState} data-add-readiness={profileSetupSupported("codex-acp", adapters, adaptersState) ? "ready" : "unavailable"}><Button tone="primary" data-profile-create="true" onClick={(event) => { profileDialogInvoker.current = event.currentTarget; onBeginCreate(); }} disabled={liveRequestState === "starting" || writeState === "saving"}>새 ACP 프로필</Button></div>}
       </Panel>
 
       <Panel title="연결 상태" kicker="CONNECTION STATUS">
@@ -1015,20 +1021,28 @@ function ProviderPage({ coreBindings, onCheckConnection, onBack, adaptersState, 
       <div className="page-actions"><Button onClick={onBack}>원래 화면으로 돌아가기</Button></div>
       {selectedProfile && !canRunSelectedProfile && <p className="unavailable-reason">선택한 프로필의 연결 확인을 완료하십시오.</p>}
     </PageHeadingAndLayout>
-    {draft && <AcpProfileEditorDialog key={`${draft.profileId ?? "new"}:${draft.expectedRevision ?? "new"}`} adaptersState={adaptersState} adapters={adapters} draft={draft} writeState={writeState} onDraftChange={onDraftChange} onBeginEdit={onBeginEdit} onSave={onSave} />}
+    {draft && <AcpProfileEditorDialog key={`${draft.profileId ?? "new"}:${draft.expectedRevision ?? "new"}`} adaptersState={adaptersState} adapters={adapters} draft={draft} invoker={profileDialogInvoker.current} writeState={writeState} onDraftChange={onDraftChange} onBeginEdit={onBeginEdit} onSave={onSave} />}
     </>
   );
 }
 
-function AcpProfileEditorDialog({ adaptersState, adapters, draft, writeState, onDraftChange, onBeginEdit, onSave }: {
+function profileDialogInvokerMatches(invoker: HTMLButtonElement | null, draft: AcpProfileDraft): boolean {
+  return Boolean(invoker?.isConnected && !invoker.disabled && (draft.profileId
+    ? invoker.dataset.profileEditId === draft.profileId && invoker.dataset.profileEditRevision === String(draft.expectedRevision)
+    : invoker.dataset.profileCreate === "true"));
+}
+
+function AcpProfileEditorDialog({ adaptersState, adapters, draft, invoker, writeState, onDraftChange, onBeginEdit, onSave }: {
   adaptersState: AcpAdapterState;
   adapters: AcpAdapterSummary[];
   draft: AcpProfileDraft;
+  invoker: HTMLButtonElement | null;
   writeState: AcpProfileWriteState;
   onDraftChange: (draft: AcpProfileDraft | null) => void;
   onBeginEdit: (profileId: string) => void;
   onSave: (draft: AcpProfileDraft) => void;
 }) {
+  const openingInvoker = useRef(invoker);
   const dialogRef = useRef<HTMLDialogElement>(null);
   const aliasRef = useRef<HTMLInputElement>(null);
   const discardRef = useRef<HTMLButtonElement>(null);
@@ -1038,19 +1052,17 @@ function AcpProfileEditorDialog({ adaptersState, adapters, draft, writeState, on
   const [validationError, setValidationError] = useState("");
   const [discardPrompt, setDiscardPrompt] = useState(false);
   const submitting = useRef(false);
-  const adapter = adapters.find((item) => item.id === draft.adapterId);
-  const canSubmit = Boolean(adapter?.state === "supported" && adaptersState === "ready" && writeState !== "saving" && writeState !== "conflict");
+  const canSubmit = profileSetupSupported(draft.adapterId, adapters, adaptersState) && writeState !== "saving" && writeState !== "conflict";
 
   useEffect(() => {
     const dialog = dialogRef.current;
     if (!dialog) return;
-    const invoker = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     if (!dialog.open) dialog.showModal();
     const focusFrame = requestAnimationFrame(() => aliasRef.current?.focus());
     return () => {
       cancelAnimationFrame(focusFrame);
       if (dialog.open) dialog.close();
-      if (invoker?.isConnected) invoker.focus({ preventScroll: true });
+      if (profileDialogInvokerMatches(openingInvoker.current, initialDraft.current)) openingInvoker.current?.focus({ preventScroll: true });
     };
   }, []);
 
@@ -1090,7 +1102,7 @@ function AcpProfileEditorDialog({ adaptersState, adapters, draft, writeState, on
   }, [writeState]);
 
   return (
-    <dialog ref={dialogRef} className="magi-dialog acp-profile-dialog" aria-labelledby="acp-profile-dialog-title" aria-describedby="acp-profile-dialog-description" onCancel={(event) => { event.preventDefault(); if (discardPrompt) { setDiscardPrompt(false); aliasRef.current?.focus(); } else close(); }}>
+    <dialog ref={dialogRef} data-profile-id={draft.profileId ?? "new"} data-profile-revision={draft.expectedRevision ?? "new"} className="magi-dialog acp-profile-dialog" aria-labelledby="acp-profile-dialog-title" aria-describedby="acp-profile-dialog-description" onCancel={(event) => { event.preventDefault(); if (discardPrompt) { setDiscardPrompt(false); aliasRef.current?.focus(); } else close(); }}>
       <section className="acp-profile-editor">
         <div className="dialog-header">
           <span>PERSISTED ACP PROFILE</span>
@@ -1123,9 +1135,10 @@ function AcpProfileEditorDialog({ adaptersState, adapters, draft, writeState, on
             <span className="field-label">ACP 어댑터</span>
             <select id="acp-profile-adapter" className="text-field" value={draft.adapterId} disabled={Boolean(draft.profileId) || adaptersState !== "ready" || writeState === "saving"} onChange={(event) => onDraftChange({ ...draft, adapterId: event.target.value })}>
               <option value="">어댑터 선택</option>
-              {adapters.filter(item => item.id !== "openai-responses").map((item) => <option key={item.id} value={item.id} disabled={item.state !== "supported"}>{item.displayName}{item.state === "blocked" ? ` · 설정 차단${item.reason ? `: ${adapterReasonLabel(item.reason)}` : ""}` : " · 프로필 설정 가능"}</option>)}
+              <option value="codex-acp">Codex ACP · 수동 프로필 설정</option>
+              {adapters.filter(item => item.id !== "openai-responses" && item.id !== "codex-acp").map((item) => <option key={item.id} value={item.id} disabled={item.state !== "supported"}>{item.displayName}{item.state === "blocked" ? ` · 설정 차단${item.reason ? `: ${adapterReasonLabel(item.reason)}` : ""}` : " · 프로필 설정 가능"}</option>)}
             </select>
-            {adaptersState === "ready" && !adapters.some((item) => item.id !== "openai-responses" && item.state === "supported") && <small className="unavailable-reason" role="status">프로필 설정이 가능한 어댑터가 없어 이 프로필을 저장할 수 없습니다.</small>}
+            {!profileSetupSupported(draft.adapterId, adapters, adaptersState) && <small className="unavailable-reason" role="status">프로필 설정이 가능한 어댑터가 없어 이 프로필을 저장할 수 없습니다.</small>}
           </label>
           <label className="field" htmlFor="acp-profile-credential-home">
             <span className="field-label">기존 CLI 인증 홈 경로 <span aria-hidden="true">· 필수</span></span>

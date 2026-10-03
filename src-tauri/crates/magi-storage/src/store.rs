@@ -1845,6 +1845,36 @@ impl Storage {
         Ok(selection)
     }
 
+    pub fn load_historical_model_selection_metadata(
+        &self,
+        profile_id: &str,
+        profile_revision: u64,
+        selection_revision: u64,
+    ) -> Result<Option<crate::ProviderModelSelection>, StorageError> {
+        validate_text("provider_profile_id", profile_id, 128)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let selection = model_selection_row(&transaction, profile_id)?;
+        if let Some(selection) = &selection {
+            if selection.selection_revision != selection_revision
+                || selection.binding.profile_revision != profile_revision
+                || selection.binding.provider_profile_id != profile_id
+            {
+                return Err(StorageError::ImmutableConflict(
+                    "historical model reference drift".into(),
+                ));
+            }
+            let catalog = load_provider_catalog_snapshot_from(
+                &transaction,
+                &selection.binding.catalog_snapshot_id,
+            )?
+            .ok_or_else(|| StorageError::Corrupt("historical selection catalog missing".into()))?;
+            selection.binding.validate_ready(&catalog)?;
+        }
+        transaction.commit()?;
+        Ok(selection)
+    }
+
     pub fn provider_model_selection_revision(
         &self,
         profile_id: &str,
