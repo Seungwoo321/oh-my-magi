@@ -272,7 +272,7 @@ fn focus_main_window_or_report(app: &AppHandle<Wry>) -> bool {
             app.dialog()
                 .message(message)
                 .title("MAGI CONSOLE")
-                .blocking_show();
+                .show(|_| {});
             false
         }
     }
