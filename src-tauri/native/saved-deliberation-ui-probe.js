@@ -43,6 +43,7 @@
   const click = el => { if (!usable(el)) throw Error("control unavailable"); el.scrollIntoView({ block: "center" }); el.click(); };
   const button = labels => Array.from(document.querySelectorAll("button")).find(el => usable(el) && labels.some(label => el.textContent.trim().includes(label)));
   const readonly = (command, args) => bounded(() => original(command, args));
+  const connectionStep = (profileIndex, step) => bounded(() => original("saved_deliberation_ui_progress", { input: { nonce: config.nonce, phase, connectionStep: { profileIndex, step } } }));
   try {
     const bridge = await wait(() => typeof window.__TAURI_INTERNALS__?.invoke === "function" && window.__TAURI_INTERNALS__);
     original = bridge.invoke.bind(bridge);
@@ -72,14 +73,20 @@
       Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value").set.call(field, value);
       field.dispatchEvent(new Event("change", { bubbles: true }));
     };
-    for (const choice of config.selections) {
+    for (const [profileIndex, choice] of config.selections.entries()) {
       const row = () => Array.from(document.querySelectorAll("li[data-profile-id]")).find(el => el.dataset.profileId === choice.providerProfileId);
+      await connectionStep(profileIndex, "selection_requested");
       click((await wait(() => row()?.querySelector(".acp-profile-select:not(:disabled)"))));
+      await wait(() => { const selected = row()?.querySelector(".acp-profile-select"); return usable(selected) && selected.getAttribute("aria-pressed") === "true"; });
+      await connectionStep(profileIndex, "selection_confirmed");
       const check = await wait(() => Array.from(row()?.querySelectorAll("button") ?? []).find(el => usable(el) && ["연결 확인", "Check connection"].includes(el.textContent.trim())));
+      await connectionStep(profileIndex, "check_requested");
       click(check);
       await rendered();
       await wait(() => row()?.textContent.includes("기존 구독 확인됨") || row()?.textContent.includes("Existing subscription verified"));
+      await connectionStep(profileIndex, "authentication_confirmed");
       const model = await wait(() => { const el = document.getElementById("live-acp-model"); return usable(el) ? el : null; });
+      await connectionStep(profileIndex, "model_control_ready");
       changeSelect(model, choice.modelId);
       await rendered();
       if (choice.modeId !== null) changeSelect(await wait(() => { const el = document.getElementById("connection-model-mode"); return usable(el) ? el : null; }), choice.modeId);

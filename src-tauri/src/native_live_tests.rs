@@ -1841,6 +1841,7 @@ fn prepare_retained_saved_profile_backup_at(
 struct SavedDeliberationUiState {
     nonce: Mutex<Option<String>>,
     progress: Mutex<Option<SavedDeliberationUiPhase>>,
+    connection_step: Mutex<Option<ConnectionDiagnostic>>,
     outcome: Mutex<Option<Result<serde_json::Value, String>>>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize)]
@@ -1862,11 +1863,107 @@ enum SavedDeliberationUiPhase {
     StartReady,
     StartReceipt,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ConnectionDiagnosticStep {
+    SelectionRequested,
+    SelectionConfirmed,
+    CheckRequested,
+    AuthenticationConfirmed,
+    ModelControlReady,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConnectionDiagnostic {
+    profile_index: u8,
+    step: ConnectionDiagnosticStep,
+}
+fn validate_connection_diagnostic(
+    phase: SavedDeliberationUiPhase,
+    prior: Option<ConnectionDiagnostic>,
+    next: ConnectionDiagnostic,
+) -> Result<(), String> {
+    if next.profile_index > 2
+        || !matches!(
+            phase,
+            SavedDeliberationUiPhase::ConnectionVerification
+                | SavedDeliberationUiPhase::ModelReconfirmation
+        )
+        || prior.is_some_and(|previous| next < previous)
+    {
+        return Err("UI connection diagnostic fenced".into());
+    }
+    Ok(())
+}
+#[cfg(test)]
+mod connection_diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn closed_connection_steps_reject_unknown_fields_and_backward_progress() {
+        let first = ConnectionDiagnostic {
+            profile_index: 0,
+            step: ConnectionDiagnosticStep::SelectionRequested,
+        };
+        let confirmed = ConnectionDiagnostic {
+            profile_index: 0,
+            step: ConnectionDiagnosticStep::SelectionConfirmed,
+        };
+        assert!(
+            validate_connection_diagnostic(
+                SavedDeliberationUiPhase::ConnectionVerification,
+                Some(first),
+                confirmed
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_connection_diagnostic(
+                SavedDeliberationUiPhase::ConnectionVerification,
+                Some(confirmed),
+                confirmed
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_connection_diagnostic(
+                SavedDeliberationUiPhase::ConnectionVerification,
+                Some(confirmed),
+                first
+            )
+            .is_err()
+        );
+        assert!(
+            validate_connection_diagnostic(SavedDeliberationUiPhase::ConsentReady, None, first)
+                .is_err()
+        );
+        assert!(
+            validate_connection_diagnostic(
+                SavedDeliberationUiPhase::ConnectionVerification,
+                None,
+                ConnectionDiagnostic {
+                    profile_index: 3,
+                    ..first
+                }
+            )
+            .is_err()
+        );
+        for value in [
+            serde_json::json!({"profileIndex":0,"step":"unknown"}),
+            serde_json::json!({"profileIndex":0,"step":"selection_requested","ready":true}),
+            serde_json::json!({"profileIndex":-1,"step":"selection_requested"}),
+        ] {
+            assert!(serde_json::from_value::<ConnectionDiagnostic>(value).is_err());
+        }
+    }
+}
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SavedDeliberationUiProgress {
     nonce: String,
     phase: SavedDeliberationUiPhase,
+    #[serde(default)]
+    connection_step: Option<ConnectionDiagnostic>,
 }
 #[tauri::command]
 fn saved_deliberation_ui_progress(
@@ -1887,6 +1984,20 @@ fn saved_deliberation_ui_progress(
     let mut progress = state.progress.lock().map_err(|_| "UI progress lock")?;
     if progress.is_some_and(|prior| input.phase < prior) {
         return Err("UI progress cannot move backwards".into());
+    }
+    if let Some(next) = input.connection_step {
+        let mut step = state
+            .connection_step
+            .lock()
+            .map_err(|_| "UI connection diagnostic lock")?;
+        validate_connection_diagnostic(input.phase, *step, next)?;
+        if *step != Some(next) {
+            eprintln!(
+                "native actual UI connection: profile_index={}; step={:?}",
+                next.profile_index, next.step
+            );
+            *step = Some(next);
+        }
     }
     if *progress != Some(input.phase) {
         eprintln!("native actual UI phase: {:?}", input.phase);
