@@ -1214,11 +1214,17 @@ impl commands::AdmissionRequestRegistry {
 impl ProbeMonitor {
     fn ensure_running(&self) -> Result<(), String> {
         if self.outcome.load(Ordering::Acquire) != 0 {
-            return Err("supervised probe permission revoked".into());
+            return Err("supervised probe outcome already terminal".into());
         }
-        self.lifecycle
-            .check()
-            .map_err(|_| "supervised probe permission revoked".into())
+        self.lifecycle.check().map_err(|error| match error {
+            magi_provider::ProviderError::Timeout => {
+                "supervised probe authority deadline expired".into()
+            }
+            magi_provider::ProviderError::Cancelled => {
+                "supervised probe authority cancelled".into()
+            }
+            _ => "supervised probe authority check failed".into(),
+        })
     }
 
     fn revoke_for_timeout(&self) -> Option<commands::AdmissionOperationLease> {
@@ -1844,6 +1850,7 @@ struct SavedDeliberationUiState {
     connection_step: Mutex<Option<ConnectionDiagnostic>>,
     core_step: Mutex<Option<CoreDiagnostic>>,
     confirmation_diagnostic: Mutex<Option<ConfirmationDiagnostic>>,
+    core_field_diagnostic: Mutex<Option<CoreFieldDiagnostic>>,
     outcome: Mutex<Option<Result<serde_json::Value, String>>>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize)]
@@ -1959,6 +1966,151 @@ fn validate_core_diagnostic(
         return Err("UI core diagnostic fenced".into());
     }
     Ok(())
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CoreFieldDiagnostic {
+    core_index: u8,
+    captured_connected: bool,
+    current_present: bool,
+    current_equals_captured: bool,
+    captured_saving: bool,
+    current_saving: bool,
+    captured_stale: bool,
+    current_stale: bool,
+    select_disabled: bool,
+    current_alert_present: bool,
+    connection_heading: bool,
+}
+fn validate_core_field_diagnostic(
+    phase: SavedDeliberationUiPhase,
+    step: Option<CoreDiagnostic>,
+    diagnostic: CoreFieldDiagnostic,
+) -> Result<(), String> {
+    if phase != SavedDeliberationUiPhase::CoreReconfirmation
+        || diagnostic.core_index > 2
+        || !step.is_some_and(|step| {
+            step.core_index == diagnostic.core_index
+                && step.step == CoreDiagnosticStep::SaveAcknowledged
+        })
+    {
+        return Err("UI core field diagnostic fenced".into());
+    }
+    Ok(())
+}
+#[cfg(test)]
+mod core_field_diagnostic_tests {
+    use super::*;
+    #[test]
+    fn supervised_authority_preserves_timeout_and_cancellation_categories() {
+        let monitor = |deadline| ProbeMonitor {
+            outcome: AtomicU8::new(0),
+            phase: Mutex::new(("setup", Instant::now())),
+            active_request: Mutex::new(None),
+            started: Instant::now(),
+            lifecycle: commands::AdmissionRequestLifecycle::until(deadline),
+        };
+        let expired = monitor(Instant::now() - Duration::from_secs(1));
+        assert_eq!(
+            expired.ensure_running().unwrap_err(),
+            "supervised probe authority deadline expired"
+        );
+        let cancelled = monitor(Instant::now() + Duration::from_secs(30));
+        cancelled.lifecycle.verification.revoke();
+        assert_eq!(
+            cancelled.ensure_running().unwrap_err(),
+            "supervised probe authority cancelled"
+        );
+        cancelled.outcome.store(2, Ordering::Release);
+        assert_eq!(
+            cancelled.ensure_running().unwrap_err(),
+            "supervised probe outcome already terminal"
+        );
+    }
+
+    #[test]
+    fn field_observation_is_closed_and_requires_same_core_save_acknowledgement() {
+        let value = serde_json::json!({"coreIndex":1,"capturedConnected":false,"currentPresent":true,"currentEqualsCaptured":false,"capturedSaving":false,"currentSaving":false,"capturedStale":false,"currentStale":false,"selectDisabled":false,"currentAlertPresent":false,"connectionHeading":false});
+        let diagnostic: CoreFieldDiagnostic = serde_json::from_value(value.clone()).unwrap();
+        let ack = CoreDiagnostic {
+            core_index: 1,
+            step: CoreDiagnosticStep::SaveAcknowledged,
+            metadata: None,
+        };
+        assert!(
+            validate_core_field_diagnostic(
+                SavedDeliberationUiPhase::CoreReconfirmation,
+                Some(ack),
+                diagnostic
+            )
+            .is_ok()
+        );
+        for step in [
+            None,
+            Some(CoreDiagnostic {
+                core_index: 0,
+                ..ack
+            }),
+            Some(CoreDiagnostic {
+                step: CoreDiagnosticStep::SaveRequested,
+                ..ack
+            }),
+            Some(CoreDiagnostic {
+                step: CoreDiagnosticStep::FieldSettled,
+                ..ack
+            }),
+        ] {
+            assert!(
+                validate_core_field_diagnostic(
+                    SavedDeliberationUiPhase::CoreReconfirmation,
+                    step,
+                    diagnostic
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            validate_core_field_diagnostic(
+                SavedDeliberationUiPhase::ConsentReady,
+                Some(ack),
+                diagnostic
+            )
+            .is_err()
+        );
+        assert!(
+            validate_core_field_diagnostic(
+                SavedDeliberationUiPhase::CoreReconfirmation,
+                Some(ack),
+                CoreFieldDiagnostic {
+                    core_index: 3,
+                    ..diagnostic
+                }
+            )
+            .is_err()
+        );
+        for key in [
+            "capturedConnected",
+            "currentPresent",
+            "currentEqualsCaptured",
+            "capturedSaving",
+            "currentSaving",
+            "capturedStale",
+            "currentStale",
+            "selectDisabled",
+            "currentAlertPresent",
+            "connectionHeading",
+        ] {
+            let mut missing = value.clone();
+            missing.as_object_mut().unwrap().remove(key);
+            assert!(serde_json::from_value::<CoreFieldDiagnostic>(missing).is_err());
+            let mut wrong = value.clone();
+            wrong[key] = serde_json::json!("false");
+            assert!(serde_json::from_value::<CoreFieldDiagnostic>(wrong).is_err());
+        }
+        let mut extra = value;
+        extra["rawText"] = serde_json::json!("denied");
+        assert!(serde_json::from_value::<CoreFieldDiagnostic>(extra).is_err());
+    }
 }
 #[cfg(test)]
 mod connection_diagnostic_tests {
@@ -2251,6 +2403,8 @@ struct SavedDeliberationUiProgress {
     core_step: Option<CoreDiagnostic>,
     #[serde(default)]
     confirmation_diagnostic: Option<ConfirmationDiagnostic>,
+    #[serde(default)]
+    core_field_diagnostic: Option<CoreFieldDiagnostic>,
 }
 #[tauri::command]
 fn saved_deliberation_ui_progress(
@@ -2298,6 +2452,21 @@ fn saved_deliberation_ui_progress(
                 next.core_index, next.step, next.metadata
             );
             *step = Some(next);
+        }
+    }
+    if let Some(next) = input.core_field_diagnostic {
+        let step = *state
+            .core_step
+            .lock()
+            .map_err(|_| "UI core diagnostic lock")?;
+        validate_core_field_diagnostic(input.phase, step, next)?;
+        let mut previous = state
+            .core_field_diagnostic
+            .lock()
+            .map_err(|_| "UI core field diagnostic lock")?;
+        if *previous != Some(next) {
+            eprintln!("native actual UI core field: {:?}", next);
+            *previous = Some(next);
         }
     }
     if let Some(next) = input.confirmation_diagnostic {

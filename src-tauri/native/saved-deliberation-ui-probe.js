@@ -149,7 +149,32 @@
       });
       await coreStep(coreIndex, "save_acknowledged");
       await rendered();
-      await wait(() => !field.textContent.includes("저장된 모델 선택을 다시 확인하십시오.") && !field.textContent.includes("Recheck the saved model selection.") && !field.textContent.includes("저장 중…") && !field.textContent.includes("Saving…"));
+      let lastFieldDiagnostic = null;
+      await wait(async () => {
+        const currentSelect = document.getElementById(`core-${choice.coreId}`);
+        const currentField = currentSelect?.closest(".field");
+        const saving = node => Boolean(node?.textContent.includes("저장 중…") || node?.textContent.includes("Saving…"));
+        const stale = node => Boolean(node?.textContent.includes("저장된 모델 선택을 다시 확인하십시오.") || node?.textContent.includes("Recheck the saved model selection."));
+        const coreFieldDiagnostic = {
+          coreIndex,
+          capturedConnected: field.isConnected,
+          currentPresent: Boolean(currentField),
+          currentEqualsCaptured: currentField === field,
+          capturedSaving: saving(field),
+          currentSaving: saving(currentField),
+          capturedStale: stale(field),
+          currentStale: stale(currentField),
+          selectDisabled: Boolean(currentSelect?.disabled),
+          currentAlertPresent: Boolean(currentField?.querySelector('[role="alert"]')),
+          connectionHeading: Array.from(document.querySelectorAll('h1,h2')).some(el => ["모델 연결", "Model connections"].includes(el.textContent.trim())),
+        };
+        const summary = JSON.stringify(coreFieldDiagnostic);
+        if (summary !== lastFieldDiagnostic) {
+          await bounded(() => original("saved_deliberation_ui_progress", { input: { nonce: config.nonce, phase: "core_reconfirmation", coreFieldDiagnostic } }));
+          lastFieldDiagnostic = summary;
+        }
+        return !field.textContent.includes("저장된 모델 선택을 다시 확인하십시오.") && !field.textContent.includes("Recheck the saved model selection.") && !field.textContent.includes("저장 중…") && !field.textContent.includes("Saving…");
+      });
       await coreStep(coreIndex, "field_settled");
     }
     await mark("draft_restored");
