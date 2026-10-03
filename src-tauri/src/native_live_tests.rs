@@ -1902,14 +1902,38 @@ enum CoreDiagnosticStep {
     SelectionRequested,
     SelectionConfirmed,
     SaveRequested,
+    SaveReadRequested,
+    SaveReadReceived,
     SaveAcknowledged,
     FieldSettled,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CoreReadSelectionState {
+    Selected,
+    Stale,
+    Unselected,
+    Unknown,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CoreReadMetadata {
+    before_revision: u64,
+    expected_revision: u64,
+    after_revision: Option<u64>,
+    selection_state: CoreReadSelectionState,
+    revision_matches: bool,
+    profile_matches: bool,
+    profile_revision_matches: bool,
+    model_ref_matches: bool,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CoreDiagnostic {
     core_index: u8,
     step: CoreDiagnosticStep,
+    #[serde(default)]
+    metadata: Option<CoreReadMetadata>,
 }
 fn validate_core_diagnostic(
     phase: SavedDeliberationUiPhase,
@@ -1918,7 +1942,18 @@ fn validate_core_diagnostic(
 ) -> Result<(), String> {
     if phase != SavedDeliberationUiPhase::CoreReconfirmation
         || next.core_index > 2
-        || prior.is_some_and(|previous| next < previous)
+        || prior.is_some_and(|previous| {
+            (next.core_index, next.step) < (previous.core_index, previous.step)
+        })
+        || (next.step == CoreDiagnosticStep::SaveReadReceived) != next.metadata.is_some()
+        || next.metadata.is_some_and(|metadata| {
+            const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+            metadata.before_revision >= MAX_SAFE_INTEGER
+                || metadata.expected_revision != metadata.before_revision + 1
+                || metadata
+                    .after_revision
+                    .is_some_and(|revision| revision > MAX_SAFE_INTEGER)
+        })
     {
         return Err("UI core diagnostic fenced".into());
     }
@@ -1929,14 +1964,97 @@ mod connection_diagnostic_tests {
     use super::*;
 
     #[test]
+    fn core_read_metadata_is_closed_bounded_and_changes_without_step_regression() {
+        let metadata = CoreReadMetadata {
+            before_revision: 1,
+            expected_revision: 2,
+            after_revision: Some(1),
+            selection_state: CoreReadSelectionState::Stale,
+            revision_matches: false,
+            profile_matches: true,
+            profile_revision_matches: true,
+            model_ref_matches: true,
+        };
+        let first = CoreDiagnostic {
+            core_index: 1,
+            step: CoreDiagnosticStep::SaveReadReceived,
+            metadata: Some(metadata),
+        };
+        let changed = CoreDiagnostic {
+            metadata: Some(CoreReadMetadata {
+                after_revision: Some(2),
+                selection_state: CoreReadSelectionState::Selected,
+                revision_matches: true,
+                ..metadata
+            }),
+            ..first
+        };
+        let phase = SavedDeliberationUiPhase::CoreReconfirmation;
+        assert!(validate_core_diagnostic(phase, Some(first), changed).is_ok());
+        assert!(validate_core_diagnostic(phase, Some(changed), first).is_ok());
+        assert!(
+            validate_core_diagnostic(
+                phase,
+                None,
+                CoreDiagnostic {
+                    metadata: None,
+                    ..first
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            validate_core_diagnostic(
+                phase,
+                None,
+                CoreDiagnostic {
+                    metadata: Some(CoreReadMetadata {
+                        expected_revision: 3,
+                        ..metadata
+                    }),
+                    ..first
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            validate_core_diagnostic(
+                phase,
+                None,
+                CoreDiagnostic {
+                    metadata: Some(CoreReadMetadata {
+                        after_revision: Some(9_007_199_254_740_992),
+                        ..metadata
+                    }),
+                    ..first
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<CoreReadSelectionState>(serde_json::json!("ready")).is_err()
+        );
+        assert!(
+            serde_json::from_value::<CoreReadMetadata>(serde_json::json!({
+                "beforeRevision":1,"expectedRevision":2,"afterRevision":null,
+                "selectionState":"unknown","revisionMatches":false,"profileMatches":false,
+                "profileRevisionMatches":false,"modelRefMatches":false,"ready":true
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn closed_core_steps_reject_wrong_phase_index_and_backward_progress() {
         let first = CoreDiagnostic {
             core_index: 0,
             step: CoreDiagnosticStep::SelectionRequested,
+            metadata: None,
         };
         let saved = CoreDiagnostic {
             core_index: 0,
             step: CoreDiagnosticStep::SaveAcknowledged,
+            metadata: None,
         };
         assert!(
             validate_core_diagnostic(
@@ -2094,8 +2212,8 @@ fn saved_deliberation_ui_progress(
         validate_core_diagnostic(input.phase, *step, next)?;
         if *step != Some(next) {
             eprintln!(
-                "native actual UI core: core_index={}; step={:?}",
-                next.core_index, next.step
+                "native actual UI core: core_index={}; step={:?}; metadata={:?}",
+                next.core_index, next.step, next.metadata
             );
             *step = Some(next);
         }

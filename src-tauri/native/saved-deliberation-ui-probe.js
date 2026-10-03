@@ -44,7 +44,7 @@
   const button = labels => Array.from(document.querySelectorAll("button")).find(el => usable(el) && labels.some(label => el.textContent.trim().includes(label)));
   const readonly = (command, args) => bounded(() => original(command, args));
   const connectionStep = (profileIndex, step) => bounded(() => original("saved_deliberation_ui_progress", { input: { nonce: config.nonce, phase, connectionStep: { profileIndex, step } } }));
-  const coreStep = (coreIndex, step) => bounded(() => original("saved_deliberation_ui_progress", { input: { nonce: config.nonce, phase, coreStep: { coreIndex, step } } }));
+  const coreStep = (coreIndex, step, metadata) => bounded(() => original("saved_deliberation_ui_progress", { input: { nonce: config.nonce, phase, coreStep: { coreIndex, step, ...(metadata ? { metadata } : {}) } } }));
   try {
     const bridge = await wait(() => typeof window.__TAURI_INTERNALS__?.invoke === "function" && window.__TAURI_INTERNALS__);
     original = bridge.invoke.bind(bridge);
@@ -123,11 +123,28 @@
       const selectedModel = await readonly("load_provider_catalog", { profileId: choice.providerProfileId, expectedRevision: profileRevision });
       await coreStep(coreIndex, "save_requested");
       click(save);
+      await coreStep(coreIndex, "save_read_requested");
+      let lastReadMetadata = null;
       await wait(async () => {
         const rows = await readonly("load_core_model_selections", {});
         const after = rows.find(item => item.coreId === choice.coreId);
-        if (after?.selectionRevision > beforeCore.selectionRevision + 1) throw Error("unexpected core revision");
         const selection = after?.selection;
+        const metadata = {
+          beforeRevision: beforeCore.selectionRevision,
+          expectedRevision: beforeCore.selectionRevision + 1,
+          afterRevision: Number.isSafeInteger(after?.selectionRevision) && after.selectionRevision >= 0 ? after.selectionRevision : null,
+          selectionState: ["selected", "stale", "unselected"].includes(after?.selectionState) ? after.selectionState : "unknown",
+          revisionMatches: after?.selectionRevision === beforeCore.selectionRevision + 1 && selection?.selectionRevision === after?.selectionRevision,
+          profileMatches: selection?.providerProfileId === choice.providerProfileId,
+          profileRevisionMatches: selection?.profileRevision === profileRevision,
+          modelRefMatches: selection?.modelSelectionRevision === selectedModel.modelSelectionRevision,
+        };
+        const summary = JSON.stringify(metadata);
+        if (summary !== lastReadMetadata) {
+          await coreStep(coreIndex, "save_read_received", metadata);
+          lastReadMetadata = summary;
+        }
+        if (after?.selectionRevision > beforeCore.selectionRevision + 1) throw Error("unexpected core revision");
         return after?.selectionState === "selected" && after.selectionRevision === beforeCore.selectionRevision + 1 && selection?.selectionRevision === after.selectionRevision && selection.providerProfileId === choice.providerProfileId && selection.profileRevision === profileRevision && selection.modelSelectionRevision === selectedModel.modelSelectionRevision;
       });
       await coreStep(coreIndex, "save_acknowledged");
