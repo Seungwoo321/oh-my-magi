@@ -139,7 +139,8 @@ pub async fn list_acp_adapters(
     app: AppHandle,
 ) -> Result<Vec<AcpAdapterDto>, String> {
     ensure_main_window(&window)?;
-    let runtime_reason = verified_provider_artifact(&app, verification_request())
+    let owner = StandaloneVerificationOwner::new(Instant::now() + Duration::from_secs(60));
+    let runtime_reason = verified_provider_artifact(&app, owner.request.clone())
         .await
         .err()
         .map(|_| "runtime_verification_failed");
@@ -1614,11 +1615,18 @@ async fn register_deliberation_request_for_parent(
     }
     if state.runtime_service().is_err() {
         let proof_deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let standalone_owner = lifecycle
+            .is_none()
+            .then(|| StandaloneVerificationOwner::new(proof_deadline));
         let proof_request = match lifecycle {
             Some(lifecycle) => lifecycle
                 .verification
                 .with_deadline(lifecycle.verification.deadline().min(proof_deadline)),
-            None => VerificationRequest::until(proof_deadline),
+            None => standalone_owner
+                .as_ref()
+                .ok_or_else(LiveRunError::storage)?
+                .request
+                .clone(),
         };
         verified_provider_artifact(&app, proof_request)
             .await
@@ -3187,10 +3195,11 @@ impl ClientFileReader for ProfileSourceReader {
     }
 }
 
-pub(crate) struct ProviderWorkdir(PathBuf);
+pub(crate) struct ProviderWorkdir(PathBuf, Option<StandaloneVerificationOwner>);
 
 impl Drop for ProviderWorkdir {
     fn drop(&mut self) {
+        drop(self.1.take());
         let _ = fs::remove_dir(&self.0);
     }
 }
@@ -3325,6 +3334,8 @@ async fn spawn_verified_client_for_authority(
         provider_profile_id: profile.provider_profile_id.clone(),
         profile_revision: profile.revision,
     });
+    let standalone_owner = (control.is_none() && lifecycle.is_none())
+        .then(|| StandaloneVerificationOwner::new(Instant::now() + Duration::from_secs(60)));
     let request = if let Some(control) = control {
         control.effect_request()?
     } else if let Some(lifecycle) = lifecycle {
@@ -3333,13 +3344,19 @@ async fn spawn_verified_client_for_authority(
             .verification
             .with_deadline(Instant::now() + Duration::from_secs(60))
     } else {
-        verification_request()
+        standalone_owner
+            .as_ref()
+            .ok_or(ProviderError::InvalidLaunch)?
+            .request
+            .clone()
     };
     let runtime = verified_provider_artifact(app, request.clone()).await?;
     let executable = runtime.executable().to_owned();
     let adapter_digest = Digest::from_hex(runtime.identity().acp_executable_sha256.clone())
         .map_err(|_| ProviderError::ArtifactVerification)?;
-    let workdir = Arc::new(create_provider_workdir(app)?);
+    let mut workdir = create_provider_workdir(app)?;
+    workdir.1 = standalone_owner;
+    let workdir = Arc::new(workdir);
     if let Some(control) = control {
         control.check_effect_authority()?;
     }
@@ -3464,8 +3481,21 @@ async fn spawn_verified_client_for_authority(
     }
 }
 
-fn verification_request() -> VerificationRequest {
-    VerificationRequest::until(std::time::Instant::now() + Duration::from_secs(60))
+struct StandaloneVerificationOwner {
+    request: VerificationRequest,
+}
+impl StandaloneVerificationOwner {
+    fn new(deadline: Instant) -> Self {
+        Self {
+            request: VerificationRequest::until(deadline),
+        }
+    }
+}
+impl Drop for StandaloneVerificationOwner {
+    fn drop(&mut self) {
+        // Revocation closes this isolated authority; actual consumers still require observed cleanup.
+        self.request.revoke();
+    }
 }
 
 async fn verified_provider_artifact(
@@ -3571,7 +3601,8 @@ fn resolve_bundled_provider_artifact(
 }
 
 pub(crate) async fn packaged_provider_runtime_available(app: &AppHandle) -> bool {
-    verified_provider_artifact(app, verification_request())
+    let owner = StandaloneVerificationOwner::new(Instant::now() + Duration::from_secs(60));
+    verified_provider_artifact(app, owner.request.clone())
         .await
         .is_ok()
 }
@@ -3598,7 +3629,7 @@ fn create_provider_workdir(app: &AppHandle) -> Result<ProviderWorkdir, ProviderE
         let _ = fs::remove_dir(&path);
         return Err(ProviderError::RoleWorkdirUnavailable);
     }
-    Ok(ProviderWorkdir(path))
+    Ok(ProviderWorkdir(path, None))
 }
 
 fn admission_reason(error: &ProviderError) -> &'static str {
@@ -9829,5 +9860,64 @@ mod provider_operation_boundary_tests {
                 LiveRunStatus::Cancelling
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod standalone_verification_owner_tests {
+    use super::*;
+
+    #[test]
+    fn standalone_success_and_early_failure_revoke_only_the_owned_root() {
+        let foreign = VerificationRequest::until(Instant::now() + Duration::from_secs(60));
+        for success in [true, false] {
+            let owner = StandaloneVerificationOwner::new(Instant::now() + Duration::from_secs(60));
+            let request = owner.request.clone();
+            let operation = || -> Result<(), ProviderError> {
+                let _owner = owner;
+                request.check()?;
+                if success {
+                    Ok(())
+                } else {
+                    Err(ProviderError::InvalidLaunch)
+                }
+            };
+            assert_eq!(operation().is_ok(), success);
+            assert!(request.check().is_err());
+            assert!(foreign.check().is_ok());
+        }
+    }
+
+    #[test]
+    fn handed_off_owner_survives_until_the_last_workdir_consumer_drops() {
+        let owner = StandaloneVerificationOwner::new(Instant::now() + Duration::from_secs(60));
+        let request = owner.request.clone();
+        let path = std::env::temp_dir().join(format!("magi-root-owner-{}", Uuid::new_v4()));
+        fs::create_dir(&path).unwrap();
+        let workdir = Arc::new(ProviderWorkdir(path.clone(), Some(owner)));
+        let consumer = workdir.clone();
+        drop(workdir);
+        assert!(request.check().is_ok());
+        assert!(path.exists());
+        drop(consumer);
+        assert!(request.check().is_err());
+        assert!(!path.exists());
+    }
+    #[tokio::test]
+    async fn cancelled_standalone_future_releases_its_root_without_revoke_of_foreign_authority() {
+        let foreign = VerificationRequest::until(Instant::now() + Duration::from_secs(60));
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let owner = StandaloneVerificationOwner::new(Instant::now() + Duration::from_secs(60));
+            assert!(sender.send(owner.request.clone()).is_ok());
+            let _owner = owner;
+            std::future::pending::<()>().await;
+        });
+        let request = receiver.await.unwrap();
+        assert!(request.check().is_ok());
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(request.check().is_err());
+        assert!(foreign.check().is_ok());
     }
 }
