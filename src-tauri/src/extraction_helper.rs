@@ -536,6 +536,65 @@ mod tests {
                 .join(format!("helper-custody-proof-{}", uuid::Uuid::new_v4())),
         );
         std::fs::create_dir(&fixture.0).unwrap();
+        let root = PathBuf::from(
+            std::env::var_os("MAGI_TEST_EXTRACTION_RESOURCE_ROOT")
+                .expect("explicit signed fixture"),
+        );
+        let resource = Arc::new(
+            authority::verify_resource(&root, |path| {
+                authority::verify_signature_with_request(
+                    path,
+                    VerificationRequest::until(Instant::now() + Duration::from_secs(60)),
+                )
+            })
+            .unwrap(),
+        );
+        authority::validate_source_binding(&resource, include_bytes!("../native/extract.swift"))
+            .unwrap();
+        struct ClosedFixture {
+            helper: Arc<RetiredExtractionAuthority>,
+        }
+        impl magi_provider::resource_custody::RetainedNativeQuiescence for ClosedFixture {
+            fn validate_quiescence(&self) -> Result<(), magi_provider::ProviderError> {
+                magi_provider::resource_custody::HeldExtractionAuthority::validate_held(
+                    self.helper.as_ref(),
+                )
+            }
+            fn bound_requests(&self) -> &[VerificationRequest] {
+                &[]
+            }
+            fn verified_extraction(
+                &self,
+            ) -> Result<
+                Arc<dyn magi_provider::resource_custody::HeldExtractionAuthority>,
+                magi_provider::ProviderError,
+            > {
+                self.validate_quiescence()?;
+                Ok(self.helper.clone())
+            }
+        }
+        let helper = Arc::new(RetiredExtractionAuthority {
+            generation: magi_domain::Digest::from_bytes(resource.as_ref().as_ref())
+                .as_str()
+                .to_owned(),
+            resource: resource.clone(),
+        });
+        let native = Arc::new(ClosedFixture { helper });
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let installed = runtime
+            .block_on(magi_provider::verify_installed_generation(
+                root.clone(),
+                root.join("provider/codex-acp/darwin-arm64/codex-acp"),
+                native.clone(),
+                VerificationRequest::until(Instant::now() + Duration::from_secs(60)),
+            ))
+            .unwrap();
+        let custody = ResourceCustody::adopt_installed(
+            ArtifactNamespace::installed_resources(&root, &fixture.0).unwrap(),
+            installed,
+            native,
+        )
+        .unwrap();
         let image = fixture.0.join("approved.png");
         std::fs::write(
             &image,
@@ -625,25 +684,6 @@ mod tests {
         let invocation = invocations.lock().unwrap().remove(0);
         let wrong_proof = proofs.lock().unwrap().pop().unwrap();
         assert!(!wrong_proof.matches(&invocation));
-        let root = PathBuf::from(
-            std::env::var_os("MAGI_TEST_EXTRACTION_RESOURCE_ROOT")
-                .expect("explicit signed fixture"),
-        );
-        let resource = Arc::new(
-            authority::verify_resource(&root, |path| {
-                authority::verify_signature_with_request(
-                    path,
-                    VerificationRequest::until(Instant::now() + Duration::from_secs(60)),
-                )
-            })
-            .unwrap(),
-        );
-        authority::validate_source_binding(&resource, include_bytes!("../native/extract.swift"))
-            .unwrap();
-        let custody = ResourceCustody::bootstrap_empty(
-            ArtifactNamespace::development(&fixture.0, DevelopmentProfile::Debug).unwrap(),
-        )
-        .unwrap();
         let request = VerificationRequest::until(invocation.deadline());
         let generation = magi_domain::Digest::from_bytes(resource.as_ref().as_ref());
         let reader = custody

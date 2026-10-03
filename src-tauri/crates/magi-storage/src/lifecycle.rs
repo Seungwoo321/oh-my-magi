@@ -504,6 +504,7 @@ impl Storage {
         for table in [
             "live_run_cancellation_receipts",
             "live_run_receipts",
+            "execution_clock_phase_events",
             "live_run_events",
             "live_run_dispatch_reservations",
             "live_run_outbox",

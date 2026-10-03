@@ -1808,6 +1808,49 @@ impl ContextManifest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CommonContextBudgetPolicy {
+    pub schema_version: u16,
+    pub token_limit: u32,
+    pub settings_field_revision: u64,
+}
+
+impl CommonContextBudgetPolicy {
+    pub fn new(token_limit: u32, settings_field_revision: u64) -> Result<Self, DomainError> {
+        let policy = Self {
+            schema_version: 1,
+            token_limit,
+            settings_field_revision,
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.schema_version != 1
+            || !(1..=128_000).contains(&self.token_limit)
+            || self.settings_field_revision > 9_007_199_254_740_991
+        {
+            return Err(DomainError::Validation(vec![ValidationIssue::new(
+                "common_context_budget",
+                "invalid_budget_policy",
+                "common budget requires version 1, a positive limit at most 128000 and a safe settings revision",
+            )]));
+        }
+        Ok(())
+    }
+}
+
+fn deserialize_common_context_budget<'de, D>(
+    deserializer: D,
+) -> Result<Option<CommonContextBudgetPolicy>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    CommonContextBudgetPolicy::deserialize(deserializer).map(Some)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InputSnapshot {
     pub schema_version: u16,
@@ -1816,6 +1859,12 @@ pub struct InputSnapshot {
     pub role_set: RoleSetSnapshot,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_provenance: Option<DeliberationRequestProvenance>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_common_context_budget",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub common_context_budget: Option<CommonContextBudgetPolicy>,
     pub policy_digest: Digest,
     pub protocol_version: u16,
     pub input_digest: Digest,
@@ -1837,6 +1886,8 @@ struct InputDigestDocument<'a> {
     question_digest: &'a Digest,
     context_digest: &'a Digest,
     roles_digest: &'a Digest,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    common_context_budget: Option<&'a CommonContextBudgetPolicy>,
     policy_digest: &'a Digest,
     protocol_version: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1856,6 +1907,7 @@ impl InputSnapshot {
             context_manifest,
             role_set,
             request_provenance: None,
+            common_context_budget: None,
             policy_digest,
             protocol_version: DELIBERATION_PROTOCOL_VERSION,
             input_digest: Digest::from_bytes(b""),
@@ -1878,6 +1930,7 @@ impl InputSnapshot {
             context_manifest,
             role_set,
             request_provenance: Some(provenance),
+            common_context_budget: None,
             policy_digest,
             protocol_version: DELIBERATION_PROTOCOL_VERSION,
             input_digest: Digest::from_bytes(b""),
@@ -1885,6 +1938,45 @@ impl InputSnapshot {
         snapshot.input_digest = snapshot.calculate_digest()?;
         snapshot.validate()?;
         Ok(snapshot)
+    }
+
+    pub fn new_with_request_provenance_and_budget(
+        question: QuestionSnapshot,
+        context_manifest: ContextManifest,
+        role_set: RoleSetSnapshot,
+        policy_digest: Digest,
+        provenance: DeliberationRequestProvenance,
+        budget: CommonContextBudgetPolicy,
+    ) -> Result<Self, DomainError> {
+        Self::new_with_request_provenance(
+            question,
+            context_manifest,
+            role_set,
+            policy_digest,
+            provenance,
+        )?
+        .with_common_context_budget(budget)
+    }
+
+    pub fn with_common_context_budget(
+        mut self,
+        budget: CommonContextBudgetPolicy,
+    ) -> Result<Self, DomainError> {
+        budget.validate()?;
+        self.common_context_budget = Some(budget);
+        self.input_digest = self.calculate_digest()?;
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn common_context_token_limit(&self) -> Result<u32, DomainError> {
+        match &self.common_context_budget {
+            Some(policy) => {
+                policy.validate()?;
+                Ok(policy.token_limit)
+            }
+            None => Ok(32_000),
+        }
     }
 
     pub fn with_request_provenance(
@@ -1903,6 +1995,7 @@ impl InputSnapshot {
             question_digest: &self.question.digest,
             context_digest: &self.context_manifest.digest,
             roles_digest: &self.role_set.digest,
+            common_context_budget: self.common_context_budget.as_ref(),
             policy_digest: &self.policy_digest,
             protocol_version: self.protocol_version,
             request_provenance: self.request_provenance.as_ref(),
@@ -1962,6 +2055,11 @@ impl InputSnapshot {
                 "unsupported_protocol_version",
                 format!("expected {DELIBERATION_PROTOCOL_VERSION}"),
             ));
+        }
+        if let Some(policy) = &self.common_context_budget
+            && let Err(DomainError::Validation(mut nested)) = policy.validate()
+        {
+            issues.append(&mut nested);
         }
         if !self.policy_digest.is_valid() {
             issues.push(ValidationIssue::new(
@@ -3132,6 +3230,51 @@ mod negotiated_mode_tests {
         )
         .unwrap();
         let encoded = serde_json::to_string(&input).unwrap();
+        assert!(!encoded.contains("common_context_budget"));
+        assert_eq!(input.common_context_token_limit().unwrap(), 32_000);
+        let old_digest_document = serde_json::json!({
+            "schema_version":input.schema_version,"question_digest":input.question.digest,
+            "context_digest":input.context_manifest.digest,"roles_digest":input.role_set.digest,
+            "policy_digest":input.policy_digest,"protocol_version":input.protocol_version,
+        });
+        assert_eq!(
+            input.input_digest,
+            Digest::from_bytes(&canonical_json(&old_digest_document).unwrap())
+        );
+        let budgeted = input
+            .clone()
+            .with_common_context_budget(CommonContextBudgetPolicy::new(128_000, 7).unwrap())
+            .unwrap();
+        assert_ne!(budgeted.input_digest, input.input_digest);
+        assert_eq!(budgeted.schema_version, input.schema_version);
+        assert_eq!(budgeted.common_context_token_limit().unwrap(), 128_000);
+        let decoded: InputSnapshot =
+            serde_json::from_slice(&serde_json::to_vec(&budgeted).unwrap()).unwrap();
+        decoded.validate().unwrap();
+        assert_eq!(decoded, budgeted);
+        let mut null_policy = serde_json::to_value(&budgeted).unwrap();
+        null_policy["common_context_budget"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<InputSnapshot>(null_policy).is_err());
+        for (version, cap, revision) in [
+            (1, 127_999, 7),
+            (1, 128_000, 8),
+            (2, 128_000, 7),
+            (1, 0, 7),
+            (1, 128_001, 7),
+            (1, 128_000, u64::MAX),
+        ] {
+            let mut tampered = budgeted.clone();
+            tampered.common_context_budget = Some(CommonContextBudgetPolicy {
+                schema_version: version,
+                token_limit: cap,
+                settings_field_revision: revision,
+            });
+            assert!(tampered.validate().is_err());
+            if version != 1 || cap == 0 || cap > 128_000 || revision == u64::MAX {
+                tampered.input_digest = tampered.calculate_digest().unwrap();
+                assert!(tampered.validate().is_err());
+            }
+        }
         assert!(!encoded.contains("modeId"));
         assert!(
             !serde_json::to_string(&catalog)

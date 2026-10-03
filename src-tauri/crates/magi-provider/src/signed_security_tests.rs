@@ -208,7 +208,7 @@ fn runtime_manifest_provenance_is_closed_and_preserves_explicit_legacy_policy() 
         ("codex_source_patch_id", "codex-http-ca-preserve-backend-v1"),
         (
             "codex_source_patch_sha256",
-            "2ed2741afc0cecc14da03cf05a4474176bbc9a81f6e7657078c069f2d584ec5b",
+            "b08f4099725b6394e5657691e10d2dc8d9696cd119623fa6155db28a70d76d54",
         ),
         (
             "codex_source_lock_sha256",

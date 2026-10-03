@@ -4,18 +4,22 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 export type ConnectionState = "unknown" | "runtime_available" | "blocked";
 export type StorageState = "unknown" | "ready" | "error";
 export type StorageUnavailableDiagnostic = {
-  code: "app_data_unavailable" | "migration_checksum_mismatch" | "unsupported_schema_version" | "store_integrity_check_failed" | "store_access_denied" | "store_already_open" | "store_initialization_failed";
+  code: "app_data_unavailable" | "migration_checksum_mismatch" | "unsupported_schema_version" | "store_integrity_check_failed" | "store_access_denied" | "store_already_open" | "store_initialization_failed" | "selected_store_open_failed";
   message: string;
   action: string;
 };
 export type BallotChoice = "support" | "oppose" | "abstain";
 
 export type RunDossierView = {
+  generation: number;
+  revision: number;
+  assessments?: Array<{ assessmentId: string; coreId: "MELCHIOR-1" | "BALTHASAR-2" | "CASPER-3"; positionSummary: string }>;
   runId: string;
   question: string;
   status: string;
   stage: string;
   proposal: {
+    kind?: "answer" | "recommendation";
     body: string;
     conditions: string[];
     alternatives: string[];
@@ -30,7 +34,30 @@ export type RunDossierView = {
   error?: { code: string; message: string; profileBinding?: ProfileAuthenticationBinding };
 };
 
+export type CoreDispatchProjection = {
+  runId: string; runRevision: number; inputDigest: string; generation: number; status: string; stage: string | null; projectionDigest: string;
+  coreDispatches: Array<{ slotOrdinal: number; state: "reserved" | "active" | "settled" | "released" | "unknown"; stage: "independent_review" | "cross_review" | "synthesis" | "balloting"; coreId: "MELCHIOR-1" | "BALTHASAR-2" | "CASPER-3" | null; bindingCoreId: "MELCHIOR-1" | "BALTHASAR-2" | "CASPER-3"; resultRef: string | null }>;
+};
+export function validCoreDispatchProjection(value: unknown, runId: string): value is CoreDispatchProjection {
+  if (!value || typeof value !== "object") return false;
+  const next = value as CoreDispatchProjection;
+  const cores = ["MELCHIOR-1", "BALTHASAR-2", "CASPER-3"];
+  return next.runId === runId && Number.isSafeInteger(next.runRevision) && next.runRevision >= 0 && Number.isSafeInteger(next.generation) && next.generation >= 0
+    && typeof next.inputDigest === "string" && /^[a-f0-9]{64}$/.test(next.inputDigest) && typeof next.projectionDigest === "string" && /^[a-f0-9]{64}$/.test(next.projectionDigest)
+    && typeof next.status === "string" && (next.stage === null || ["independent_review", "cross_review", "synthesis", "balloting"].includes(next.stage))
+    && Array.isArray(next.coreDispatches) && next.coreDispatches.length <= 10 && next.coreDispatches.every(slot => slot !== null && typeof slot === "object") && new Set(next.coreDispatches.map(slot => slot.slotOrdinal)).size === next.coreDispatches.length
+    && next.coreDispatches.every(slot => Number.isInteger(slot.slotOrdinal) && slot.slotOrdinal >= 1 && slot.slotOrdinal <= 10 && ["reserved", "active", "settled", "released", "unknown"].includes(slot.state)
+      && (slot.stage === (slot.slotOrdinal <= 3 ? "independent_review" : slot.slotOrdinal <= 6 ? "cross_review" : slot.slotOrdinal === 7 ? "synthesis" : "balloting")) && (slot.slotOrdinal === 7 ? slot.coreId === null : slot.coreId === slot.bindingCoreId) && cores.includes(slot.bindingCoreId) && (slot.coreId === null || cores.includes(slot.coreId))
+      && (slot.resultRef === null || (typeof slot.resultRef === "string" && slot.resultRef.length > 0)));
+}
+export async function loadRunCoreDispatches(runId: string): Promise<CoreDispatchProjection> {
+  const next: unknown = await invoke("load_run_core_dispatches", { runId });
+  if (!validCoreDispatchProjection(next, runId)) throw new Error("dispatch_projection_invalid");
+  return next;
+}
+
 export type RunUpdate = {
+  dispatchProjection?: CoreDispatchProjection;
   runId: string;
   stage: string;
   coreId?: "MELCHIOR-1" | "BALTHASAR-2" | "CASPER-3";
@@ -40,6 +67,7 @@ export type RunUpdate = {
 };
 
 export type ConsoleRunSummary = {
+  dispatchProjection?: CoreDispatchProjection;
   id: string;
   question: string;
   stage: string;
@@ -69,6 +97,7 @@ export type CapturedSourceSummary = {
   representation: "utf8_text" | "pdf_text" | "pdf_raster" | "image" | "unsupported" | "unknown";
   digest?: string;
   issueCodes: string[];
+  includedLocators?: RecordEvidenceLocator[];
 };
 
 export type ContextSelectionSummary = {
@@ -486,6 +515,7 @@ export type ConsolePreferences = {
   theme: "command" | "clear";
   fontScale: 100 | 125 | 150 | 200;
   language: "ko" | "en";
+  commonContextTokenLimit: number;
 };
 
 export type PreferenceField = keyof ConsolePreferences;
@@ -494,7 +524,7 @@ export type SettingsSnapshot = { schemaVersion: 1; revision: number; preferences
 export type SettingsCommand = { schemaVersion: 1; commandId: string; idempotencyKey: string; target: "console_preferences"; patch: Partial<ConsolePreferences>; expectedFieldRevisions: Partial<PreferenceRevisions> };
 export type SettingsReceipt = { schemaVersion: 1; commandId: string; idempotencyKey: string; intentDigest: string; committedAt: string; snapshot: SettingsSnapshot };
 export type CommittedPreferences = { schemaVersion: 1; receipt: SettingsReceipt; notification: { state: "delivered" | "pending" } };
-const preferenceFields: PreferenceField[] = ["motion", "sound", "theme", "fontScale", "language"];
+const preferenceFields: PreferenceField[] = ["motion", "sound", "theme", "fontScale", "language", "commonContextTokenLimit"];
 function settingsObject(value: unknown, keys: string[]): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).sort().join() !== [...keys].sort().join()) throw new Error("Invalid settings response.");
   return value as Record<string, unknown>;
@@ -504,7 +534,7 @@ export function validateSettingsSnapshot(value: unknown): SettingsSnapshot {
   const object = settingsObject(value, ["schemaVersion", "revision", "preferences", "fieldRevisions"]);
   const preferences = settingsObject(object.preferences, preferenceFields);
   const revisions = settingsObject(object.fieldRevisions, preferenceFields);
-  if (object.schemaVersion !== 1 || !settingsRevision(object.revision) || (typeof preferences.motion !== "string" || !["full", "reduced", "off"].includes(preferences.motion)) || typeof preferences.sound !== "boolean" || (typeof preferences.theme !== "string" || !["command", "clear"].includes(preferences.theme)) || ![100,125,150,200].includes(preferences.fontScale as number) || typeof preferences.fontScale !== "number" || (typeof preferences.language !== "string" || !["ko", "en"].includes(preferences.language)) || preferenceFields.some(field => !settingsRevision(revisions[field]) || (revisions[field] as number) > (object.revision as number))) throw new Error("Invalid settings response.");
+  if (object.schemaVersion !== 1 || !settingsRevision(object.revision) || (typeof preferences.motion !== "string" || !["full", "reduced", "off"].includes(preferences.motion)) || typeof preferences.sound !== "boolean" || (typeof preferences.theme !== "string" || !["command", "clear"].includes(preferences.theme)) || ![100,125,150,200].includes(preferences.fontScale as number) || typeof preferences.fontScale !== "number" || (typeof preferences.language !== "string" || !["ko", "en"].includes(preferences.language)) || typeof preferences.commonContextTokenLimit !== "number" || !Number.isSafeInteger(preferences.commonContextTokenLimit) || preferences.commonContextTokenLimit < 1 || preferences.commonContextTokenLimit > 128000 || preferenceFields.some(field => !settingsRevision(revisions[field]) || (revisions[field] as number) > (object.revision as number))) throw new Error("Invalid settings response.");
   return value as SettingsSnapshot;
 }
 
@@ -803,6 +833,8 @@ export function normalizeLiveRunError(error: unknown): LiveRunError {
   };
 }
 
+export type CommonContextBudgetPolicy = { schemaVersion: 1; tokenLimit: number; settingsFieldRevision: number };
+
 export type StartDeliberationInput = {
   commandId: string;
   idempotencyKey: string;
@@ -813,6 +845,7 @@ export type StartDeliberationInput = {
   rolePresetId: string;
   roleRevision: number;
   disclosureConfirmed: true;
+  expectedCommonContextBudgetRevision?: number;
 };
 
 export type AdmissionAuthority = { token: string; processEpoch: string };
@@ -1038,6 +1071,11 @@ export async function listenRunUpdate(
 ): Promise<UnlistenFn> {
   if (!isDesktopApp()) return () => undefined;
   return listen<RunUpdate>("magi:run-update", ({ payload }) => onUpdate(payload));
+}
+
+export async function listenCoreDispatches(onProjection: (projection: CoreDispatchProjection) => void): Promise<UnlistenFn> {
+  if (!isDesktopApp()) return () => undefined;
+  return listen<CoreDispatchProjection>("magi:core-dispatches", ({ payload }) => onProjection(payload));
 }
 
 export async function listenLiveRunChanged(

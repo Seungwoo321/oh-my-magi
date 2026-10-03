@@ -114,6 +114,49 @@ impl Drop for ActivityLease {
     }
 }
 
+pub(crate) struct PromptPublicationAuthorization {
+    expires_at_epoch_ms: u64,
+    deadline: std::time::Instant,
+    check_current: Arc<dyn Fn() -> Result<(), ProviderError> + Send + Sync>,
+}
+impl PromptPublicationAuthorization {
+    pub(crate) fn new(
+        expires_at_epoch_ms: u64,
+        check_current: Arc<dyn Fn() -> Result<(), ProviderError> + Send + Sync>,
+    ) -> Result<Self, ProviderError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| ProviderError::Cancelled)?
+            .as_millis();
+        let remaining = u128::from(expires_at_epoch_ms)
+            .checked_sub(now)
+            .filter(|n| *n > 0)
+            .ok_or(ProviderError::Cancelled)?;
+        let deadline = std::time::Instant::now()
+            .checked_add(std::time::Duration::from_millis(
+                u64::try_from(remaining).map_err(|_| ProviderError::Cancelled)?,
+            ))
+            .ok_or(ProviderError::Cancelled)?;
+        Ok(Self {
+            expires_at_epoch_ms,
+            deadline,
+            check_current,
+        })
+    }
+    pub(crate) fn check(&self) -> Result<(), ProviderError> {
+        (self.check_current)()?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| ProviderError::Cancelled)?
+            .as_millis();
+        if now >= u128::from(self.expires_at_epoch_ms) || std::time::Instant::now() >= self.deadline
+        {
+            return Err(ProviderError::Cancelled);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct EffectAuthority {
     revoked: Arc<AtomicBool>,
@@ -234,6 +277,25 @@ impl VerificationRequest {
                 updates: tokio::sync::watch::channel(RequestSettlement::default()).0,
             }),
         }
+    }
+
+    /// Serializes a durable cancellation decision with actual effect publication.
+    /// The callback must not recursively acquire this authority or await work.
+    /// Expiry does not prevent cancellation; only a successful decision revokes.
+    pub fn revoke_conditionally<T>(
+        &self,
+        operation: impl FnOnce() -> (T, bool),
+    ) -> Result<T, ProviderError> {
+        let _guard = self
+            .publication
+            .lock()
+            .map_err(|_| ProviderError::Cancelled)?;
+        let (result, revoke) = operation();
+        if revoke {
+            self.revoked.store(true, Ordering::SeqCst);
+            self.revocation.send_replace(true);
+        }
+        Ok(result)
     }
 
     pub fn revoke(&self) {
@@ -1742,6 +1804,81 @@ fn bounded_child_output(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn conditional_cancel_linearizes_after_authorized_writer_and_before_late_bytes() {
+        use std::io::{Read, Write};
+        use std::sync::mpsc;
+        let request = VerificationRequest::until(Instant::now() + Duration::from_secs(5));
+        let authority = request.effect_authority();
+        let (mut writer, mut reader) = std::os::unix::net::UnixStream::pair().unwrap();
+        reader
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (authorized, seen) = mpsc::channel();
+        let (release, resume) = mpsc::channel();
+        let writing = std::thread::spawn(move || {
+            authority
+                .publish(|| {
+                    // The prompt authorization callback has returned, but the actual write is paused.
+                    authorized.send(()).unwrap();
+                    resume.recv_timeout(Duration::from_secs(2)).unwrap();
+                    writer.write_all(b"approved").unwrap();
+                })
+                .unwrap();
+        });
+        seen.recv_timeout(Duration::from_secs(2)).unwrap();
+        let cancel_request = request.clone();
+        let (committed, observed) = mpsc::channel();
+        let (attempting, attempted) = mpsc::channel();
+        let cancel = std::thread::spawn(move || {
+            assert!(matches!(
+                cancel_request.publication.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ));
+            attempting.send(()).unwrap();
+            cancel_request
+                .revoke_conditionally(|| {
+                    committed.send(()).unwrap();
+                    ((), true)
+                })
+                .unwrap();
+        });
+        attempted.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(
+            observed.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        release.send(()).unwrap();
+        writing.join().unwrap();
+        observed.recv_timeout(Duration::from_secs(2)).unwrap();
+        cancel.join().unwrap();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"approved");
+        assert!(
+            request
+                .effect_authority()
+                .publish(|| panic!("late publication"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rejected_cancel_preserves_authority_and_expired_cancel_still_revokes() {
+        let request = VerificationRequest::until(Instant::now() + Duration::from_secs(1));
+        assert_eq!(
+            request
+                .revoke_conditionally(|| ("stale_cas", false))
+                .unwrap(),
+            "stale_cas"
+        );
+        assert!(request.check().is_ok());
+        let expired = request.with_deadline(Instant::now());
+        expired.revoke_conditionally(|| ((), true)).unwrap();
+        assert!(matches!(request.check(), Err(ProviderError::Cancelled)));
+        expired.revoke_conditionally(|| ((), true)).unwrap();
+    }
+
     #[tokio::test]
     async fn aborted_caller_cannot_settle_its_live_blocking_worker() {
         let request = VerificationRequest::until(Instant::now() + Duration::from_secs(2));

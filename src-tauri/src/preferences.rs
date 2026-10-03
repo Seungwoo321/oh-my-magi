@@ -47,16 +47,25 @@ pub struct ConsolePreferences {
     pub font_scale: u16,
     #[serde(default = "default_ui_language")]
     pub language: UiLanguage,
+    #[serde(default = "default_common_context_token_limit")]
+    pub common_context_token_limit: u32,
 }
 
 impl ConsolePreferences {
     fn validate(&self) -> Result<(), String> {
+        if !(1..=128_000).contains(&self.common_context_token_limit) {
+            return Err("Common context token limit must be between 1 and 128000.".into());
+        }
         if [100, 125, 150, 200].contains(&self.font_scale) {
             Ok(())
         } else {
             Err("Console text size is not supported.".into())
         }
     }
+}
+
+fn default_common_context_token_limit() -> u32 {
+    32_000
 }
 
 fn default_font_scale() -> u16 {
@@ -68,6 +77,55 @@ fn default_ui_language() -> UiLanguage {
 }
 
 pub use authority::{SettingsCommand, SettingsReceipt, SettingsSnapshot};
+
+pub(crate) fn with_common_context_budget<T>(
+    app: &AppHandle,
+    expected_revision: u64,
+    operation: impl FnOnce(magi_domain::CommonContextBudgetPolicy) -> T,
+) -> Result<T, String> {
+    with_common_context_budget_at(&state_directory(app)?, expected_revision, operation)
+}
+
+fn with_common_context_budget_at<T>(
+    directory: &std::path::Path,
+    expected_revision: u64,
+    operation: impl FnOnce(magi_domain::CommonContextBudgetPolicy) -> T,
+) -> Result<T, String> {
+    let _guard = PREFERENCES_LOCK.lock().map_err(|_| settings_error())?;
+    let (cap, revision) = match fs::symlink_metadata(directory.join("console-preferences.sqlite")) {
+        Ok(_) => authority::load(&open_authority(directory)?)
+            .map_err(map_error)?
+            .common_context_budget()
+            .map_err(map_error)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if read_legacy(directory)?.is_some() {
+                let (_, snapshot) = activate(
+                    directory,
+                    ConsolePreferences {
+                        motion: MotionPreference::Full,
+                        sound: false,
+                        theme: ThemePreference::Command,
+                        font_scale: default_font_scale(),
+                        language: default_ui_language(),
+                        common_context_token_limit: default_common_context_token_limit(),
+                    },
+                )?;
+                snapshot.common_context_budget().map_err(map_error)?
+            } else {
+                (default_common_context_token_limit(), 0)
+            }
+        }
+        Err(_) => return Err(settings_error()),
+    };
+    if expected_revision != revision {
+        return Err(
+            "Common context budget setting revision changed; review the input again.".into(),
+        );
+    }
+    let policy =
+        magi_domain::CommonContextBudgetPolicy::new(cap, revision).map_err(|_| settings_error())?;
+    Ok(operation(policy))
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -379,10 +437,33 @@ mod tests {
             theme: ThemePreference::Command,
             font_scale: 100,
             language: UiLanguage::Ko,
+            common_context_token_limit: default_common_context_token_limit(),
         }
     }
     fn command(id: &str, font: u16, revision: u64) -> SettingsCommand {
         serde_json::from_value(serde_json::json!({"schemaVersion":1,"commandId":id,"idempotencyKey":format!("key-{id}"),"target":"console_preferences","patch":{"fontScale":font},"expectedFieldRevisions":{"fontScale":revision}})).unwrap()
+    }
+
+    #[test]
+    fn common_budget_persists_across_real_authority_reopen_without_defaults_overwrite() {
+        let root = OwnedDirectory::new();
+        let (connection, snapshot) = activate(&root.0, defaults()).unwrap();
+        assert_eq!(snapshot.common_context_budget().unwrap(), (32_000, 0));
+        drop(connection);
+        let command: SettingsCommand = serde_json::from_value(serde_json::json!({"schemaVersion":1,"commandId":"budget","idempotencyKey":"budget-key","target":"console_preferences","patch":{"commonContextTokenLimit":128000},"expectedFieldRevisions":{"commonContextTokenLimit":0}})).unwrap();
+        let committed = commit_at(&root.0, &command, "accepted", |_| true).unwrap();
+        let (connection, reopened) = activate(&root.0, defaults()).unwrap();
+        assert_eq!(reopened.common_context_budget().unwrap(), (128_000, 1));
+        assert_eq!(reopened, committed.receipt.snapshot);
+        drop(connection);
+        let replay = commit_at(&root.0, &command, "later", |_| true).unwrap();
+        assert_eq!(replay.receipt, committed.receipt);
+        let observed = with_common_context_budget_at(&root.0, 1, |policy| policy).unwrap();
+        assert_eq!(observed.token_limit, 128_000);
+        assert_eq!(observed.settings_field_revision, 1);
+        let called = std::cell::Cell::new(false);
+        assert!(with_common_context_budget_at(&root.0, 0, |_| called.set(true)).is_err());
+        assert!(!called.get());
     }
 
     #[test]

@@ -180,6 +180,8 @@ pub struct AdmissionRequestIntent {
     pub question: String,
     pub core_bindings: Vec<CoreBindingReference>,
     pub request_provenance: magi_domain::DeliberationRequestProvenance,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub common_context_budget: Option<magi_domain::CommonContextBudgetPolicy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

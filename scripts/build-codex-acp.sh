@@ -15,7 +15,7 @@ readonly public_ca_sha256='a41b5d356aea97a529fe27e0f7316d2f9d946d75927476cf9cf1b
 readonly codex_source_commit='b412ff32c417f855c2b2d1581b77058eed87c84b'
 readonly codex_source_sha256='1ac6a92e7318b8acf3d767170c5c5e6dceeffdc074c73b1c5d422b46f0de4daf'
 readonly codex_source_patch_id='codex-http-ca-preserve-backend-v1'
-readonly codex_source_patch_sha256='2ed2741afc0cecc14da03cf05a4474176bbc9a81f6e7657078c069f2d584ec5b'
+readonly codex_source_patch_sha256='b08f4099725b6394e5657691e10d2dc8d9696cd119623fa6155db28a70d76d54'
 readonly codex_source_lock_sha256='d722f05fc760bcd1f5749ec452452d81058458b788df3b765b80500d757eba4a'
 provider_bun="${MAGI_BUN_EXECUTABLE:-bun}"
 
@@ -901,7 +901,7 @@ const expected = {
   codex_source_commit: 'b412ff32c417f855c2b2d1581b77058eed87c84b',
   codex_source_sha256: '1ac6a92e7318b8acf3d767170c5c5e6dceeffdc074c73b1c5d422b46f0de4daf',
   codex_source_patch_id: 'codex-http-ca-preserve-backend-v1',
-  codex_source_patch_sha256: '2ed2741afc0cecc14da03cf05a4474176bbc9a81f6e7657078c069f2d584ec5b',
+  codex_source_patch_sha256: 'b08f4099725b6394e5657691e10d2dc8d9696cd119623fa6155db28a70d76d54',
   codex_source_lock_sha256: 'd722f05fc760bcd1f5749ec452452d81058458b788df3b765b80500d757eba4a',
   status: 'built_unadmitted',
 };
@@ -1207,7 +1207,7 @@ const expected = {
   codex_source_commit: 'b412ff32c417f855c2b2d1581b77058eed87c84b',
   codex_source_sha256: '1ac6a92e7318b8acf3d767170c5c5e6dceeffdc074c73b1c5d422b46f0de4daf',
   codex_source_patch_id: 'codex-http-ca-preserve-backend-v1',
-  codex_source_patch_sha256: '2ed2741afc0cecc14da03cf05a4474176bbc9a81f6e7657078c069f2d584ec5b',
+  codex_source_patch_sha256: 'b08f4099725b6394e5657691e10d2dc8d9696cd119623fa6155db28a70d76d54',
   codex_source_lock_sha256: 'd722f05fc760bcd1f5749ec452452d81058458b788df3b765b80500d757eba4a',
   status: 'built_unadmitted',
 };
@@ -1356,9 +1356,8 @@ NODE
 (
   assert_repo_local_paths "$temporary_dir" "$checkout" "$npm_cache"
   cd "$checkout"
-  npm ci --cache "$npm_cache" --no-audit --no-fund
+  npm ci --ignore-scripts --cache "$npm_cache" --no-audit --no-fund
   npx tsc --noEmit
-  npm cache clean --force --cache "$npm_cache" >/dev/null
   "$provider_bun" build src/index.ts --minify --sourcemap --compile --target="bun-darwin-$target_arch" --outfile "dist/bin/codex-acp-$target_arch-darwin"
 )
 
@@ -1402,6 +1401,7 @@ A copy of the license is available at https://www.mozilla.org/MPL/2.0/.
 The original certificate bundle headers and certificate data are preserved without modification.
 EOF
 cat "$codex_runtime_root/LICENSE" "$codex_runtime_root/NOTICE" >> "$staging_dir/ca-notice.txt"
+node "$script_dir/collect-provider-licenses.mjs" "$checkout" >> "$staging_dir/ca-notice.txt"
 chmod 444 "$staging_dir/ca-notice.txt"
 cat > "$staging_dir/build-manifest.json" <<EOF
 {

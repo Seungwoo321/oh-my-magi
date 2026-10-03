@@ -83,9 +83,12 @@ pub fn clarification_view(
 #[serde(rename_all = "camelCase")]
 pub struct RunDossierView {
     pub run_id: String,
+    pub generation: u64,
     pub question: String,
+    pub revision: u64,
     pub status: &'static str,
     pub stage: &'static str,
+    pub assessments: Vec<AssessmentView>,
     pub proposal: Option<ProposalView>,
     pub votes: Vec<VoteView>,
     pub outcome: Option<Outcome>,
@@ -96,10 +99,19 @@ pub struct RunDossierView {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProposalView {
+    pub kind: magi_domain::QuestionKind,
     pub body: String,
     pub conditions: Vec<String>,
     pub alternatives: Vec<String>,
     pub open_objections: Vec<ObjectionView>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssessmentView {
+    pub assessment_id: String,
+    pub core_id: CoreId,
+    pub position_summary: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -167,10 +179,22 @@ fn stage_name(status: &RunStatus) -> &'static str {
 pub fn dossier_view(snapshot: &RunSnapshot) -> RunDossierView {
     RunDossierView {
         run_id: snapshot.run.run_id.clone(),
+        generation: snapshot.run.generation,
         question: snapshot.input.question.prompt.clone(),
+        revision: snapshot.run.revision,
         status: status_name(&snapshot.run.status),
         stage: stage_name(&snapshot.run.status),
+        assessments: snapshot
+            .assessments
+            .iter()
+            .map(|assessment| AssessmentView {
+                assessment_id: assessment.attempt_id.clone(),
+                core_id: assessment.core_id,
+                position_summary: assessment.position_summary.clone(),
+            })
+            .collect(),
         proposal: snapshot.proposal.as_ref().map(|proposal| ProposalView {
+            kind: proposal.kind,
             body: proposal.body.clone(),
             conditions: proposal.conditions.clone(),
             alternatives: proposal.alternatives.clone(),

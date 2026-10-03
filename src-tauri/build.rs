@@ -1,4 +1,4 @@
-use extraction_authority::{Identity, identity};
+use extraction_authority::{identity, Identity};
 use std::{
     fs,
     fs::OpenOptions,
@@ -262,6 +262,10 @@ fn admit_existing_resources(out_dir: &Path) -> io::Result<()> {
         ".local/provider-build/codex-http-ca-preserve-backend-v1-package/codex-acp-tauri-resources",
     );
     let request = VerificationRequest::until(Instant::now() + Duration::from_secs(60));
+    let config =
+        HeldBuildInput::open_with_request(&manifest.join("tauri.conf.json"), 1024 * 1024, &request)
+            .map_err(|_| io::Error::other("Resource configuration unavailable"))?;
+    validate_resource_configuration(&serde_json::from_slice(config.bytes())?)?;
     let release_inputs = verify_release_manifest_inputs(
         &manifest,
         &source.join("darwin-arm64/build-manifest.json"),
@@ -273,6 +277,10 @@ fn admit_existing_resources(out_dir: &Path) -> io::Result<()> {
     let extraction_source = repository.join(".local/native-build/extraction");
     admit_extraction_resource_tree(&extraction_source, &target, &manifest, &request)
         .map_err(|error| io::Error::new(error.kind(), format!("extraction admission: {error}")))?;
+    admit_legal_resources(repository, &target, &request)?;
+    config
+        .check()
+        .map_err(|_| io::Error::other("Resource configuration changed during admission"))?;
     for input in release_inputs {
         input
             .check()
@@ -766,6 +774,13 @@ fn verify_existing_authorities(
         .build()?;
     let release_inputs = verify_release_inputs(manifest, target, &request)?;
     let candidate_inputs = verify_configured_candidate_inputs(manifest, target, &request)?;
+    let legal_inputs = verify_legal_resources(
+        manifest
+            .parent()
+            .ok_or_else(|| io::Error::other("Legal source root unavailable"))?,
+        target,
+        &request,
+    )?;
     let helper = extraction_authority::verify_resource(helper_root, |path| {
         extraction_authority::verify_signature_with_request(path, request.clone())
     })
@@ -877,6 +892,7 @@ fn verify_existing_authorities(
         .iter()
         .chain(candidate_inputs.iter())
         .chain(helper_inputs.iter())
+        .chain(legal_inputs.iter())
     {
         input
             .check()
@@ -1111,11 +1127,141 @@ fn verify_release_manifest_inputs(
     Ok(held)
 }
 
+const LEGAL_RESOURCES: [(&str, &str); 6] = [
+    ("docs/SECURITY.md", "policy/SECURITY.md"),
+    (
+        "src/assets/fonts/barlow-condensed/OFL.txt",
+        "licenses/fonts/barlow-condensed/OFL.txt",
+    ),
+    (
+        "src/assets/fonts/noto-sans-kr/OFL.txt",
+        "licenses/fonts/noto-sans-kr/OFL.txt",
+    ),
+    (
+        "src/assets/fonts/ibm-plex-mono/OFL.txt",
+        "licenses/fonts/ibm-plex-mono/OFL.txt",
+    ),
+    ("NOTICE.md", "licenses/NOTICE.md"),
+    ("LICENSE", "licenses/LICENSE"),
+];
+
+fn verify_legal_resources(
+    repository: &Path,
+    target: &Path,
+    request: &magi_provider::VerificationRequest,
+) -> io::Result<Vec<HeldBuildInput>> {
+    let mut held = Vec::new();
+    for group in ["policy", "licenses"] {
+        let root = target.join(group);
+        let mut files = std::collections::BTreeSet::new();
+        collect_configured_resource_tree(&root, Path::new(""), &mut files, &mut held)?;
+        let expected: std::collections::BTreeSet<_> = LEGAL_RESOURCES
+            .iter()
+            .filter_map(|(_, destination)| {
+                destination
+                    .strip_prefix(&format!("{group}/"))
+                    .map(PathBuf::from)
+            })
+            .collect();
+        if files != expected {
+            return Err(io::Error::other("Legal resource inventory changed"));
+        }
+    }
+    for (source, destination) in LEGAL_RESOURCES {
+        let input =
+            HeldBuildInput::open_with_request(&repository.join(source), 1024 * 1024, request)
+                .map_err(|_| io::Error::other("Legal resource source unavailable"))?;
+        let output =
+            HeldBuildInput::open_with_request(&target.join(destination), 1024 * 1024, request)
+                .map_err(|_| io::Error::other("Legal resource copy unavailable"))?;
+        if input.bytes() != output.bytes()
+            || input.expected.0 == output.expected.0 && input.expected.1 == output.expected.1
+        {
+            return Err(io::Error::other(
+                "Legal resource copy changed or reused source inode",
+            ));
+        }
+        held.extend([input, output]);
+    }
+    Ok(held)
+}
+
+fn admit_legal_resources(
+    repository: &Path,
+    target: &Path,
+    request: &magi_provider::VerificationRequest,
+) -> io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let mut generations = Vec::new();
+    let mut source_inputs = Vec::new();
+    for group in ["policy", "licenses"] {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(io::Error::other)?
+            .as_nanos();
+        let mut owned = OwnedAdmissionResource::create(
+            target.join(format!(".legal-admission-{}-{nonce}", std::process::id())),
+        )?;
+        for (source, destination) in LEGAL_RESOURCES {
+            let Some(relative) = destination.strip_prefix(&format!("{group}/")) else {
+                continue;
+            };
+            let input =
+                HeldBuildInput::open_with_request(&repository.join(source), 1024 * 1024, request)
+                    .map_err(|_| io::Error::other("Legal source unavailable during admission"))?;
+            let path = owned.path.join(relative);
+            fs::create_dir_all(
+                path.parent()
+                    .ok_or_else(|| io::Error::other("Legal resource parent unavailable"))?,
+            )?;
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&path)?;
+            file.write_all(input.bytes())?;
+            file.sync_all()?;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o444))?;
+            input
+                .check()
+                .map_err(|_| io::Error::other("Legal source changed during admission"))?;
+            source_inputs.push(input);
+        }
+        owned.publish(&target.join(group))?;
+        generations.push(owned);
+    }
+    let held = verify_legal_resources(repository, target, request)?;
+    for input in held.iter().chain(source_inputs.iter()) {
+        input
+            .check()
+            .map_err(|_| io::Error::other("Legal resources changed during admission"))?;
+    }
+    for generation in &generations {
+        seal_generated_resources(&generation.path)?;
+    }
+    let sealed = verify_legal_resources(repository, target, request)?;
+    for input in sealed.iter().chain(source_inputs.iter()) {
+        input
+            .check()
+            .map_err(|_| io::Error::other("Legal resources changed before admission commit"))?;
+    }
+    for generation in &mut generations {
+        generation.commit();
+    }
+    Ok(())
+}
+
 fn validate_resource_configuration(config: &serde_json::Value) -> io::Result<()> {
     let expected = serde_json::json!({
         "../.local/provider-build/codex-http-ca-preserve-backend-v1-package/codex-acp-tauri-resources/": "provider/codex-acp/",
         "../.local/native-build/extraction/": "extraction/",
-        "../docs/SECURITY.md": "policy/SECURITY.md"
+        "../docs/SECURITY.md": "policy/SECURITY.md",
+        "../src/assets/fonts/barlow-condensed/OFL.txt": "licenses/fonts/barlow-condensed/OFL.txt",
+        "../src/assets/fonts/noto-sans-kr/OFL.txt": "licenses/fonts/noto-sans-kr/OFL.txt",
+        "../src/assets/fonts/ibm-plex-mono/OFL.txt": "licenses/fonts/ibm-plex-mono/OFL.txt",
+        "../NOTICE.md": "licenses/NOTICE.md",
+        "../LICENSE": "licenses/LICENSE"
     });
     if config.pointer("/bundle/resources") != Some(&expected)
         || config
@@ -1628,7 +1774,65 @@ mod tests {
     }
     impl Drop for Fixture {
         fn drop(&mut self) {
-            let _ = remove_retired_resources(&self.0);
+            if let Err(error) = remove_retired_resources(&self.0) {
+                if std::thread::panicking() {
+                    eprintln!("Resource test fixture cleanup failed during unwind: {error}");
+                } else {
+                    panic!("Resource test fixture cleanup failed: {error}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sealed_admitted_fixture_is_removed_after_error_and_panic_unwind() {
+        for panic_after_admission in [false, true] {
+            let fixture = Fixture::new();
+            let path = fixture.0.clone();
+            let outcome = std::panic::catch_unwind(move || -> io::Result<()> {
+                let fixture = fixture;
+                let repository = &fixture.0;
+                for (source, _) in LEGAL_RESOURCES {
+                    let input = repository.join(source);
+                    fs::create_dir_all(input.parent().unwrap()).unwrap();
+                    fs::write(input, source.as_bytes()).unwrap();
+                }
+                let request = magi_provider::VerificationRequest::until(
+                    std::time::Instant::now() + std::time::Duration::from_secs(30),
+                );
+                let target = repository.join("target/debug");
+                admit_legal_resources(repository, &target, &request).unwrap();
+                assert_eq!(
+                    fs::metadata(target.join("licenses")).unwrap().mode() & 0o777,
+                    0o555
+                );
+                assert_eq!(
+                    fs::metadata(target.join("policy")).unwrap().mode() & 0o777,
+                    0o555
+                );
+                assert_eq!(
+                    fs::metadata(target.join("licenses/LICENSE"))
+                        .unwrap()
+                        .mode()
+                        & 0o777,
+                    0o444
+                );
+                if panic_after_admission {
+                    panic!("Injected failure after sealed legal admission");
+                }
+                Err(io::Error::other(
+                    "Injected error after sealed legal admission",
+                ))
+            });
+            if panic_after_admission {
+                assert!(outcome.is_err());
+            } else {
+                assert!(outcome.unwrap().is_err());
+            }
+            assert!(
+                !path.exists(),
+                "Sealed fixture remained after failure cleanup"
+            );
         }
     }
 
@@ -1645,20 +1849,16 @@ mod tests {
         .unwrap();
         assert!(changed_version);
         assert_ne!(identity(&fs::metadata(&parent).unwrap()), expected);
-        assert!(
-            hold_build_ancestor(&parent, || {
-                fs::rename(&parent, fixture.0.join("retired-ancestor")).unwrap();
-                fs::create_dir(&parent).unwrap();
-            })
-            .is_err()
-        );
-        assert!(
-            hold_build_ancestor(&parent, || {
-                fs::remove_dir(&parent).unwrap();
-                std::os::unix::fs::symlink(fixture.0.join("retired-ancestor"), &parent).unwrap();
-            })
-            .is_err()
-        );
+        assert!(hold_build_ancestor(&parent, || {
+            fs::rename(&parent, fixture.0.join("retired-ancestor")).unwrap();
+            fs::create_dir(&parent).unwrap();
+        })
+        .is_err());
+        assert!(hold_build_ancestor(&parent, || {
+            fs::remove_dir(&parent).unwrap();
+            std::os::unix::fs::symlink(fixture.0.join("retired-ancestor"), &parent).unwrap();
+        })
+        .is_err());
     }
 
     fn owned_codegen_fixture(path: PathBuf) -> OwnedCodegenConfiguration {
@@ -1688,10 +1888,10 @@ mod tests {
         assert!(!success.exists());
         drop(owned);
         let error = fixture.0.join("error");
-        let outcome: io::Result<()> = (|| {
+        let outcome: io::Result<()> = {
             let _owned = owned_codegen_fixture(error.clone());
             Err(io::Error::other("injected code generation failure"))
-        })();
+        };
         assert!(outcome.is_err());
         assert!(!error.exists());
     }
@@ -1741,9 +1941,10 @@ mod tests {
             let path = fixture.0.join(relative);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(path, b"captured release input").unwrap();
-            authority[key] = serde_json::json!(
-                magi_domain::Digest::from_bytes(b"captured release input").as_str()
-            );
+            authority[key] = serde_json::json!(magi_domain::Digest::from_bytes(
+                b"captured release input"
+            )
+            .as_str());
         }
         let authority_path = target.join("provider/codex-acp/darwin-arm64/build-manifest.json");
         fs::create_dir_all(authority_path.parent().unwrap()).unwrap();
@@ -1896,6 +2097,90 @@ mod tests {
     }
 
     #[test]
+    fn pinned_generation_fresh_admission_preserves_provider_helper_legal_and_provenance() {
+        let fixture = Fixture::new();
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .canonicalize()
+            .unwrap();
+        let repository = manifest.parent().unwrap();
+        let target = fixture.0.join("target/debug");
+        admit_existing_resources(&fixture.out()).unwrap();
+        let request = magi_provider::VerificationRequest::until(
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        );
+        let provider = verify_configured_candidate_inputs(&manifest, &target, &request).unwrap();
+        let helper = verify_configured_helper_inputs(
+            &repository.join(".local/native-build/extraction"),
+            &target.join("extraction"),
+            &request,
+        )
+        .unwrap();
+        let legal = verify_legal_resources(repository, &target, &request).unwrap();
+        let provenance = verify_release_inputs(&manifest, &target, &request).unwrap();
+        assert!(
+            !provider.is_empty()
+                && !helper.is_empty()
+                && !legal.is_empty()
+                && !provenance.is_empty()
+        );
+        assert_eq!(
+            fs::read_dir(&target)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["build", "extraction", "licenses", "policy", "provider"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        );
+        for input in provider
+            .iter()
+            .chain(helper.iter())
+            .chain(legal.iter())
+            .chain(provenance.iter())
+        {
+            input.check().unwrap();
+        }
+        assert!(admit_existing_resources(&fixture.out()).is_err());
+        drop((provider, helper, legal, provenance));
+        let root = fixture.0.clone();
+        drop(fixture);
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn legal_admission_preserves_exact_content_and_rejects_drift_and_extra_files() {
+        let fixture = Fixture::new();
+        let repository = &fixture.0;
+        let target = repository.join("target/debug");
+        for (source, _) in LEGAL_RESOURCES {
+            let path = repository.join(source);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, source.as_bytes()).unwrap();
+        }
+        let request = magi_provider::VerificationRequest::until(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+        );
+        admit_legal_resources(repository, &target, &request).unwrap();
+        let held = verify_legal_resources(repository, &target, &request).unwrap();
+        assert!(admit_legal_resources(repository, &target, &request).is_err());
+        let license = target.join("licenses/LICENSE");
+        fs::set_permissions(&license, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::write(&license, b"replacement legal text").unwrap();
+        assert!(verify_legal_resources(repository, &target, &request).is_err());
+        assert!(held.iter().any(|input| input.check().is_err()));
+        fs::write(&license, b"LICENSE").unwrap();
+        fs::set_permissions(&license, fs::Permissions::from_mode(0o444)).unwrap();
+        verify_legal_resources(repository, &target, &request).unwrap();
+        fs::set_permissions(target.join("licenses"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(target.join("licenses/extra"), b"unapproved").unwrap();
+        assert!(verify_legal_resources(repository, &target, &request).is_err());
+        fs::remove_file(target.join("licenses/extra")).unwrap();
+        fs::write(repository.join("LICENSE"), b"source replacement").unwrap();
+        assert!(verify_legal_resources(repository, &target, &request).is_err());
+    }
+
+    #[test]
     fn verification_purpose_rejects_unknown_resources_and_unguarded_publication() {
         assert_eq!(BuildPurpose::parse(None).unwrap(), BuildPurpose::Verify);
         assert_eq!(
@@ -1906,30 +2191,33 @@ mod tests {
         assert!(require_publication_authority().is_err());
         let injected =
             std::ffi::OsStr::new(r#"{"bundle":{"resources":{"attacker":"provider/codex-acp/"}}}"#);
-        assert!(
-            verify_existing_resources_with(
-                Path::new("missing-output"),
-                Path::new("missing-manifest"),
-                Some(injected),
-                |_| panic!("override must reject before Tauri resource copying")
-            )
-            .is_err()
-        );
+        assert!(verify_existing_resources_with(
+            Path::new("missing-output"),
+            Path::new("missing-manifest"),
+            Some(injected),
+            |_| panic!("override must reject before Tauri resource copying")
+        )
+        .is_err());
 
         validate_configuration_override(None).unwrap();
-        assert!(
-            validate_configuration_override(Some(std::ffi::OsStr::new(
-                r#"{"bundle":{"resources":{"attacker":"provider/codex-acp/"}}}"#
-            )))
-            .is_err()
-        );
+        assert!(validate_configuration_override(Some(std::ffi::OsStr::new(
+            r#"{"bundle":{"resources":{"attacker":"provider/codex-acp/"}}}"#
+        )))
+        .is_err());
         assert!(validate_configuration_override(Some(std::ffi::OsStr::new(""))).is_err());
 
-        let mut config = serde_json::json!({"bundle":{"resources":{
-            "../.local/provider-build/codex-http-ca-preserve-backend-v1-package/codex-acp-tauri-resources/":"provider/codex-acp/",
-            "../.local/native-build/extraction/":"extraction/"
-        }}});
+        let mut config: serde_json::Value =
+            serde_json::from_str(include_str!("tauri.conf.json")).unwrap();
         validate_resource_configuration(&config).unwrap();
+        let mut mismatched = config.clone();
+        mismatched["bundle"]["resources"]["../LICENSE"] = serde_json::json!("licenses/OTHER");
+        assert!(validate_resource_configuration(&mismatched).is_err());
+        let mut missing = config.clone();
+        missing["bundle"]["resources"]
+            .as_object_mut()
+            .unwrap()
+            .remove("../LICENSE");
+        assert!(validate_resource_configuration(&missing).is_err());
         config["bundle"]["externalBin"] = serde_json::json!(["unverified-sidecar"]);
         assert!(validate_resource_configuration(&config).is_err());
         config["bundle"]
@@ -1952,12 +2240,10 @@ mod tests {
             .parent()
             .unwrap()
             .join("previous-codex-acp-resources");
-        assert!(
-            retire_resources_using(&destination, &previous, |_| {
-                Err(io::Error::other("Injected placeholder retirement failure"))
-            })
-            .is_err()
-        );
+        assert!(retire_resources_using(&destination, &previous, |_| {
+            Err(io::Error::other("Injected placeholder retirement failure"))
+        })
+        .is_err());
         assert_eq!(fs::metadata(&destination).unwrap().ino(), inode);
         assert_eq!(fs::metadata(&destination).unwrap().mode() & 0o777, 0o555);
         assert_eq!(
@@ -1975,20 +2261,18 @@ mod tests {
                 .unwrap(),
             Some(expected.into())
         );
-        assert!(
-            select_developer_identity("0 valid identities found")
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            select_developer_identity("1) ABC \"Developer ID Application: Other (OTHERTEAM)\"")
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            select_developer_identity(&format!("1) ABC \"{expected}\"\n2) DEF \"{expected}\""))
-                .is_err()
-        );
+        assert!(select_developer_identity("0 valid identities found")
+            .unwrap()
+            .is_none());
+        assert!(select_developer_identity(
+            "1) ABC \"Developer ID Application: Other (OTHERTEAM)\""
+        )
+        .unwrap()
+        .is_none());
+        assert!(select_developer_identity(&format!(
+            "1) ABC \"{expected}\"\n2) DEF \"{expected}\""
+        ))
+        .is_err());
     }
 
     #[test]
@@ -2054,16 +2338,14 @@ mod tests {
         let helper_inode = fs::metadata(helper.join("prior")).unwrap().ino();
         let outside = fixture.0.join("outside-canary");
         fs::write(&outside, b"outside").unwrap();
-        assert!(
-            publish_fresh_resources(&fixture.out(), || {
-                fs::create_dir_all(fixture.destination())?;
-                fs::write(fixture.destination().join("fresh"), b"provider")?;
-                fs::create_dir_all(&helper)?;
-                std::os::unix::fs::symlink(&outside, helper.join("invalid"))?;
-                Ok(())
-            })
-            .is_err()
-        );
+        assert!(publish_fresh_resources(&fixture.out(), || {
+            fs::create_dir_all(fixture.destination())?;
+            fs::write(fixture.destination().join("fresh"), b"provider")?;
+            fs::create_dir_all(&helper)?;
+            std::os::unix::fs::symlink(&outside, helper.join("invalid"))?;
+            Ok(())
+        })
+        .is_err());
         assert_eq!(
             fs::metadata(fixture.destination().join("prior"))
                 .unwrap()
@@ -2131,14 +2413,12 @@ mod tests {
             .unwrap()
             .join("other-provider.txt");
         fs::write(&sibling, b"unrelated generated resource").unwrap();
-        assert!(
-            publish_fresh_resources(&fixture.out(), || {
-                fs::create_dir_all(fixture.destination())?;
-                fs::write(fixture.destination().join("partial"), b"partial")?;
-                Err(io::Error::other("controlled build failure"))
-            })
-            .is_err()
-        );
+        assert!(publish_fresh_resources(&fixture.out(), || {
+            fs::create_dir_all(fixture.destination())?;
+            fs::write(fixture.destination().join("partial"), b"partial")?;
+            Err(io::Error::other("controlled build failure"))
+        })
+        .is_err());
         assert_eq!(fs::metadata(prior).unwrap().ino(), inode);
         assert_eq!(fs::read(sibling).unwrap(), b"unrelated generated resource");
         assert!(!fixture.destination().join("partial").exists());
@@ -2155,17 +2435,15 @@ mod tests {
             let outside = fixture.0.join("outside");
             fs::create_dir(&outside).unwrap();
             fs::write(outside.join("keep"), b"outside canary").unwrap();
-            assert!(
-                publish_fresh_resources(&fixture.out(), || {
-                    match output {
-                        "file" => fs::write(fixture.destination(), b"invalid resource root")?,
-                        "symlink" => std::os::unix::fs::symlink(&outside, fixture.destination())?,
-                        _ => {}
-                    }
-                    Ok(())
-                })
-                .is_err()
-            );
+            assert!(publish_fresh_resources(&fixture.out(), || {
+                match output {
+                    "file" => fs::write(fixture.destination(), b"invalid resource root")?,
+                    "symlink" => std::os::unix::fs::symlink(&outside, fixture.destination())?,
+                    _ => {}
+                }
+                Ok(())
+            })
+            .is_err());
             assert_eq!(fs::metadata(&prior).unwrap().ino(), inode);
             assert_eq!(fs::read(&prior).unwrap(), b"verified prior resource");
             assert_eq!(fs::read(outside.join("keep")).unwrap(), b"outside canary");
@@ -2190,19 +2468,17 @@ mod tests {
             let outside = fixture.0.join("outside");
             fs::create_dir(&outside).unwrap();
             fs::write(outside.join("keep"), b"outside canary").unwrap();
-            assert!(
-                publish_fresh_resources(&fixture.out(), || {
-                    fs::create_dir_all(fixture.destination())?;
-                    fs::write(fixture.destination().join("new"), b"new provider")?;
-                    match invalid {
-                        "file" => fs::write(&helper, b"invalid helper root")?,
-                        "symlink" => std::os::unix::fs::symlink(&outside, &helper)?,
-                        _ => {}
-                    }
-                    Ok(())
-                })
-                .is_err()
-            );
+            assert!(publish_fresh_resources(&fixture.out(), || {
+                fs::create_dir_all(fixture.destination())?;
+                fs::write(fixture.destination().join("new"), b"new provider")?;
+                match invalid {
+                    "file" => fs::write(&helper, b"invalid helper root")?,
+                    "symlink" => std::os::unix::fs::symlink(&outside, &helper)?,
+                    _ => {}
+                }
+                Ok(())
+            })
+            .is_err());
             assert_eq!(fs::metadata(&provider_prior).unwrap().ino(), provider_inode);
             assert_eq!(fs::metadata(&helper_prior).unwrap().ino(), helper_inode);
             assert_eq!(fs::read(&provider_prior).unwrap(), b"provider authority");
