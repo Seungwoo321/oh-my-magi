@@ -6233,11 +6233,37 @@ fn emit_live_run_change(app: &AppHandle, change: LiveRunChange) {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct StoredCoreRoleDto {
+    core_id: CoreId,
+    profile_id: String,
+    display_name: String,
+    review_purpose: String,
+    evaluation_criteria: Vec<String>,
+    falsification_questions: Vec<String>,
+    response_language: String,
+}
+
+impl From<CoreRoleDefinition> for StoredCoreRoleDto {
+    fn from(role: CoreRoleDefinition) -> Self {
+        Self {
+            core_id: role.core_id,
+            profile_id: role.profile_id,
+            display_name: role.display_name,
+            review_purpose: role.review_purpose,
+            evaluation_criteria: role.evaluation_criteria,
+            falsification_questions: role.falsification_questions,
+            response_language: role.response_language,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StoredRolePresetDto {
     preset_id: String,
     revision: u64,
     display_name: String,
-    roles: [CoreRoleDefinition; 3],
+    roles: [StoredCoreRoleDto; 3],
     digest: String,
     source: &'static str,
 }
@@ -6260,12 +6286,94 @@ fn role_preset_dto(preset: RolePresetRevision, source: RolePresetSource) -> Stor
         preset_id: preset.preset_id,
         revision: preset.revision,
         display_name: preset.display_name,
-        roles: preset.roles,
+        roles: preset.roles.map(StoredCoreRoleDto::from),
         digest: preset.digest.as_str().to_owned(),
         source: match source {
             RolePresetSource::Factory => "factory",
             RolePresetSource::User => "user",
         },
+    }
+}
+
+#[cfg(test)]
+mod role_preset_wire_tests {
+    use super::*;
+
+    struct OwnedRoleRoot(PathBuf);
+    impl Drop for OwnedRoleRoot {
+        fn drop(&mut self) {
+            if self.0.exists()
+                && let Err(error) = fs::remove_dir_all(&self.0)
+            {
+                if std::thread::panicking() {
+                    eprintln!("Failed to remove owned role fixture: {error}");
+                } else {
+                    panic!("Failed to remove owned role fixture: {error}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn factory_role_wire_keys_preserve_domain_values_and_persisted_digest() {
+        let root = std::env::temp_dir().join(format!("magi-role-wire-{}", Uuid::new_v4()));
+        let _owned = OwnedRoleRoot(root.clone());
+        let storage = Storage::open_or_create(&root).unwrap();
+        let preset = storage
+            .load_role_preset_revision("factory.magi.default", 0)
+            .unwrap()
+            .unwrap();
+        let domain_bytes = serde_json::to_vec(&preset).unwrap();
+        let domain_roles = serde_json::to_value(&preset.roles).unwrap();
+        let wire = serde_json::to_value(role_preset_dto(preset.clone(), RolePresetSource::Factory))
+            .unwrap();
+        let expected_keys = [
+            "coreId",
+            "displayName",
+            "evaluationCriteria",
+            "falsificationQuestions",
+            "profileId",
+            "responseLanguage",
+            "reviewPurpose",
+        ];
+        for (index, role) in preset.roles.iter().enumerate() {
+            let actual = wire["roles"][index].as_object().unwrap();
+            assert_eq!(
+                actual
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<std::collections::BTreeSet<_>>(),
+                expected_keys
+                    .into_iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+            );
+            assert_eq!(
+                actual["coreId"],
+                serde_json::to_value(role.core_id).unwrap()
+            );
+            assert_eq!(actual["profileId"], role.profile_id);
+            assert_eq!(actual["displayName"], role.display_name);
+            assert_eq!(actual["reviewPurpose"], role.review_purpose);
+            assert_eq!(
+                actual["evaluationCriteria"],
+                serde_json::to_value(&role.evaluation_criteria).unwrap()
+            );
+            assert_eq!(
+                actual["falsificationQuestions"],
+                serde_json::to_value(&role.falsification_questions).unwrap()
+            );
+            assert_eq!(actual["responseLanguage"], role.response_language);
+            assert!(domain_roles[index].get("core_id").is_some());
+            assert!(domain_roles[index].get("coreId").is_none());
+        }
+        assert_eq!(wire["digest"], preset.digest.as_str());
+        assert_eq!(wire["source"], "factory");
+        let reloaded = storage
+            .load_role_preset_revision("factory.magi.default", 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(serde_json::to_vec(&reloaded).unwrap(), domain_bytes);
+        reloaded.validate().unwrap();
     }
 }
 
