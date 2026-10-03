@@ -1997,6 +1997,130 @@ mod saved_ui_report_contract_tests {
     }
 }
 
+fn physical_probe_bundle_identifier() -> Result<String, String> {
+    let executable = std::env::current_exe()
+        .and_then(|path| path.canonicalize())
+        .map_err(|_| "physical probe executable unavailable")?;
+    let macos = executable
+        .parent()
+        .ok_or("physical probe executable parent missing")?;
+    let contents = macos.parent().ok_or("physical probe contents missing")?;
+    let bundle = contents.parent().ok_or("physical probe bundle missing")?;
+    if macos.file_name() != Some(std::ffi::OsStr::new("MacOS"))
+        || contents.file_name() != Some(std::ffi::OsStr::new("Contents"))
+        || bundle.extension() != Some(std::ffi::OsStr::new("app"))
+    {
+        return Err("physical probe requires its packaged application host".into());
+    }
+    read_physical_probe_identifier(&contents.join("Info.plist"))
+}
+
+fn read_physical_probe_identifier(path: &Path) -> Result<String, String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|_| "physical probe bundle metadata unavailable")?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| "physical probe bundle metadata unavailable")?;
+    if !metadata.is_file() || metadata.len() > 64 * 1024 {
+        return Err("physical probe bundle metadata invalid".into());
+    }
+    let mut bytes = Vec::new();
+    file.take(64 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "physical probe bundle metadata unreadable")?;
+    parse_physical_probe_identifier(&bytes)
+}
+
+fn parse_physical_probe_identifier(bytes: &[u8]) -> Result<String, String> {
+    if bytes.len() > 64 * 1024 {
+        return Err("physical probe bundle metadata oversized".into());
+    }
+    let value = plist::Value::from_reader(std::io::Cursor::new(bytes))
+        .map_err(|_| "physical probe bundle metadata malformed")?;
+    let identifier = value
+        .as_dictionary()
+        .and_then(|dictionary| dictionary.get("CFBundleIdentifier"))
+        .and_then(plist::Value::as_string)
+        .ok_or("physical probe bundle identifier unavailable")?;
+    if identifier != "local.magi.installed.probe" {
+        return Err("physical probe bundle identity mismatch".into());
+    }
+    Ok(identifier.into())
+}
+
+#[cfg(test)]
+mod physical_probe_identity_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_binary_and_xml_identity_fail_closed_for_invalid_or_nonregular_inputs() {
+        struct OwnedRoot(PathBuf);
+        impl Drop for OwnedRoot {
+            fn drop(&mut self) {
+                if let Err(error) = std::fs::remove_dir_all(&self.0) {
+                    if std::thread::panicking() {
+                        eprintln!("Owned bundle identity fixture cleanup failed: {error}");
+                    } else {
+                        panic!("Owned bundle identity fixture cleanup failed: {error}");
+                    }
+                }
+            }
+        }
+        let path =
+            std::env::temp_dir().join(format!("magi-bundle-identity-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&path).unwrap();
+        let root = OwnedRoot(path);
+        let path = root.0.join("Info.plist");
+        let mut dictionary = plist::Dictionary::new();
+        dictionary.insert(
+            "CFBundleIdentifier".into(),
+            plist::Value::String("local.magi.installed.probe".into()),
+        );
+        let value = plist::Value::Dictionary(dictionary);
+        let mut binary = Vec::new();
+        value.to_writer_binary(&mut binary).unwrap();
+        let mut xml = Vec::new();
+        value.to_writer_xml(&mut xml).unwrap();
+        for bytes in [binary, xml] {
+            std::fs::write(&path, bytes).unwrap();
+            assert_eq!(
+                read_physical_probe_identifier(&path).unwrap(),
+                "local.magi.installed.probe"
+            );
+        }
+        let mut wrong = plist::Dictionary::new();
+        wrong.insert(
+            "CFBundleIdentifier".into(),
+            plist::Value::String("other.application".into()),
+        );
+        let mut bytes = Vec::new();
+        plist::Value::Dictionary(wrong)
+            .to_writer_xml(&mut bytes)
+            .unwrap();
+        assert!(parse_physical_probe_identifier(&bytes).is_err());
+        let mut wrong_type = plist::Dictionary::new();
+        wrong_type.insert("CFBundleIdentifier".into(), plist::Value::Boolean(true));
+        let mut wrong_type_bytes = Vec::new();
+        plist::Value::Dictionary(wrong_type)
+            .to_writer_binary(&mut wrong_type_bytes)
+            .unwrap();
+        assert!(parse_physical_probe_identifier(&wrong_type_bytes).is_err());
+        assert!(parse_physical_probe_identifier(b"malformed").is_err());
+        assert!(parse_physical_probe_identifier(&vec![b'x'; 64 * 1024 + 1]).is_err());
+        std::fs::write(&path, vec![b'x'; 64 * 1024 + 1]).unwrap();
+        assert!(read_physical_probe_identifier(&path).is_err());
+        assert!(read_physical_probe_identifier(&root.0).is_err());
+        let link = root.0.join("symlink.plist");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(read_physical_probe_identifier(&link).is_err());
+    }
+}
+
 fn prepare_saved_profile_run_store() -> Result<(), String> {
     let source = PathBuf::from(
         std::env::var_os("MAGI_TEST_SAVED_PROFILE_SOURCE_ROOT")
@@ -2285,7 +2409,18 @@ pub(crate) fn run() {
             }
         }
     }
-    context.config_mut().identifier = format!("local.magi.probe.p{}", std::process::id());
+    context.config_mut().identifier = if std::env::var("MAGI_TEST_ACTUAL_DOM_START").ok().as_deref()
+        == Some("1")
+    {
+        assert_eq!(
+            purpose,
+            ProbePurpose::SavedProfileDeliberation,
+            "physical start requires saved-profile purpose"
+        );
+        physical_probe_bundle_identifier().expect("physical probe packaged host identity required")
+    } else {
+        format!("local.magi.probe.p{}", std::process::id())
+    };
     context.config_mut().app.app_directories_override = Some(
         tauri::utils::config::AppDirectoriesOverride::Root(root.clone()),
     );

@@ -24,7 +24,7 @@ name = "magi-run-query"
 path = "src/bin/magi-run-query.rs"
 
 [features]
-native-live-probe = []
+native-live-probe = ["dep:plist"]
 custom-protocol = ["tauri/custom-protocol"]
 
 [[bin]]
@@ -45,6 +45,7 @@ tokio = { version = "1", features = ["rt", "time", "sync"] }
 libc = "0.2"
 
 [dependencies]
+plist = { version = "=1.10.1", optional = true }
 tokio = { version = "1", features = ["time"] }
 schemars = "=0.8.22"
 cap-std = "=3.4.6"

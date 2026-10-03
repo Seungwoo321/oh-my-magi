@@ -2203,6 +2203,7 @@ dependencies = [
  "magi-provider",
  "magi-storage",
  "minisign-verify",
+ "plist",
  "reqwest",
  "rusqlite",
  "schemars 0.8.22",
