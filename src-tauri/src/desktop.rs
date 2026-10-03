@@ -108,6 +108,7 @@ macro_rules! product_invoke_handler {
         ]
     };
 }
+#[cfg(feature = "native-live-probe")]
 pub(crate) use product_invoke_handler;
 
 pub(crate) fn product_context() -> tauri::Context<Wry> {
