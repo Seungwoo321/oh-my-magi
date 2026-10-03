@@ -24,7 +24,7 @@
   const clone = value => JSON.parse(JSON.stringify(value));
   function state(ctx) {
     currentState = ctx.formState;
-    if (!currentState.setup) currentState.setup = { selected: ["release", "support", "feedback"], sourceId: "release", sourceView: "original", sourceRange: "selected", roles: clone(initialRoles), roleDraft: clone(initialRoles), roleDirty: false, assignments: ["personal", "personal", "personal"], providerName: "개인 ACP", providerModel: "선택한 프론티어 모델", connectionReady: true, consent: false, sourceRevision: 1, roleRevision: 1 };
+    if (!currentState.setup) currentState.setup = { selected: ["release", "support", "feedback"], sourceId: "release", sourceView: "original", sourceRange: "selected", roles: clone(initialRoles), roleDraft: clone(initialRoles), roleDirty: false, assignments: ["personal", "personal", "personal"], providerName: "개인 ACP", providerModel: "선택한 프론티어 모델", profiles: [{ id: "personal", name: "개인 구독", path: "~/.codex", revision: 1 }], connectionReady: true, consent: false, sourceRevision: 1, roleRevision: 1 };
     return currentState.setup;
   }
   const variants = entries => entries.map(([id, label]) => ({ id, label }));
@@ -63,44 +63,33 @@
     default: ["연결 준비됨", "공급자 연결과 세 관점의 할당을 확인했습니다.", "success"],
     empty: ["연결된 제공자가 없습니다", "질문과 자료를 준비할 수 있습니다. 심의를 시작하려면 본인 연결을 추가하세요.", "info"],
     checking: ["필수 기능 확인", "실행 파일부터 모델까지 확인 단계를 순서대로 살펴봅니다.", "info"],
-    auth: ["공식 인증이 필요합니다", "개인 ACP의 인증 상태를 확인할 수 없습니다. 연결을 확인한 뒤 직접 심의를 시작하세요.", "warning"],
+    auth: ["기존 구독 인증 확인 필요", "개인 ACP의 인증 상태를 확인할 수 없습니다. 연결을 확인한 뒤 직접 심의를 시작하세요.", "warning"],
     quota: ["제공자 사용 한도", "개인 ACP가 사용량 제한을 알렸습니다. 초기화 시각은 제공되지 않았습니다.", "warning"],
     unsupported: ["필수 기능 미지원", "범위 밖 파일 접근 차단과 호출 정지를 확인할 수 없어 이 연결로 시작할 수 없습니다.", "error"],
     missing: ["실행 파일을 찾을 수 없습니다", "연결에 지정한 에이전트 경로가 이동했거나 접근할 수 없습니다. 실행 파일을 다시 선택하세요.", "error"],
     policy: ["연결 조건 확인 필요", "이 배포 형태에서 사용할 수 있는 인증 경로와 제공자 조건이 확인되지 않았습니다.", "warning"],
   };
   S.connections = {
-    title: "연결과 모델", group: "설정", variants: variants(Object.entries(connectionStates).map(([id, a]) => [id, a[0]])),
+    title: "모델 연결", group: "설정", variants: variants(Object.entries(connectionStates).map(([id, a]) => [id, a[0]])),
     render(ctx) {
-      const s = state(ctx), v = ctx.variant || "default", status = connectionStates[v] || connectionStates.default;
+      const s = state(ctx), v = ctx.variant === "default" && !s.connectionReady ? "checking" : ctx.variant || "default", status = connectionStates[v] || connectionStates.default;
       if (v !== "default") s.connectionReady = false;
-      const checks = ["실행 파일", "통신", "공식 인증", "자료·도구 격리", "취소·정지 관측", "모델 확인"];
+      const checks = ["실행 파일", "통신", "기존 구독 인증", "자료·도구 격리", "취소·정지 관측", "모델 확인"];
       const blocker = { missing: 0, auth: 2, unsupported: 3, policy: 2, checking: 3, empty: 0 }[v];
       const admission = `<ol class="setup-check-list">${checks.map((name, i) => `<li><span class="setup-check-number">${String(i + 1).padStart(2, "0")}</span><span>${name}</span>${badge(v === "empty" ? "연결 없음" : blocker === undefined || i < blocker ? "확인됨" : i === blocker ? (v === "checking" ? "확인 중" : "확인 필요") : "대기", blocker !== undefined && i >= blocker ? "pending" : "ready")}</li>`).join("")}</ol>`;
-      const assignments = `<div class="setup-assignment-list">${coreNames.map((name, i) => `<div class="setup-assignment"><strong>${name}</strong>${select("할당할 연결", `setup-assignment-${i}`, s.assignments[i], [["personal", `${s.providerName} · ${s.providerModel}`], ["api", "개인 API · 별도 모델"], ["none", "연결 선택 필요"]], `assignments.${i}`)}</div>`).join("")}</div>${act("할당 적용", "setup-assign", "primary")}`;
-      const recovery = { default: btn("안건으로 돌아가기", "input"), empty: btn("연결 추가", "provider", "default", "primary"), checking: act("확인 결과 보기", "setup-check-done", "primary"), auth: btn("인증 경로 확인", "provider", "default", "primary"), quota: act("사용량 정보 확인", "setup-usage"), unsupported: btn("다른 연결 추가", "provider"), missing: btn("실행 파일 다시 선택", "provider"), policy: act("연결 조건 보기", "setup-policy") }[v];
-      return page(ctx, { kicker: "CONNECTION CONTROL", title: "연결과 모델", intro: "한 안건, 세 관점. 모델 연결과 역할 할당을 구분합니다.", body: `${K.notice(...status)}${K.panel("제공자 연결", v === "empty" ? `<div class="setup-empty"><span aria-hidden="true">未接続</span><h3>연결을 기다립니다</h3><p>저장한 안건과 자료는 그대로 유지됩니다.</p>${recovery}</div>` : `<div class="setup-provider-head"><div><span class="panel-kicker">PERSONAL / ACP</span><h3>${e(s.providerName)}</h3><p>${e(s.providerModel)}</p></div>${badge(status[0], v === "default" ? "ready" : "pending")}</div>${admission}<div class="page-actions">${recovery}${btn("연결 편집", "provider")}</div>`, "01 / PROVIDER ADMISSION")}${K.panel("세 관점의 모델 할당", assignments, "02 / CORE BINDING")}`, side: aside(ctx, "연결의 의미", `${K.notice(s.assignments.every(a => a === s.assignments[0]) ? "같은 모델을 세 관점으로 사용" : "서로 다른 연결을 사용", "별도 세션은 문맥을 나눕니다. 판단의 통계적 독립성이나 정확도 향상을 보장하지 않습니다.")}${ledger([["추론 위치", "선택한 제공자의 클라우드"], ["원문 범위", "확인한 자료만 전달"], ["앱 전체 동시 호출", "최대 3개"], ["제공자 잔여 사용량", "제공되지 않음"]])}`), actions: `${btn("연결 추가", "provider")}${btn("자료 확인", "intake", "default", "primary")}` });
+      const assignments = `<div class="setup-assignment-list">${coreNames.map((name, i) => `<div class="setup-assignment"><strong>${name}</strong>${select("할당할 연결", `setup-assignment-${i}`, s.assignments[i], [...s.profiles.map(p => [p.id, `${p.name} · ${s.providerModel}`]), ["none", "연결 선택 필요"]], `assignments.${i}`)}</div>`).join("")}</div>${act("할당 적용", "setup-assign", "primary")}`;
+      const profiles = v === "empty" ? `<p>저장된 프로필이 없습니다. 이름과 기존 CLI 인증 홈 경로를 입력해 추가하십시오.</p>` : s.profiles.map(p => `<div class="setup-provider-head"><div><h3>${e(p.name)}</h3><p><code>${e(p.path)}</code> · revision ${p.revision}</p></div>${act("편집", "setup-profile-edit").replace('data-action="setup-profile-edit"', `data-action="setup-profile-edit" data-profile-id="${e(p.id)}"`)}</div>`).join("");
+      return page(ctx, { kicker: "MODEL CONNECTIONS", title: "모델 연결", intro: "프로필·연결 확인·실제 모델·세 코어 할당을 한 화면에서 관리합니다.", body: `${K.notice(...status)}${K.panel("연결 프로필", profiles + `<div class="page-actions">${act("프로필 추가", "setup-profile-add", "primary")}${act("연결 확인", "setup-check-done")}</div>` + admission, "01 / PROFILES")}${K.panel("세 코어 모델 할당", assignments, "02 / CORE BINDING")}`, side: aside(ctx, "다음 실행에 적용", K.notice("같은 모델을 세 관점으로 사용", "모델 중복은 통계적 독립성이나 정확도 향상을 보장하지 않습니다. 진행 중 심의는 고정 입력을 유지합니다.")), actions: act("원래 화면으로 돌아가기", "setup-return-connections") });
     },
     actions: {
+      "setup-profile-add": ctx => editProfile(ctx, false),
+      "setup-profile-edit": ctx => editProfile(ctx, true),
+      "setup-profile-save": ctx => saveProvider(ctx),
+      "setup-return-connections": ctx => ctx.go(ctx.formState.connectionReturn?.screen || "input", ctx.formState.connectionReturn?.variant || "default", { returning: true }),
       "setup-assign": ctx => { const s = state(ctx); s.consent = false; ctx.notify(s.assignments.includes("none") ? "할당되지 않은 코어가 있습니다. 연결을 선택해 주세요." : "세 관점의 연결을 다음 실행에 적용했습니다."); ctx.go("connections", "default"); },
       "setup-check-done": ctx => { state(ctx).connectionReady = true; ctx.go("connections", "default"); },
       "setup-usage": ctx => show(ctx, "제공자 사용량", "남은 사용량과 초기화 시각은 제공되지 않았습니다. 연결이 회복되어도 심의는 자동 재개하지 않습니다."),
       "setup-policy": ctx => show(ctx, "연결 조건", "공식 인증 소유자, 앱 배포 형태의 허용 조건, 도구 격리와 취소 관측을 각각 확인합니다. 토큰을 추출하거나 다른 계정의 인증을 재사용하지 않습니다."),
-    },
-  };
-
-  S.provider = {
-    title: "제공자 연결", group: "설정", variants: variants([["default", "로컬 ACP"], ["api", "API 키"], ["invalid", "입력 오류"]]),
-    render(ctx) {
-      const s = state(ctx), invalid = ctx.variant === "invalid";
-      if (!s.providerDraft) s.providerDraft = { name: s.providerName, model: s.providerModel };
-      if (!invalid) s.providerMode = ctx.variant === "api" ? "api" : "acp";
-      const api = s.providerMode === "api";
-      return page(ctx, { kicker: "PROVIDER REGISTRATION", title: "제공자 연결", intro: "본인이 소유한 연결을 선택합니다. 연결 저장은 심의를 시작하지 않습니다.", body: `<nav class="setup-tabs" aria-label="연결 방식">${btn("로컬 에이전트 · ACP", "provider", "default", !api ? "primary" : "")}${btn("내 API 키", "provider", "api", api ? "primary" : "")}</nav>${invalid ? K.notice("입력을 확인해 주세요", s.providerError || "연결 이름과 모델을 입력하세요.", "error") : ""}<form id="setup-provider-form">${K.panel(api ? "API 연결 정보" : "공식 에이전트 연결", `<div class="form-grid">${field("연결 이름", "setup-provider-name", s.providerDraft.name, { required: true, path: "providerDraft.name" })}${field("사용할 모델", "setup-provider-model", s.providerDraft.model, { required: true, path: "providerDraft.model" })}${api ? `${select("제공자", "setup-api-provider", s.apiProvider || "google", [["google", "Google Gemini API"], ["openai", "OpenAI API"], ["anthropic", "Anthropic API"]], "apiProvider")}${field("API 키", "setup-api-key", "", { type: "password", help: "현재 입력값은 저장하거나 외부로 전송하지 않습니다. 이 화면을 떠나면 입력을 지웁니다." })}` : `${field("에이전트 실행 파일", "setup-agent-path", s.agentPath || "/Applications/Agent.app/Contents/MacOS/agent", { path: "agentPath", help: "사용자가 선택한 실행 파일만 연결합니다. 원문 폴더를 작업 디렉터리로 사용하지 않습니다." })}${select("인증 경로", "setup-auth-path", "official", [["official", "에이전트의 공식 로그인"]])}`}</div><div class="setup-authorization">${api ? "제품에서는 키를 macOS Keychain에 보관하며 저장한 키 원문을 다시 표시하지 않습니다." : "구독 사용 가능 여부와 한도는 제공자의 실제 계정 정책을 따릅니다. ACP 연결 자체가 사용 권리를 부여하지 않습니다."}</div><div class="page-actions">${act(api ? "입력 확인" : "연결 확인", api ? "setup-api-save" : "setup-provider-save", "primary")}${btn("돌아가기", "connections")}</div>`, api ? "BYOK / DIRECT PROVIDER" : "LOCAL AUTH / CLOUD INFERENCE")}</form>`, side: aside(ctx, "전송과 권한", `${ledger([["앱 개발자 서버", "경유하지 않음"], ["로컬 자료", "선택·확인한 범위"], ["임의 셸·원문 수정", "허용하지 않음"], ["인증 비밀", "공유·역할·로그에 제외"]])}${K.notice("로컬 연결과 로컬 추론은 다릅니다", "로컬 에이전트가 클라우드 모델을 호출하면 확인한 자료가 해당 제공자에게 전송됩니다.")}`) });
-    },
-    actions: {
-      "setup-provider-save": ctx => saveProvider(ctx, false),
-      "setup-api-save": ctx => saveProvider(ctx, true),
     },
   };
 
@@ -144,7 +133,7 @@
     render(ctx) {
       const s = state(ctx), v = ctx.variant || "default";
       const notice = { blocked: ["연결 확인이 필요합니다", "필수 기능을 확인하지 못한 연결이 있습니다. 현재 입력을 보존하고 연결 화면에서 확인하세요.", "error"], changed: ["입력이 변경되어 동의를 다시 받습니다", "자료 또는 역할의 범위가 바뀌었습니다. 전달할 내용을 확인하고 다시 동의하세요.", "warning"], oversize: ["세 관점의 공통 문맥 한도를 초과합니다", "자동으로 내용을 잘라내지 않습니다. 자료 범위를 줄이거나 검증된 다른 모델을 선택하세요.", "error"] }[v];
-      const roles = `<ol class="setup-role-summary">${s.roles.map((r, i) => `<li><strong>${coreNames[i]}</strong><div><h4>${e(r.name)}</h4><p>${e(r.purpose)}</p><small>${e(s.assignments[i] === "api" ? "개인 API · 별도 모델" : `${s.providerName} · ${s.providerModel}`)}</small></div></li>`).join("")}</ol>`;
+      const roles = `<ol class="setup-role-summary">${s.roles.map((r, i) => `<li><strong>${coreNames[i]}</strong><div><h4>${e(r.name)}</h4><p>${e(r.purpose)}</p><small>${e(`${s.profiles.find(p => p.id === s.assignments[i])?.name || "미할당"} · ${s.providerModel}`)}</small></div></li>`).join("")}</ol>`;
       const sources = selectedSources(s);
       return page(ctx, { kicker: "INPUT CONFIRMATION", title: "이 입력으로 심의합니다", intro: "질문·자료·세 관점·전송 대상을 고정합니다. 이후 변경은 새 심의로 이어집니다.", body: `${notice ? K.notice(...notice) : ""}${K.panel("판단할 질문", `<blockquote class="setup-question">${e(ctx.question)}</blockquote>${ledger([["목표", "제한 공개의 조건과 미해결 사항 판단"], ["제약", "참여자 20명 · 2주 · 지정된 지원 범위"]])}${btn("질문 수정", "input")}`, "01 / AGENDA")}${K.panel("세 관점과 모델", roles + btn("역할 편집", "roles"), "02 / ROLE SET")}${K.panel("전달할 내용", `<div class="setup-disclosure"><h3>선택한 제공자의 클라우드</h3><p>질문, 역할 지침, 아래 자료, 공개된 검토 의견과 결의문이 단계별 입력으로 전달됩니다. 서로 다른 제공자를 선택하면 공개 평가가 다른 제공자에게도 전달됩니다.</p>${sources.length ? `<ul>${sources.map(x => `<li><strong>${e(x.name)}</strong><span>${e(s.sourceRange === "all" ? "전체 원문" : x.locator)} · ${e(x.kind)}</span></li>`).join("")}</ul>` : "<p>추가 자료 없음 · 질문과 역할만 사용합니다.</p>"}</div><div class="page-actions">${btn("원문·범위 다시 보기", "intake")}${btn("제공자 확인", "connections")}</div>`, "03 / DISCLOSURE")}`, side: aside(ctx, "호출과 사용량", `${ledger([["심의", "독립 3 → 교차 3 → 서기 1 → 표결 3"], ["기본 앱 턴 요청", "10회"], ["구조 교정 포함 상한", `최대 ${ctx.formState.budget || 20}회`], ["제공자 내부 추론", "요청 수와 다를 수 있음"], ["제공자 잔여 사용량", "제공되지 않음"]])}${K.notice("실패해도 자동 우회하지 않습니다", "다른 계정·유료 API로 바꾸지 않습니다. 중단한 심의는 같은 입력을 확인한 뒤 직접 재개합니다.")}`), actions: `<div class="setup-start"><label class="setup-consent"><input type="checkbox" id="setup-consent" data-setup-field="consent"${s.consent && v === "default" ? " checked" : ""}><span>위 질문·역할·자료 범위를 표시된 제공자에게 전달하는 데 동의합니다.</span></label>${v === "blocked" ? btn("연결 확인", "connections", "unsupported", "primary") : v === "oversize" ? btn("자료 범위 조정", "intake", "default", "primary") : `${act("이 입력으로 심의 시작", "setup-start-run", "primary")}<p class="field-help" id="setup-start-help">명시적으로 시작하기 전에는 모델을 호출하지 않습니다.</p>`}</div>` });
     },
@@ -199,10 +188,11 @@
         intro: t("강한 형상과 읽기 편한 본문. 메인 콘솔과 상태 팝오버에 같은 설정을 적용합니다.", "A shared visual language for the command console and its status companion."),
         body: `${ctx.variant === "budget" ? K.notice(t("다음 심의에 적용되는 한도", "Budget for the next deliberation"), t("진행 중인 심의의 예산은 고정됩니다. 저장한 한도는 다음 입력 확인에서 표시됩니다.", "An active deliberation keeps its approved budget. New limits appear in the next input confirmation.")) : ""}<form id="setup-settings-form">${K.panel(t("화면과 동작", "Presentation"), appearance, "01 / PRESENTATION")}${K.panel(t("다음 심의의 실행 한도", "Limits for new deliberations"), limits, "02 / RUN LIMITS")}</form>`,
         side: aside(ctx, t("설정의 적용 범위", "Shared preferences"), `${K.notice(t("안건과 읽던 위치를 유지합니다", "Your agenda and reading position are preserved"), t("설정은 세 코어의 위치·표 의미·근거를 숨기거나 바꾸지 않습니다.", "Preferences preserve the core positions, ballot meaning, and supporting evidence."))}${ledger([["Command / Clear", t("동일한 기하와 의미", "Same topology and meaning")], [t("동작 줄임", "Reduced motion"), t("실제 상태는 즉시 표시", "State is shown immediately")], [t("앱 언어", "Application language"), t("답변 언어와 별도", "Separate from response language")], [t("메뉴 막대", "Menu bar"), t("같은 설정 공유", "Shared preferences")]])}`),
-        actions: `${act(t("설정 적용", "Apply preferences"), "setup-apply-settings", "primary")}${act(t("기본 설정 복원", "Restore defaults"), "setup-reset-settings")}${btn(t("콘솔로 돌아가기", "Return to console"), "input")}`,
+        actions: `${btn("모델 연결 관리", "connections")}${act("원래 화면으로 돌아가기", "setup-return-settings")}${act(t("설정 적용", "Apply preferences"), "setup-apply-settings", "primary")}${act(t("기본 설정 복원", "Restore defaults"), "setup-reset-settings")}${btn(t("콘솔로 돌아가기", "Return to console"), "input")}`,
       });
     },
     actions: {
+      "setup-return-settings": ctx => ctx.go(ctx.formState.settingsReturn?.screen || "input", ctx.formState.settingsReturn?.variant || "default", { returning: true }),
       "setup-apply-settings": ctx => applySettings(ctx, false),
       "setup-reset-settings": ctx => applySettings(ctx, true),
     },
@@ -211,21 +201,27 @@
   function show(ctx, title, body, html = false) {
     ctx.openDialog(title, html ? body : `<p>${e(body)}</p>`);
   }
-  function saveProvider(ctx, api) {
+  function editProfile(ctx, editing) {
+    const s = state(ctx), profile = editing ? s.profiles.find(p => p.id === ctx.target?.dataset.profileId) || s.profiles[0] : null;
+    s.providerDraft = profile ? { ...profile } : { id: null, name: "", path: "", revision: 0 };
+    ctx.openDialog(profile ? "연결 프로필 편집" : "연결 프로필 추가", `<form id="setup-provider-form"><p>이름과 기존 CLI 구독 인증 홈 경로를 직접 입력합니다.</p>${field("프로필 이름", "setup-provider-name", s.providerDraft.name, { required: true, path: "providerDraft.name" })}${field("인증 홈 경로", "setup-provider-path", s.providerDraft.path, { required: true, path: "providerDraft.path", help: "홈 내부 경로는 ~/.codex처럼 표시합니다." })}<p>어댑터 · Codex ACP${editing ? " · 변경 불가" : ""}</p></form>`, [{ label: "취소", action: "close-dialog" }, { label: "프로필 저장", action: "setup-profile-save", primary: true }]);
+    document.getElementById("setup-provider-form")?.addEventListener("submit", event => { event.preventDefault(); saveProvider(ctx); });
+    document.getElementById("setup-provider-name")?.focus();
+  }
+  function saveProvider(ctx) {
     const s = state(ctx), form = document.getElementById("setup-provider-form");
-    const key = document.getElementById("setup-api-key");
-    if (!form.reportValidity() || !s.providerDraft.name.trim() || !s.providerDraft.model.trim() || (api && !key?.value.trim())) {
-      s.providerError = api && !key?.value.trim() ? "API 키 입력이 비어 있습니다. 키는 저장하거나 전송하지 않습니다." : "연결 이름과 모델을 입력해 주세요.";
-      if (key) key.value = "";
-      ctx.go("provider", "invalid"); return;
+    if (!form.reportValidity()) return;
+    const draft = s.providerDraft;
+    if (!draft.name.trim() || !/^(~\/|\/)/.test(draft.path.trim())) {
+      const field = document.getElementById("setup-provider-path");
+      field.setCustomValidity("절대 경로나 ~/로 시작하는 인증 홈 경로를 입력하십시오."); field.reportValidity(); field.setCustomValidity(""); return;
     }
-    if (key) key.value = "";
-    s.providerError = "";
-    s.providerName = s.providerDraft.name.trim();
-    s.providerModel = s.providerDraft.model.trim();
-    s.consent = false;
-    ctx.notify(api ? "API 입력 형식을 확인하고 키 입력을 지웠습니다. 외부 연결은 수행하지 않았습니다." : "연결 확인 단계를 열었습니다.");
-    ctx.go("connections", "checking");
+    const profile = { ...draft, id: draft.id || `profile-${s.profiles.length + 1}`, name: draft.name.trim(), path: draft.path.trim(), revision: draft.revision + 1 };
+    const index = s.profiles.findIndex(p => p.id === profile.id);
+    if (index < 0) s.profiles.push(profile); else s.profiles[index] = profile;
+    s.providerName = profile.name; s.connectionReady = false; s.consent = false;
+    ctx.closeDialog(() => { ctx.rerender(); document.querySelector('[data-action="setup-profile-add"]')?.focus(); });
+    ctx.notify("프로필을 저장했습니다. 연결 확인이 필요합니다.");
   }
   function download(name, content) {
     const url = URL.createObjectURL(new Blob([content], { type: "application/json" }));

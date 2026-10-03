@@ -141,15 +141,6 @@
       ]
     },
     {
-      "id": "provider",
-      "profile": "desktop",
-      "variants": [
-        "default",
-        "api",
-        "invalid"
-      ]
-    },
-    {
       "id": "intake",
       "profile": "desktop",
       "variants": [
@@ -291,10 +282,16 @@
       "routes": [
         "input",
         "connections",
-        "provider",
         "connections",
         "roles",
         "confirmation"
+      ],
+      "actions": [
+        "setup-profile-add",
+        "setup-profile-save",
+        "setup-check-done",
+        "setup-assign",
+        "setup-return-connections"
       ]
     },
     {
@@ -365,6 +362,22 @@
         "cancelling",
         "cancelled"
       ]
+    },
+    {
+      "id": "connection-settings-return",
+      "routes": [
+        "input",
+        "settings",
+        "connections",
+        "settings",
+        "input"
+      ],
+      "actions": [
+        "setup-profile-edit",
+        "close-dialog",
+        "setup-return-connections",
+        "setup-return-settings"
+      ]
     }
   ],
   "overlays": [
@@ -388,5 +401,8 @@
     "no-network-or-native-effects-in-review",
     "native-boundaries-are-explicit",
     "ui-has-no-project-brand-duplication"
-  ]
+  ],
+  "routeAliases": {
+    "provider": "connections"
+  }
 }

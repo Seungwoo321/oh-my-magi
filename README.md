@@ -36,6 +36,17 @@ Oh My MAGI!는 에반게리온의 MAGI에서 영감을 받은 무료 팬 프로�
 
 앱 사용료는 없다. 모델 구독의 사용량 제한과 API 비용은 사용자가 선택한 제공자의 조건을 따른다. 구독 사용량을 무제한으로 표시하거나 자체 LLM 구독을 재판매하지 않는다.
 
+## macOS 릴리스 빌드
+
+릴리스 스크립트는 Apple 서명 프로필 하나를 선택해 앱과 DMG를 빌드한다. 기본으로 공통 Apple 환경 파일을 사용하며, `--env-file`을 지정하면 그 파일이 상속된 `APPLE_*` 환경변수보다 우선한다. 인자는 따옴표가 있는 `~` 경로도 홈 기준으로 해석한다.
+
+```sh
+./scripts/build-macos-release.sh --notary-profile NOTARY_PROFILE
+./scripts/build-macos-release.sh --env-file '/path/to/apple.env' --notary-profile NOTARY_PROFILE
+```
+
+`--notary-profile`은 Keychain에 저장된 Apple 공증 프로필 이름이다. `xcrun notarytool store-credentials`의 보호된 입력으로 한 번 등록하고, 앱 암호를 명령 인자로 전달하지 않는다. 스크립트는 앱과 DMG의 서명·공증 스테이플·Gatekeeper 검사가 모두 성공한 뒤에만 완료를 표시하며 GitHub에 업로드하지 않는다. 앱별 자동 업데이트 키와 매니페스트 키는 이 Apple 프로필에서 읽지 않는다.
+
 ## 문서 검사
 
 ```sh

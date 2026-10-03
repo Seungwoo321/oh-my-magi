@@ -101,6 +101,12 @@ flowchart LR
 <a id="outputs"></a>
 ## 5. 구조화 산출물과 검증
 
+제공자가 반환하는 검토·결의안·표결 body는 같은 엄격한 typed 계약에서 생성한 완전한 JSON Schema와 parser를 사용한다. 각 턴의 prompt는 이 schema와 해당 단계의 참조 규칙을 함께 전달한다. 필드 이름만 나열한 별도 응답 형식을 두지 않는다. 필수 필드·배열과 객체의 구분·nullable 값·enum·알 수 없는 필드 거부는 생성된 계약과 실제 parser에서 일치한다. 문자열을 배열이나 객체로 바꾸거나 가까운 enum으로 추측해 유효 산출물을 만들지 않는다.
+
+제공자 body와 저장 envelope의 권위는 분리한다. Native는 frozen Run·input·역할·단계·시도 세대에 body를 결합하고 고유 ID·생성 시각·내용 digest를 부여한다. 제공자가 이 저장 권위를 지정하거나 덮어쓰지 못한다. 형식 검증 뒤에도 승인 원문 범위, 허용된 이전 주장, frozen proposal과 단계·generation의 일치를 결정적으로 검사한다.
+
+독립 검토에는 이전 검토가 없으므로 `claim_responses`와 `position_changes`는 빈 배열이다. 교차 검토의 대상·영향 주장 ID는 제공된 독립 검토에서만 가져온다. 서기는 허용된 검토의 주장·이의를 종합하며, 표결은 같은 frozen proposal digest와 미해결 이의만 참조한다. 형식 오류 진단은 신뢰된 필드 경로와 오류 분류만 보존하며 원문 응답·임의 필드 값·비공개 내용을 공개 로그에 복사하지 않는다.
+
 ### 5.1 RoleAssessment
 
 필수 envelope는 `schema_version`, `run_id`, `attempt_id`, `core_id`, `stage`, `input_digest`다. `stage`는 `independent_review` 또는 `cross_review`다. body에는 `position_summary`, `claims`, `assumptions`, `information_gaps`, `counterarguments`를 담는다. 교차 검토에는 `claim_responses`와 `position_changes`를 추가한다.
@@ -111,13 +117,13 @@ flowchart LR
 | `kind` | `source_fact`, `model_knowledge`, `inference`, `preference`, `assumption` 중 하나 |
 | `text` | 사용자에게 공개할 짧은 주장 |
 | `evidence_refs` | 허용 manifest 안의 snapshot ID·원문 범위·필요한 인용 |
-| `limitations` | 자료·방법·범위의 한계 |
+| `limitations` | 자료·방법·범위의 한계를 담은 문자열 배열 |
 
 `source_fact`에는 최소 하나의 유효 원문 참조가 필요하다. `model_knowledge`는 제공 자료로 확인되지 않은 모델 지식이라는 표시를 유지한다. 사용자 발언은 입력 참조로 연결하며 그 발언만으로 외부 사실이 검증됐다고 보지 않는다.
 
 인용 위치·내용 hash·허용 범위는 결정적으로 검증한다. 원문 참조가 존재한다는 사실과 그 자료가 주장을 실제로 뒷받침한다는 판단은 다르다. 후자는 교차 검토와 사용자의 원문 조회 대상으로 남긴다. 기계 검증 통과를 사실 검증 완료로 표시하지 않는다.
 
-`information_gaps`의 각 항목은 부족한 내용, 영향, `essential` 여부를 담는다. 필수 질문 의미가 결손되면 `paused(reason=needs_input)`로 이동한다. 승인 범위 밖 자료가 필요하면 권한을 확장하지 않고 사용자에게 필요한 범위를 제시한다. 새 자료는 새 manifest와 자식 Run으로 들어간다.
+`claims`, `information_gaps`, `counterarguments`, `claim_responses`, `position_changes`는 각 계약의 객체 배열이며 `assumptions`는 문자열 배열이다. `claim_responses`의 항목은 대상 주장 ID, 응답 enum, 이유, 근거 참조를 담는 객체이며 문자열 목록으로 대체하지 않는다. `information_gaps`의 각 항목은 부족한 내용, 영향, `essential` 여부를 담는다. 필수 질문 의미가 결손되면 `paused(reason=needs_input)`로 이동한다. 승인 범위 밖 자료가 필요하면 권한을 확장하지 않고 사용자에게 필요한 범위를 제시한다. 새 자료는 새 manifest와 자식 Run으로 들어간다.
 
 ### 5.2 ProposalSnapshot
 

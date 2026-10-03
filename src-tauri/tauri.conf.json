@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "pnpm dev",
     "devUrl": "http://127.0.0.1:1420",
-    "beforeBuildCommand": "pnpm build",
+    "beforeBuildCommand": "bash scripts/build-codex-acp.sh --require-signature \"${TAURI_ENV_ARCH:?}\" && pnpm build",
     "frontendDist": "../dist"
   },
   "app": {
@@ -47,6 +47,11 @@
     "active": true,
     "targets": ["dmg"],
     "category": "Productivity",
+    "resources": {
+      "../.local/provider-build/codex-http-ca-preserve-backend-v1-package/codex-acp-tauri-resources/": "provider/codex-acp/",
+      "../.local/native-build/extraction/": "extraction/",
+      "../docs/SECURITY.md": "policy/SECURITY.md"
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

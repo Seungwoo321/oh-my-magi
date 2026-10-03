@@ -32,7 +32,7 @@ agent 실행물은 사용자가 설치한 공식 경로 또는 검증된 배포 
 
 메뉴 막대 아이콘·팝오버·Dock은 동일 앱 인스턴스의 진입점이다. 콘솔 복원 요청이 겹쳐도 두 번째 Coordinator나 같은 Run의 별도 실행을 만들지 않는다. 제거된 디스플레이의 좌표를 그대로 재사용해 창이 화면 밖에 남지 않도록 한다. 팝오버의 화면 경계·포커스·닫기 동작은 DesktopShell이 처리하며, 메인 창과 실행의 수명을 바꾸지 않는다.
 
-종료 확인을 닫거나 취소하면 앱과 실행을 유지한다. 모든 명시적 종료 진입점은 같은 종료 절차를 사용한다. 앱 재시작·로그인 복구·창 복원은 조회 가능한 상태와 입력을 되살리며, 중단된 실행은 [재개 조건](ARCHITECTURE.md#run-state)과 사용자의 명시적 재개 명령 없이는 모델을 다시 호출하지 않는다.
+종료 확인을 닫거나 취소하면 앱과 실행을 유지한다. 모든 명시적 종료 진입점은 같은 종료 절차를 사용한다. 앱 재시작·기존 구독 연결 복구·창 복원은 조회 가능한 상태와 입력을 되살리며, 중단된 실행은 [재개 조건](ARCHITECTURE.md#run-state)과 사용자의 명시적 재개 명령 없이는 모델을 다시 호출하지 않는다.
 
 agent process group은 실행 직전에 소유권·시작 정체성·Run·slot·generation을 기록한다. 시작은 예약 의도 저장, gated child 준비, identity 저장, 실행 허용 순서다. 실행 허용 이전에 부모와 연결이 끊기면 child는 종료한다. 이미 실행된 child의 parent-liveness guard는 heartbeat 손실 뒤 새 도구 실행을 막고 소유 process group을 정지한다. PID만 저장하거나 PID가 같다는 이유로 임의 프로세스를 종료하지 않는다.
 
@@ -42,7 +42,11 @@ guard의 관측·종료는 OS 스케줄링·sleep·crash의 영향을 받는다.
 
 ## 3. 저장·복구
 
-사용자 데이터는 OS가 지정한 앱 전용 Application Support 아래에 둔다. `state/`는 DB와 버전 필드가 있는 `console-preferences.json`을 소유한다. 환경설정 파일은 테마·모션·음향·글자 확대·화면 언어만 담는다. 구버전 필드는 명시된 기본값으로 읽고 다음 저장에서 새 버전으로 기록한다. 파일은 임시 경로에 완전히 쓴 뒤 원자적으로 교체하며 소유자 읽기·쓰기 권한으로 저장한다. `objects/`는 원문·파생 객체, `runs/`는 세션 scratch, `logs/`는 진단, `tmp/`는 미완 객체, `backups/`는 명시적 백업을 소유한다. 앱 디렉터리는 소유자 전용으로 생성한다. 실행 데이터를 코드 저장소에 쓰지 않는다.
+사용자 데이터는 OS가 지정한 앱 전용 Application Support 아래에 둔다. `state/`는 실행 DB와 별도의 안정된 native 설정 SQLite를 소유한다. 설정 DB는 테마·모션·음향·글자 확대·화면 언어와 그 변경 명령·receipt·이벤트의 단일 권위다. 실행 data root의 백업·복원·계보 전환은 화면 설정이나 설정 명령의 정체성을 교체하지 않는다. `objects/`는 원문·파생 객체, `runs/`는 세션 scratch, `logs/`는 진단, `tmp/`는 미완 객체, `backups/`는 명시적 백업을 소유한다. 앱 디렉터리는 소유자 전용으로 생성한다. 실행 데이터를 코드 저장소에 쓰지 않는다.
+
+설정 변경은 [공통 명령 계약](ARCHITECTURE.md#6-명령저장멱등성)을 따르며 실제로 편집한 필드만 patch에 담는다. Native는 필드별 예상 revision을 검사하고 현재 값을 읽어 병합·검증한 뒤 상태·필드 revision·정규화 의도·원래 receipt·이벤트를 한 SQLite 트랜잭션으로 commit한다. 서로 다른 필드의 변경은 함께 보존하고 같은 필드의 stale 변경은 충돌로 반환한다. 전체 설정의 stale 복사본으로 다른 창의 변경을 덮어쓰거나 충돌 revision을 자동으로 고쳐 재실행하지 않는다. 같은 명령의 재생은 원래 committed receipt를 반환하며 이전 설정 상태를 다시 적용하지 않는다.
+
+Commit된 설정 변경의 성공과 창에 알림을 전달한 결과는 별개다. 알림 실패는 committed receipt와 전달 진단으로 반환하며 저장 실패로 표시하지 않는다. 메인 창과 Companion은 검증된 최신 설정 revision을 읽고, acknowledgement는 해당 필드의 같은 편집 세대만 확정한다. 늦은 응답이나 이벤트는 더 새로운 편집·설정 revision을 덮어쓰지 않는다. 버전이 선언된 `console-preferences.json`은 native가 검증하는 일회성 가져오기 입력이며 독립적인 쓰기 권위가 아니다. 손상되거나 지원하지 않는 입력은 거부하고 기본값으로 바꾸어 성공한 가져오기처럼 처리하지 않는다.
 
 SQLite는 bundled 버전을 lock하고 WAL·`synchronous=FULL`·외래키 검사를 사용한다. OS lock을 가진 코어만 writer가 된다. 클라우드 동기화·network filesystem을 활성 DB 위치로 사용하지 않는다. WAL만 임의 삭제하거나 lock 파일을 지워 중복 writer를 시작하지 않는다. 내구성 설정의 의미는 [SQLite synchronous](https://www.sqlite.org/pragma.html#pragma_synchronous)를 따른다.
 
@@ -70,6 +74,7 @@ SQLite는 bundled 버전을 lock하고 WAL·`synchronous=FULL`·외래키 검사
 | 추출 worker | 동시 2개·각 512 MiB | 각각 1 GiB; 파일당 60초, 사용자가 고른 큰 범위는 최대 300초 |
 | 공통 원문 문맥 | 32,000 추정 token | 각 단계의 system·역할·누적 평가·제안·출력 예약량을 뺀 공통 최소값 이하; 설정 상한 128,000 |
 | 슬롯 공개 출력 | 4,096 token 요청 | 8,192 token 요청; parser 결과 256 KiB, 깊이 32 |
+| 공급자 텍스트 스트림 | 슬롯당 UTF-8 256 KiB·누적 text update 4,096개 | 미리보기 전달 queue 128개; queue 압력은 손실 없는 합치기로 처리하고 byte·이벤트 상한을 올리지 않음 |
 | host 근거 읽기 | 호출당 64 KiB, 슬롯당 16회 | 슬롯 합계 1 MiB; manifest 범위·model context 상한을 함께 검사 |
 | 모델 호출 기한 | 10분 | 30분; 시간 초과는 투표의 abstain으로 바꾸지 않음 |
 | Run 활성 실행 누적 시간 | 45분 | 120분; 사용자·인증 대기는 별도 기록, 남은 호출 예산은 유지 |
@@ -82,6 +87,10 @@ SQLite는 bundled 버전을 lock하고 WAL·`synchronous=FULL`·외래키 검사
 | 미완 임시 export·추출 | 종료 후 24시간 | 활성 참조·복구 대상은 제거 대상에서 제외 |
 
 token 추정치는 확정 과금이나 남은 구독 사용량이 아니다. provider가 실제 usage를 주면 입력·출력·캐시·추론 항목과 단위를 보존하고, 없으면 unknown으로 표시한다. 0·무제한·임의 백분율을 대신 표시하지 않는다. 출력 token 설정은 지원되는 모델에만 전달하며 반환 크기는 adapter와 host가 별도로 제한한다.
+
+스트림의 누적 UTF-8 bytes와 공급자 text update 수는 fragment 합치기 전 원래 입력 기준으로 제한한다. 누적 본문과 아직 전달하지 않은 텍스트의 각 buffer는 출력 byte 상한 안에서 고정된 메모리 소유권을 가지며, queue·wake 신호도 유한하다. 느린 소비자는 정상 범위 안의 동일한 본문을 거부하거나 일부 fragment를 잃는 원인이 되지 않는다. byte 상한·누적 이벤트 상한 초과는 별도 실패로 취소하며, queue 압력·소비자 종료·취소와 구분한다.
+
+진단은 신뢰한 실패 분류와 수치만 기록한다. 실패 branch, 수신 bytes·update 수, queue 점유·capacity, 합친 fragment 수, 아직 전달하지 않은 bytes를 함께 관측해 압력과 실제 한도 초과를 구분한다. 원시 본문·자료·계정 비밀은 진단에 넣지 않는다. 취소와 terminal 전이는 소비자의 대기를 깨우며, 최종 결과 수락은 [스트림 전달 권위](ARCHITECTURE.md#provider-artifacts)를 따른다.
 
 앱 턴 요청 상한은 Coordinator의 dispatch 수를 제한한다. native agent 안에서 발생한 모델 요청·도구 재시도는 provider가 관측 정보를 제공한 범위에서만 집계한다. 시간·host 도구 호출·출력 한도를 초과하면 취소하며, 그 취소가 이미 소비한 provider 사용량을 되돌린다고 표시하지 않는다.
 
@@ -97,7 +106,7 @@ preflight는 단계별 `source + question/role/system + prior_artifacts_max + ou
 
 | 상황 | 처리 |
 |---|---|
-| 인증 만료·로그아웃 | `paused(auth)`와 공식 재인증 경로. 갱신 뒤 [사용자 재개 명령](ARCHITECTURE.md#run-state)을 기다리며 다른 계정으로 자동 교체하지 않음 |
+| 인증 만료·로그아웃 | `paused(auth)`로 다음 호출을 멈춤. 사용자가 앱 밖의 기존 CLI에서 구독 정보를 갱신한 뒤 [모델 연결 화면](UI_SCREENS.md#35-모델-연결)에서 실행에 고정된 동일 프로필·계정·모델 경로를 재확인함. [인증 권위](SECURITY.md#provider-auth)를 유지하며 앱 내 로그인이나 다른 프로필 자동 교체 없이 [사용자 재개 명령](ARCHITECTURE.md#run-state)을 기다림 |
 | provider quota·429 | `paused(quota)`; 실제 알려진 reset 또는 Retry-After를 표시. 회복 뒤 [사용자 재개 명령](ARCHITECTURE.md#run-state)을 기다림 |
 | 요청이 발행되지 않았음이 확인된 일시 오류 | 최초 포함 3회, 1초·2초 기준 지연과 jitter, 최대 30초·기한 안에서 재시도 |
 | 전송 후 응답 유실·timeout | 상태 조회로 조정. 수락·과금 불명은 interrupted, 자동 재호출 금지 |
@@ -105,7 +114,7 @@ preflight는 단계별 `source + question/role/system + prior_artifacts_max + ou
 | 의미·인용·제안 digest 불일치 | `paused(validation)` 또는 failed. 유효한 표로 치환하지 않음 |
 | 추가 근거 필요 | `paused(needs_input)`; 새 manifest 확인 후 자식 Run |
 
-readiness는 로그인·지원 기능·binding·입력 예산·출력 예약량·디스크·grant를 검사한다. 구독 잔량을 API로 알 수 없으면 시작 전에 unknown임을 표시하고 실행 중 제한을 정상 상태로 처리한다. 무료 한도 소진을 유료 API·더 저렴한 모델·다른 계정으로 자동 우회하지 않는다.
+readiness는 [기존 구독 인증](SECURITY.md#provider-auth)·지원 기능·binding·입력 예산·출력 예약량·디스크·grant를 검사한다. 구독 잔량을 API로 알 수 없으면 시작 전에 unknown임을 표시하고 실행 중 제한을 정상 상태로 처리한다. 무료 한도 소진을 유료 API·더 저렴한 모델·다른 계정으로 자동 우회하지 않는다.
 
 <a id="retention"></a>
 ## 6. 보존·삭제·백업
@@ -118,14 +127,21 @@ readiness는 로그인·지원 기능·binding·입력 예산·출력 예약량�
 | provider 원시 stream | 기본 영속 저장하지 않음; 필요한 구조화 결과와 관측만 보관 |
 | 중단 세션 scratch | 정지·필요 객체 이관을 확인한 뒤 24시간 이내 정리 |
 | 명시적 백업 | 사용자가 선택한 보존·삭제. 자동 cloud sync 없음 |
+| 명령 취소 fence·삭제 tombstone | 같은 실행 계보의 재실행을 막는 최소 정체성은 기록·원문 삭제와 독립적으로 보존 |
 
 기록 삭제는 참조와 진행 중 실행을 먼저 확인한다. 여러 Run이 공유하는 원문 객체는 마지막 참조가 사라져야 GC한다. 사용자가 원문만 삭제하면 영향 기록과 잃는 감사 범위를 미리 표시하고 참조를 결손 상태로 바꾼다. 저장 한도 경고 때문에 결의·근거를 자동 삭제하지 않는다.
+
+취소 fence에는 명령 종류, 실행 계보, 원래 명령 ID와 멱등 키, 정규화 의도 digest, 취소 명령의 정체성·payload digest·접수 시각·receipt 버전과 필요한 Run 참조만 둔다. 질문·원문·경로·인증 정보·접수 token은 보존하지 않는다. Digest도 추측 가능한 입력의 비밀성을 보장하지 않으므로 로컬 보호 대상이다. Run 삭제는 이 최소 fence를 남기며, TTL·객체 GC·개별 receipt 삭제로 취소를 해제하지 않는다. 전체 실행 계보의 폐기는 모든 소유 worker의 정리를 확인한 명시적 데이터 삭제로만 수행한다. 외부 백업의 삭제는 별도 사용자 책임이다.
 
 앱 데이터의 원문·결의는 OS 파일 권한으로 보호되는 로컬 데이터다. 별도 앱 암호화가 적용되지 않은 데이터를 암호화됐다고 표시하지 않는다. Keychain 비밀은 일반 데이터 export·backup에 포함하지 않는다. 사용자가 만든 backup에 민감한 원문이 포함되는 경우 보호 수준과 범위를 생성 전에 표시한다.
 
 백업은 [SQLite online backup](https://www.sqlite.org/backup.html) 또는 읽기 snapshot으로 DB와 event high-water를 고정하고, 참조 객체를 pin한 뒤 복사·해시 검증한다. manifest에는 store ID·schema·객체 digest·포함 범위가 들어간다. 모두 검증된 뒤 complete marker를 설치하며 partial은 복구 가능한 백업으로 표시하지 않는다.
 
-복원은 새 data root에서 수행하고 검증 후 사용자 선택으로 전환한다. 새 store generation을 발급하며 실행 lease·권한 동의·secret·provider 로그인·살아있는 세션을 백업에서 재활성화하지 않는다. 복원한 기록은 열람 가능하지만 새 호출은 readiness와 공개 범위 확인을 거친다. 기존 data root를 검증 전 덮어쓰지 않는다.
+백업은 같은 snapshot의 접수 binding·취소 fence·명령 tombstone과 실행 계보를 포함한다. 백업 시점 뒤의 취소는 그 백업에 존재한다고 가정하지 않는다. 복원은 백업의 시점과 범위를 표시하며 이후 원본의 취소 상태를 보존했다고 주장하지 않는다.
+
+복원은 새 data root에서 수행하고 검증 후 사용자 선택으로 전환한다. 새 store generation을 발급하며 실행 lease·권한 동의·secret·provider 인증 연결·살아있는 세션을 백업에서 재활성화하지 않는다. 복원한 기록은 열람 가능하지만 새 호출은 readiness와 공개 범위 확인을 거친다. 기존 data root를 검증 전 덮어쓰지 않는다.
+
+복원은 새 실행 계보를 발급하고 가져온 모든 접수 binding을 재생 전용으로 고정한다. 가져온 취소 fence와 receipt는 변경하지 않으며 미접수 명령도 자동 재등록하지 않는다. 현재 계보·store generation·프로세스 세대가 다른 token은 거부한다. 백업에 없는 이후 명령의 정지나 취소를 만들어 기록하지 않는다. 원본과 복원본 사이에 활성 실행 권위를 승계하지 않으며 새 실행은 사용자의 새 명령과 현재 readiness 확인으로만 시작한다.
 
 ## 7. 업데이트와 배포 서명
 
@@ -150,7 +166,7 @@ migration은 단일 writer에서 멱등적으로 수행하며 중간 실패 상�
 | 비활성 상태 | 최소화·가려진 창의 연속 장식 animation 중지; 모델 heartbeat와 분리 |
 | 메뉴 막대 | 팝오버 반복 열기·닫기에서 새 모델 호출 0회, 같은 Run·revision 표시, 콘솔 복원 시 입력·근거 위치 보존 |
 | 데스크톱 창 | 지원 디스플레이·배율·Space 변경 후 창과 팝오버가 사용 가능한 화면 영역 안에 있으며 Dock 최소화·숨김·명시적 종료가 구분됨 |
-| 재시작 | 원문 재추출 없이 최근 1,000개 Run 목록·선택 기록을 2초 이내 표시하는 목표; 외부 로그인 시간 제외 |
+| 재시작 | 원문 재추출 없이 최근 1,000개 Run 목록·선택 기록을 2초 이내 표시하는 목표; 외부 인증 연결 검증 시간 제외 |
 | 스트림 폭주 | 3개 동시 출력·느린 renderer에도 코어 저장·취소 가능, 미리보기 누락은 표시하고 최종 결과는 객체로 복구 |
 | 공급자 격리 | 범위 밖 파일·셸·다른 코어의 봉인된 결과·secret 접근 시도 거부 증거 |
 | 장애 복구 | dispatch 전·후, 평가 수락, 3번째 표 저장, 결과 commit 경계 crash 후 중복 표·가짜 완료가 없음 |

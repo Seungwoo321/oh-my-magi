@@ -1,17 +1,114 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod resource_custody;
 mod sandbox;
+pub mod subscription;
 mod transport;
+mod verification;
 
-pub use sandbox::CodexAcpLaunch;
-pub use transport::{
-    AdapterInfo, AuthMethod, AuthenticationStatus, AvailableModel, CodexAcpClient,
-    HomeBindingProof, InitializeResult, PromptEvent, PromptHandle, PromptResult, ProviderUsage,
-    SessionInfo,
+pub use verification::{
+    RequestSettlement, RetiredGenerationCapture, RuntimeVerificationService, VerificationMetrics,
+    VerificationRequest, VerifiedInstalledGeneration, VerifiedReadOnlyInstallation,
+    VerifiedRuntimeArtifact, verify_codesign_identity, verify_installed_generation,
+    verify_readonly_installation,
 };
 
-#[derive(Debug, Error)]
+pub struct StreamOperationLease {
+    _activity: verification::ActivityLease,
+    request: VerificationRequest,
+}
+
+impl StreamOperationLease {
+    /// Keeps unknown external cleanup visible even after the local owner is dropped.
+    pub fn retain_unresolved(mut self) {
+        self._activity.mark_owned_process();
+    }
+}
+impl VerificationRequest {
+    /// Linearizes a synchronous owned effect with revocation under the bound lease.
+    pub fn with_stream_effect_admission<T>(
+        &self,
+        lease: &StreamOperationLease,
+        operation: impl FnOnce() -> T,
+    ) -> Result<T, ProviderError> {
+        if !self.same_root(&lease.request) {
+            return Err(ProviderError::InvalidLaunch);
+        }
+        self.publish(operation)
+    }
+
+    /// Yields settlement observation on the async timer, bounded by its absolute deadline.
+    pub async fn wait_for_stream_checkpoint(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<(), ProviderError> {
+        if std::time::Instant::now() >= deadline {
+            return Err(ProviderError::Timeout);
+        }
+        let next = (std::time::Instant::now() + std::time::Duration::from_millis(1)).min(deadline);
+        tokio::time::sleep_until(next.into()).await;
+        if std::time::Instant::now() >= deadline {
+            Err(ProviderError::Timeout)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn track_stream_operation(&self) -> Result<StreamOperationLease, ProviderError> {
+        Ok(StreamOperationLease {
+            _activity: self.provider_activity()?,
+            request: self.clone(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod native_fixture_tests;
+
+#[cfg(all(test, target_os = "macos"))]
+mod signed_security_tests;
+
+pub use sandbox::{
+    CodexAcpLaunch, RuntimeArtifactIdentity, codex_acp_adapter_patch_id, verify_packaged_artifact,
+    verify_packaged_artifact_identity,
+};
+pub use transport::{
+    AdapterInfo, AuthMethod, AuthProgressStage, AuthenticationStatus, AvailableMode,
+    AvailableModel, CancelOutcome, ClientFileReadError, ClientFileReader, CodexAcpClient,
+    HomeBindingProof, InitializeResult, NoticeCategory, NoticeSeverity, PendingCancel,
+    PendingModelConfiguration, PendingSession, PreparedSession, PromptEvent, PromptHandle,
+    PromptResult, PromptStreamDiagnostic, PromptStreamFailure, PromptStreamSnapshot,
+    ProviderNoticeDiagnostic, ProviderUsage, RpcFailureCategory, RpcFailureDiagnostic,
+    RpcFailureMethod, SessionInfo,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderRemediation {
+    Reauthenticate,
+    RefreshCatalog,
+    ReviewRequest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxPolicyFailureCode {
+    NetworkRuleRejected,
+    ProfileRejected,
+    ProbeTimedOut,
+}
+
+impl std::fmt::Display for ProviderRemediation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Reauthenticate => "reauthenticate",
+            Self::RefreshCatalog => "refresh_catalog",
+            Self::ReviewRequest => "review_request",
+        })
+    }
+}
+
+#[derive(Debug, Error, Clone)]
 pub enum ProviderError {
     #[error("provider execution is supported only on macOS")]
     UnsupportedPlatform,
@@ -25,16 +122,33 @@ pub enum ProviderError {
     RoleWorkdirUnavailable,
     #[error("the operating system isolation boundary could not be established")]
     IsolationUnavailable,
+    #[error("the operating system isolation policy was rejected")]
+    SandboxPolicyRejected {
+        code: SandboxPolicyFailureCode,
+        exit_status: Option<i32>,
+    },
     #[error("the provider process could not be started")]
     ProcessStart,
     #[error("the provider process is closed")]
     ProcessClosed,
     #[error("the provider process exited unexpectedly")]
     ProcessExited,
+    #[error("the Codex App Server exited during sign-in")]
+    CodexAppServerExited { exit_code: Option<i32> },
+    #[error("Codex authentication status could not be read")]
+    AuthenticationStatusRpcFailed,
+    #[error("Codex sign-in could not be started")]
+    AuthenticationRpcFailed,
+    #[error("macOS could not open the Codex sign-in browser")]
+    BrowserOpenFailed,
     #[error("the ACP protocol exchange failed")]
     Protocol,
-    #[error("the provider rejected the request")]
-    RemoteRequestFailed,
+    #[error("Codex RPC failed; remediation category: {remediation}")]
+    RemoteRequestFailed { remediation: ProviderRemediation },
+    #[error("Codex RPC timed out; remediation category: {remediation}")]
+    RpcTimeout { remediation: ProviderRemediation },
+    #[error("the provider endpoint proxy could not be started or completed its request")]
+    ProxyUnavailable,
     #[error("the provider response did not match the expected protocol shape")]
     InvalidResponse,
     #[error("the selected authentication method is not supported")]
@@ -43,10 +157,14 @@ pub enum ProviderError {
     Unauthenticated,
     #[error("this core already has an ACP session")]
     SessionAlreadyCreated,
+    #[error("a provider model catalog request is already in progress")]
+    CatalogBusy,
     #[error("the selected model is not available from the provider")]
     ModelUnavailable,
     #[error("the ACP session does not exist")]
     SessionUnavailable,
+    #[error("the durable local source permission store is unavailable")]
+    SourceReadUnavailable,
     #[error("this ACP session already has a prompt in progress")]
     PromptInProgress,
     #[error("the provider attempted to use a denied tool")]
@@ -57,10 +175,42 @@ pub enum ProviderError {
     InputLimit,
     #[error("the provider output stream exceeded its event limit")]
     EventLimit,
+    #[error("the provider notice buffer exceeded its configured limit")]
+    NoticeLimit,
+    #[error("the provider output consumer closed before delivery completed")]
+    StreamConsumerClosed,
     #[error("the provider request timed out")]
     Timeout,
     #[error("the provider request was cancelled")]
     Cancelled,
+    #[error("prompt failed after receiving buffered provider updates: {source}")]
+    PromptFailedWithEvents {
+        #[source]
+        source: Box<ProviderError>,
+        buffered_events: Vec<transport::PromptEvent>,
+    },
+}
+
+impl ProviderError {
+    pub fn remediation_category(&self) -> Option<ProviderRemediation> {
+        match self {
+            Self::PromptFailedWithEvents { source, .. } => source.remediation_category(),
+            Self::RemoteRequestFailed { remediation } => Some(*remediation),
+            Self::RpcTimeout { remediation } => Some(*remediation),
+            Self::Unauthenticated | Self::AuthenticationUnavailable => {
+                Some(ProviderRemediation::Reauthenticate)
+            }
+            Self::CatalogBusy | Self::ModelUnavailable => Some(ProviderRemediation::RefreshCatalog),
+            Self::Timeout | Self::ProcessClosed | Self::ProcessExited => {
+                Some(ProviderRemediation::ReviewRequest)
+            }
+            Self::CodexAppServerExited { .. } => Some(ProviderRemediation::Reauthenticate),
+            Self::AuthenticationRpcFailed | Self::BrowserOpenFailed => {
+                Some(ProviderRemediation::Reauthenticate)
+            }
+            _ => None,
+        }
+    }
 }
 
 pub const CODEX_ACP_PACKAGE: &str = "@agentclientprotocol/codex-acp";

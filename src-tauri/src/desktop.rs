@@ -4,6 +4,7 @@ use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem, Submenu},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
+use tauri_plugin_dialog::DialogExt;
 
 use crate::commands::{ExitAuthorization, focus_main_window};
 
@@ -16,19 +17,36 @@ pub(crate) fn run() {
         .menu(build_app_menu)
         .on_menu_event(|app, event| match event.id().as_ref() {
             "magi-console-open" => {
-                let _ = focus_main_window(app);
+                focus_main_window_or_report(app);
             }
             "magi-settings" => {
-                if focus_main_window(app).is_ok() {
+                if focus_main_window_or_report(app) {
                     let _ = app.emit_to("main", "magi:open-settings", ());
                 }
             }
             _ => {}
         })
         .invoke_handler(tauri::generate_handler![
-            crate::commands::get_console_snapshot,
+            get_console_snapshot,
+            crate::commands::load_run_dossier,
+            crate::records::list_records,
+            crate::records::load_record_replay,
+            crate::records::list_record_evidence,
+            crate::records::load_evidence,
+            crate::records::load_context_evidence,
+            crate::records::preview_evidence_deletion,
+            crate::records::delete_record_evidence,
+            crate::records::delete_record,
+            crate::records::import_shared_replay,
+            crate::records::load_external_replay,
+            crate::records::list_external_replays,
+            crate::records::create_local_backup,
+            crate::records::restore_local_backup,
             crate::commands::select_context_files,
             crate::commands::select_context_directory,
+            crate::pdf_capture::prepare_pdf_range_capture,
+            crate::pdf_capture::apply_pdf_range_capture,
+            crate::pdf_capture::discard_pdf_range_capture,
             crate::preferences::get_console_preferences,
             crate::preferences::save_console_preferences,
             crate::commands::shell_context,
@@ -40,10 +58,39 @@ pub(crate) fn run() {
             crate::profiles::list_recent_runs,
             crate::profiles::list_acp_adapters,
             crate::profiles::list_provider_profiles,
+            crate::profiles::list_provider_source_scopes,
+            crate::profiles::pick_provider_source_directory,
+            crate::profiles::add_provider_source_scope,
+            crate::profiles::revoke_provider_source_scope,
             crate::profiles::load_active_provider_profile_selection,
             crate::profiles::save_provider_profile,
             crate::profiles::set_active_provider_profile,
             crate::profiles::validate_provider_profile,
+            crate::profiles::authenticate_provider_profile,
+            crate::profiles::cancel_provider_authentication,
+            crate::profiles::refresh_provider_model_catalog,
+            crate::profiles::load_provider_catalog,
+            crate::profiles::refresh_provider_catalog,
+            crate::profiles::select_provider_model,
+            crate::profiles::load_core_model_selections,
+            crate::profiles::load_core_execution_witnesses,
+            crate::profiles::select_core_model,
+            crate::profiles::register_deliberation_request,
+            crate::profiles::register_clarification_request,
+            crate::profiles::start_clarification,
+            crate::profiles::cancel_clarification_request,
+            crate::profiles::start_deliberation,
+            crate::profiles::load_run_clarification,
+            crate::commands::create_clarification_draft,
+            crate::commands::load_clarification_draft,
+            crate::commands::list_clarification_drafts,
+            crate::commands::save_clarification_question,
+            crate::commands::discard_clarification_draft,
+            crate::profiles::start_live_run,
+            crate::profiles::get_live_run_snapshot,
+            crate::profiles::cancel_live_run,
+            crate::profiles::cancel_deliberation,
+            crate::profiles::cancel_deliberation_request,
             crate::profiles::list_role_presets,
             crate::profiles::load_active_role_preset_selection,
             crate::profiles::set_active_role_preset,
@@ -121,10 +168,10 @@ fn install_tray(app: &AppHandle<Wry>) -> Result<(), Box<dyn std::error::Error>> 
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {
             "open-console" => {
-                let _ = focus_main_window(app);
+                focus_main_window_or_report(app);
             }
             "open-settings" => {
-                if focus_main_window(app).is_ok() {
+                if focus_main_window_or_report(app) {
                     let _ = app.emit_to("main", "magi:open-settings", ());
                 }
             }
@@ -175,8 +222,21 @@ fn handle_run_event(app: &AppHandle<Wry>, event: RunEvent) {
 }
 
 fn request_exit(app: &AppHandle<Wry>) {
-    if focus_main_window(app).is_ok() {
+    if focus_main_window_or_report(app) {
         let _ = app.emit_to("main", "magi:exit-requested", ());
+    }
+}
+
+fn focus_main_window_or_report(app: &AppHandle<Wry>) -> bool {
+    match focus_main_window(app) {
+        Ok(()) => true,
+        Err(message) => {
+            app.dialog()
+                .message(message)
+                .title("MAGI CONSOLE")
+                .blocking_show();
+            false
+        }
     }
 }
 
@@ -266,4 +326,13 @@ fn set_pixel(pixels: &mut [u8], size: i32, x: i32, y: i32, color: [u8; 4]) {
     }
     let index = ((y * size + x) * 4) as usize;
     pixels[index..index + 4].copy_from_slice(&color);
+}
+
+#[tauri::command]
+async fn get_console_snapshot(
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, crate::commands::DesktopState>,
+) -> Result<crate::commands::ConsoleSnapshot, String> {
+    crate::commands::verified_console_snapshot(window, app, state).await
 }
