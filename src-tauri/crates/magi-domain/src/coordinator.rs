@@ -460,6 +460,7 @@ impl RunAggregate {
                     actual: "proposal references another input snapshot".to_owned(),
                 });
             }
+            aggregate.validate_proposal_sources(&proposal)?;
             aggregate.proposal = Some(proposal);
         }
         for ballot in state.sealed_ballots {
@@ -758,16 +759,7 @@ impl RunAggregate {
             });
         }
         proposal.validate(Some(&self.input.context_manifest))?;
-        let all_claim_ids = self.all_claim_ids();
-        for objection in &proposal.open_objections {
-            if !all_claim_ids.contains(&objection.claim_id) {
-                return Err(DomainError::Validation(vec![crate::ValidationIssue::new(
-                    "open_objections.claim_id",
-                    "unknown_source_claim",
-                    "open objection must point to a claim from an accepted assessment",
-                )]));
-            }
-        }
+        self.validate_proposal_sources(&proposal)?;
         let proposal_id = proposal.proposal_id.clone();
         let digest = proposal.digest.clone();
         self.proposal = Some(proposal);
@@ -1166,6 +1158,20 @@ impl RunAggregate {
                 assessment.claims.iter().map(|claim| claim.claim_id.clone())
             })
             .collect()
+    }
+
+    fn validate_proposal_sources(&self, proposal: &ProposalSnapshot) -> Result<(), DomainError> {
+        let all_claim_ids = self.all_claim_ids();
+        for objection in &proposal.open_objections {
+            if !all_claim_ids.contains(&objection.claim_id) {
+                return Err(DomainError::Validation(vec![crate::ValidationIssue::new(
+                    "open_objections.claim_id",
+                    "unknown_source_claim",
+                    "open objection must point to a claim from an accepted assessment",
+                )]));
+            }
+        }
+        Ok(())
     }
 
     fn all_claim_ids(&self) -> Vec<OpaqueId> {

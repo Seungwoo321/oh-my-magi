@@ -4,7 +4,7 @@ set -euo pipefail
 readonly source_commit='b412ff32c417f855c2b2d1581b77058eed87c84b'
 readonly source_sha256='1ac6a92e7318b8acf3d767170c5c5e6dceeffdc074c73b1c5d422b46f0de4daf'
 readonly patch_id='codex-http-ca-preserve-backend-v1'
-readonly patch_sha256='2ed2741afc0cecc14da03cf05a4474176bbc9a81f6e7657078c069f2d584ec5b'
+readonly patch_sha256='b08f4099725b6394e5657691e10d2dc8d9696cd119623fa6155db28a70d76d54'
 readonly lock_sha256='d722f05fc760bcd1f5749ec452452d81058458b788df3b765b80500d757eba4a'
 readonly source_url="https://codeload.github.com/openai/codex/tar.gz/$source_commit"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -25,18 +25,9 @@ if [[ ! -f "$patch_file" || -L "$patch_file" || "$(shasum -a 256 "$patch_file" |
   printf 'The runtime source patch does not match its pin.\n' >&2
   exit 1
 fi
-if [[ "${1:-}" == --verify ]]; then
-  python3 - "$root" "$source_commit" "$source_sha256" "$patch_id" "$patch_sha256" "$lock_sha256" <<'PY'
-import hashlib,json,pathlib,stat,sys
-root=pathlib.Path(sys.argv[1]); expected=dict(zip(('source_commit','source_sha256','patch_id','patch_sha256','lock_sha256'),sys.argv[2:]))
-manifest=json.loads((root/'runtime-build.json').read_text())
-assert set(manifest)==set(expected)|{'schema_version','target','executable_sha256','rust_toolchain'}
-assert manifest['schema_version']==1 and manifest['target']=='aarch64-apple-darwin' and manifest['rust_toolchain']=='1.95.0'
-assert all(manifest[key]==value for key,value in expected.items())
-for name in ('codex','runtime-build.json','LICENSE','NOTICE'):
-    metadata=(root/name).lstat();assert stat.S_ISREG(metadata.st_mode) and metadata.st_nlink==1 and not metadata.st_mode&0o022
-assert hashlib.sha256((root/'codex').read_bytes()).hexdigest()==manifest['executable_sha256']
-PY
+if [[ "${1:-}" == --verify || "${1:-}" == --restore-provenance ]]; then
+  [[ "$#" -eq 1 ]] || exit 1
+  python3 "$script_dir/runtime-provenance.py" "$1" "$root" "$patch_file" "$source_commit" "$source_sha256" "$patch_id" "$patch_sha256" "$lock_sha256"
   exit 0
 fi
 if [[ "$#" -ne 0 || -e "$output_root" || -L "$output_root" ]]; then
@@ -48,6 +39,37 @@ node "$script_dir/assert-repo-local-paths.cjs" "$repo_root" "$root"
 mkdir -p "$root"
 chmod 700 "$root"
 node "$script_dir/assert-repo-local-paths.cjs" "$repo_root" "$root"
+staging_root="$root"
+staging_identity="$(python3 - "$root" <<'PYIDENTITY'
+import os,sys
+m=os.lstat(sys.argv[1]);print(f'{m.st_dev}:{m.st_ino}')
+PYIDENTITY
+)"
+cleanup_runtime_paths() {
+  python3 - "$staging_root" "$staging_identity" "$@" <<'PYCLEANUP'
+import os,pathlib,shutil,stat,sys
+root=pathlib.Path(sys.argv[1]);expected=sys.argv[2]
+if not root.exists(): raise SystemExit(0)
+m=root.lstat();assert stat.S_ISDIR(m.st_mode) and m.st_uid==os.getuid() and f'{m.st_dev}:{m.st_ino}'==expected
+paths=[root/name for name in sys.argv[3:]] if len(sys.argv)>3 else [root]
+for target in paths:
+    assert target==root or target.parent==root
+    if not target.exists() and not target.is_symlink(): continue
+    entries=[target]+list(target.rglob('*')) if target.is_dir() else [target]
+    for entry in entries:
+        metadata=entry.lstat();assert metadata.st_uid==os.getuid()
+        if entry.is_symlink():
+            resolved=entry.resolve(strict=True);assert resolved.is_relative_to(root) and resolved.is_file(), 'Refusing cleanup of external or unexpected symlink'
+        else: assert stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)
+    for entry in entries:
+        if not entry.is_symlink() and entry.is_dir(): entry.chmod(0o700)
+    if target.is_dir(): shutil.rmtree(target)
+    else: target.unlink()
+PYCLEANUP
+}
+trap cleanup_runtime_paths EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 archive="$root/source.tar.gz"
 curl --disable --fail --location --silent --show-error --proto '=https' --proto-redir '=https' \
   --max-redirs 2 --max-time 90 --max-filesize 104857600 --output "$archive" "$source_url"
@@ -138,6 +160,11 @@ manifest.update(schema_version=1,target='aarch64-apple-darwin',rust_toolchain='1
 (root/'runtime-build.json').write_text(json.dumps(manifest,indent=2)+'\n')
 PY
 chmod 444 "$root/runtime-build.json"
+cp "$root/source/codex-rs/Cargo.lock" "$root/provenance-Cargo.lock"
+cleanup_runtime_paths target source original-Cargo.lock source-test-target-reclamation.json
+mkdir -p "$root/source/codex-rs"
+mv "$root/provenance-Cargo.lock" "$root/source/codex-rs/Cargo.lock"
+chmod 444 "$root/source.tar.gz" "$root/source/codex-rs/Cargo.lock"
 if [[ -e "$output_root" || -L "$output_root" ]]; then
   printf 'Refusing to overwrite an existing runtime generation.\n' >&2
   exit 1

@@ -1,10 +1,6 @@
-mod commands;
+use crate::{commands, profiles};
 #[path = "../native/connection-ui-fixture.rs"]
 mod connection_ui_fixture;
-mod pdf_capture;
-mod preferences;
-mod profiles;
-mod run_projection;
 
 use std::os::unix::fs::PermissionsExt;
 use std::{
@@ -199,7 +195,7 @@ fn validate_saved_profile_records(
             return Err("saved profile reference drift");
         }
         let core = storage
-            .load_core_model_selection(binding.core_id)
+            .load_core_model_selection_intent(binding.core_id)
             .map_err(|_| "saved core unavailable")?;
         match (core, binding.core_selection_revision) {
             (None, None) => {}
@@ -236,7 +232,7 @@ fn derive_saved_profile_bindings(
                 .map_err(|_| "saved model unavailable")?
                 .ok_or("saved model missing")?;
             let core = storage
-                .load_core_model_selection(reference.core_id)
+                .load_core_model_selection_intent(reference.core_id)
                 .map_err(|_| "saved core unavailable")?;
             let core_selection_revision = match core {
                 None if reference.core_selection_revision.is_none() => None,
@@ -1218,11 +1214,17 @@ impl commands::AdmissionRequestRegistry {
 impl ProbeMonitor {
     fn ensure_running(&self) -> Result<(), String> {
         if self.outcome.load(Ordering::Acquire) != 0 {
-            return Err("supervised probe permission revoked".into());
+            return Err("supervised probe outcome already terminal".into());
         }
-        self.lifecycle
-            .check()
-            .map_err(|_| "supervised probe permission revoked".into())
+        self.lifecycle.check().map_err(|error| match error {
+            magi_provider::ProviderError::Timeout => {
+                "supervised probe authority deadline expired".into()
+            }
+            magi_provider::ProviderError::Cancelled => {
+                "supervised probe authority cancelled".into()
+            }
+            _ => "supervised probe authority check failed".into(),
+        })
     }
 
     fn revoke_for_timeout(&self) -> Option<commands::AdmissionOperationLease> {
@@ -1593,6 +1595,1132 @@ async fn retained_saved_preparation(
     ))
 }
 
+struct OwnedPreparationPath {
+    path: PathBuf,
+    keep: bool,
+}
+impl Drop for OwnedPreparationPath {
+    fn drop(&mut self) {
+        if !self.keep
+            && self.path.exists()
+            && let Err(error) = std::fs::remove_dir_all(&self.path)
+        {
+            if std::thread::panicking() {
+                eprintln!("Owned preparation cleanup failed: {error}");
+            } else {
+                panic!("Owned preparation cleanup failed: {error}");
+            }
+        }
+    }
+}
+
+fn prepare_retained_saved_profile_backup() -> Result<(), String> {
+    let required = |name| {
+        std::env::var_os(name)
+            .map(PathBuf::from)
+            .ok_or_else(|| format!("{name} required"))
+    };
+    prepare_retained_saved_profile_backup_at(
+        required("MAGI_TEST_RETAINED_PROFILE_ROOT")?,
+        required("MAGI_TEST_OWNED_COPY_ROOT")?,
+        required("MAGI_TEST_SAVED_PROFILE_BACKUP_ROOT")?,
+    )
+}
+
+fn prepare_retained_saved_profile_backup_at(
+    retained: PathBuf,
+    copy: PathBuf,
+    backup: PathBuf,
+) -> Result<(), String> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    if copy.exists() || backup.exists() || retained == copy || retained == backup {
+        return Err("fresh distinct owned destinations required".into());
+    }
+    use std::os::fd::{AsRawFd, FromRawFd};
+    fn open_at(
+        parent: &std::fs::File,
+        name: &str,
+        directory: bool,
+    ) -> Result<std::fs::File, String> {
+        let name = std::ffi::CString::new(name).map_err(|_| "retained name invalid")?;
+        let flags = libc::O_RDONLY
+            | libc::O_NOFOLLOW
+            | libc::O_CLOEXEC
+            | libc::O_NONBLOCK
+            | if directory { libc::O_DIRECTORY } else { 0 };
+        let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err("retained relative acquisition failed".into());
+        }
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let metadata = file.metadata().map_err(|_| "retained metadata")?;
+        if metadata.uid() != unsafe { libc::geteuid() } || (directory && !metadata.is_dir()) {
+            return Err("retained owner invalid".into());
+        }
+        Ok(file)
+    }
+    fn names(parent: &std::fs::File) -> Result<Vec<String>, String> {
+        let fd = unsafe { libc::dup(parent.as_raw_fd()) };
+        if fd < 0 {
+            return Err("directory enumeration failed".into());
+        }
+        let directory = unsafe { libc::fdopendir(fd) };
+        if directory.is_null() {
+            unsafe {
+                libc::close(fd);
+            }
+            return Err("directory enumeration failed".into());
+        }
+        let result = (|| {
+            let mut names = Vec::new();
+            loop {
+                let entry = unsafe { libc::readdir(directory) };
+                if entry.is_null() {
+                    break;
+                }
+                let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }
+                    .to_str()
+                    .map_err(|_| "directory name invalid")?;
+                if name != "." && name != ".." {
+                    names.push(name.to_owned());
+                }
+            }
+            Ok(names)
+        })();
+        if unsafe { libc::closedir(directory) } != 0 {
+            return Err("directory close failed".into());
+        }
+        result
+    }
+    let retained_directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(&retained)
+        .map_err(|_| "retained directory unavailable")?;
+    let state_directory = open_at(&retained_directory, "state", true)?;
+    let objects_directory = open_at(&retained_directory, "objects", true)?;
+    let check_closed = || -> Result<(), String> {
+        for suffix in ["-wal", "-shm"] {
+            let name = std::ffi::CString::new(format!("magi.sqlite{suffix}"))
+                .map_err(|_| "retained name")?;
+            let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+            let result = unsafe {
+                libc::fstatat(
+                    state_directory.as_raw_fd(),
+                    name.as_ptr(),
+                    metadata.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOENT) {
+                return Err("closed retained store required".into());
+            }
+        }
+        Ok(())
+    };
+    let read_file = |parent: &std::fs::File, name: &str| -> Result<Vec<u8>, String> {
+        let mut file = open_at(parent, name, false)?;
+        let before = file.metadata().map_err(|_| "retained metadata")?;
+        if !before.is_file() || before.nlink() != 1 || before.len() > 500 * 1024 * 1024 {
+            return Err("retained file custody invalid".into());
+        }
+        let mut bytes = Vec::new();
+        file.by_ref()
+            .take(500 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "retained read")?;
+        let identity = |m: &std::fs::Metadata| {
+            (
+                m.dev(),
+                m.ino(),
+                m.len(),
+                m.mtime(),
+                m.mtime_nsec(),
+                m.ctime(),
+                m.ctime_nsec(),
+            )
+        };
+        if bytes.len() as u64 != before.len()
+            || identity(&before) != identity(&file.metadata().map_err(|_| "retained metadata")?)
+            || identity(&before)
+                != identity(
+                    &open_at(parent, name, false)?
+                        .metadata()
+                        .map_err(|_| "retained metadata")?,
+                )
+        {
+            return Err("retained file changed".into());
+        }
+        Ok(bytes)
+    };
+    let copy_file = |parent: &std::fs::File,
+                     name: &str,
+                     destination: &Path|
+     -> Result<magi_domain::Digest, String> {
+        use std::io::Write;
+        let bytes = read_file(parent, name)?;
+        let digest = magi_domain::Digest::from_bytes(&bytes);
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(destination)
+            .map_err(|_| "owned copy write")?;
+        output.write_all(&bytes).map_err(|_| "owned copy write")?;
+        Ok(digest)
+    };
+    for path in [
+        &retained,
+        &retained.join("state"),
+        &retained.join("objects"),
+    ] {
+        let m = std::fs::symlink_metadata(path).map_err(|_| "retained root unavailable")?;
+        if !m.is_dir() || m.file_type().is_symlink() || m.uid() != unsafe { libc::geteuid() } {
+            return Err("retained root custody invalid".into());
+        }
+    }
+    check_closed()?;
+    std::fs::create_dir(&copy).map_err(|_| "owned copy root")?;
+    let _copy_guard = OwnedPreparationPath {
+        path: copy.clone(),
+        keep: false,
+    };
+    std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o700))
+        .map_err(|_| "owned copy permissions")?;
+    for name in ["state", "objects"] {
+        std::fs::create_dir(copy.join(name)).map_err(|_| "owned copy directory")?;
+        std::fs::set_permissions(copy.join(name), std::fs::Permissions::from_mode(0o700))
+            .map_err(|_| "owned directory permissions")?;
+    }
+    let original_db = copy_file(
+        &state_directory,
+        "magi.sqlite",
+        &copy.join("state/magi.sqlite"),
+    )?;
+    for prefix in names(&objects_directory)? {
+        if prefix.len() != 2 || !prefix.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("object prefix invalid".into());
+        }
+        let object_directory = open_at(&objects_directory, &prefix, true)?;
+        std::fs::create_dir(copy.join("objects").join(&prefix)).map_err(|_| "owned objects")?;
+        for name in names(&object_directory)? {
+            if name.len() != 62 || !name.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err("object name invalid".into());
+            }
+            let digest = copy_file(
+                &object_directory,
+                &name,
+                &copy.join("objects").join(&prefix).join(&name),
+            )?;
+            if digest.as_str() != format!("{prefix}{name}") {
+                return Err("retained object integrity mismatch".into());
+            }
+        }
+    }
+    check_closed()?;
+    let original_after =
+        magi_domain::Digest::from_bytes(&read_file(&state_directory, "magi.sqlite")?);
+    if original_db != original_after {
+        return Err("retained database changed".into());
+    }
+    let storage =
+        magi_storage::Storage::open_or_create(&copy).map_err(|_| "owned copy migration failed")?;
+    let mut backup_guard = OwnedPreparationPath {
+        path: backup.clone(),
+        keep: false,
+    };
+    let manifest = storage
+        .create_backup(&backup)
+        .map_err(|_| "coherent backup failed")?;
+    std::fs::write(backup.join("preparation-proof.json"),serde_json::to_vec_pretty(&serde_json::json!({"sourceDatabaseDigest":original_db,"backup":manifest,"sourceWrites":0})).map_err(|_| "backup proof encoding")?).map_err(|_| "backup proof write")?;
+    std::fs::set_permissions(
+        backup.join("preparation-proof.json"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .map_err(|_| "proof permissions")?;
+    backup_guard.keep = true;
+    Ok(())
+}
+
+#[derive(Default)]
+struct SavedDeliberationUiState {
+    nonce: Mutex<Option<String>>,
+    progress: Mutex<Option<SavedDeliberationUiPhase>>,
+    connection_step: Mutex<Option<ConnectionDiagnostic>>,
+    core_step: Mutex<Option<CoreDiagnostic>>,
+    confirmation_diagnostic: Mutex<Option<ConfirmationDiagnostic>>,
+    core_field_diagnostic: Mutex<Option<CoreFieldDiagnostic>>,
+    outcome: Mutex<Option<Result<serde_json::Value, String>>>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SavedDeliberationUiPhase {
+    BridgeReady,
+    DocumentReady,
+    NewDeliberation,
+    QuestionWritable,
+    ConnectionVerification,
+    ModelReconfirmation,
+    CoreReconfirmation,
+    DraftRestored,
+    SourcesView,
+    NativePicker,
+    CaptureComplete,
+    InputReview,
+    ConsentReady,
+    StartReady,
+    StartReceipt,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ConnectionDiagnosticStep {
+    SelectionRequested,
+    SelectionConfirmed,
+    CheckRequested,
+    AuthenticationConfirmed,
+    ModelControlReady,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConnectionDiagnostic {
+    profile_index: u8,
+    step: ConnectionDiagnosticStep,
+}
+fn validate_connection_diagnostic(
+    phase: SavedDeliberationUiPhase,
+    prior: Option<ConnectionDiagnostic>,
+    next: ConnectionDiagnostic,
+) -> Result<(), String> {
+    if next.profile_index > 2
+        || !matches!(
+            phase,
+            SavedDeliberationUiPhase::ConnectionVerification
+                | SavedDeliberationUiPhase::ModelReconfirmation
+        )
+        || prior.is_some_and(|previous| next < previous)
+    {
+        return Err("UI connection diagnostic fenced".into());
+    }
+    Ok(())
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CoreDiagnosticStep {
+    SelectionRequested,
+    SelectionConfirmed,
+    SaveRequested,
+    SaveReadRequested,
+    SaveReadReceived,
+    SaveAcknowledged,
+    FieldSettled,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CoreReadSelectionState {
+    Selected,
+    Stale,
+    Unselected,
+    Unknown,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CoreReadMetadata {
+    before_revision: u64,
+    expected_revision: u64,
+    after_revision: Option<u64>,
+    selection_state: CoreReadSelectionState,
+    revision_matches: bool,
+    profile_matches: bool,
+    profile_revision_matches: bool,
+    model_ref_matches: bool,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CoreDiagnostic {
+    core_index: u8,
+    step: CoreDiagnosticStep,
+    #[serde(default)]
+    metadata: Option<CoreReadMetadata>,
+}
+fn validate_core_diagnostic(
+    phase: SavedDeliberationUiPhase,
+    prior: Option<CoreDiagnostic>,
+    next: CoreDiagnostic,
+) -> Result<(), String> {
+    if phase != SavedDeliberationUiPhase::CoreReconfirmation
+        || next.core_index > 2
+        || prior.is_some_and(|previous| {
+            (next.core_index, next.step) < (previous.core_index, previous.step)
+        })
+        || (next.step == CoreDiagnosticStep::SaveReadReceived) != next.metadata.is_some()
+        || next.metadata.is_some_and(|metadata| {
+            const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+            metadata.before_revision >= MAX_SAFE_INTEGER
+                || metadata.expected_revision != metadata.before_revision + 1
+                || metadata
+                    .after_revision
+                    .is_some_and(|revision| revision > MAX_SAFE_INTEGER)
+        })
+    {
+        return Err("UI core diagnostic fenced".into());
+    }
+    Ok(())
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CoreFieldDiagnostic {
+    core_index: u8,
+    captured_connected: bool,
+    current_present: bool,
+    current_equals_captured: bool,
+    captured_saving: bool,
+    current_saving: bool,
+    captured_stale: bool,
+    current_stale: bool,
+    select_disabled: bool,
+    current_alert_present: bool,
+    connection_heading: bool,
+}
+fn validate_core_field_diagnostic(
+    phase: SavedDeliberationUiPhase,
+    step: Option<CoreDiagnostic>,
+    diagnostic: CoreFieldDiagnostic,
+) -> Result<(), String> {
+    if phase != SavedDeliberationUiPhase::CoreReconfirmation
+        || diagnostic.core_index > 2
+        || !step.is_some_and(|step| {
+            step.core_index == diagnostic.core_index
+                && step.step == CoreDiagnosticStep::SaveAcknowledged
+        })
+    {
+        return Err("UI core field diagnostic fenced".into());
+    }
+    Ok(())
+}
+#[cfg(test)]
+mod core_field_diagnostic_tests {
+    use super::*;
+    #[test]
+    fn supervised_authority_preserves_timeout_and_cancellation_categories() {
+        let monitor = |deadline| ProbeMonitor {
+            outcome: AtomicU8::new(0),
+            phase: Mutex::new(("setup", Instant::now())),
+            active_request: Mutex::new(None),
+            started: Instant::now(),
+            lifecycle: commands::AdmissionRequestLifecycle::until(deadline),
+        };
+        let expired = monitor(Instant::now() - Duration::from_secs(1));
+        assert_eq!(
+            expired.ensure_running().unwrap_err(),
+            "supervised probe authority deadline expired"
+        );
+        let cancelled = monitor(Instant::now() + Duration::from_secs(30));
+        cancelled.lifecycle.verification.revoke();
+        assert_eq!(
+            cancelled.ensure_running().unwrap_err(),
+            "supervised probe authority cancelled"
+        );
+        cancelled.outcome.store(2, Ordering::Release);
+        assert_eq!(
+            cancelled.ensure_running().unwrap_err(),
+            "supervised probe outcome already terminal"
+        );
+    }
+
+    #[test]
+    fn field_observation_is_closed_and_requires_same_core_save_acknowledgement() {
+        let value = serde_json::json!({"coreIndex":1,"capturedConnected":false,"currentPresent":true,"currentEqualsCaptured":false,"capturedSaving":false,"currentSaving":false,"capturedStale":false,"currentStale":false,"selectDisabled":false,"currentAlertPresent":false,"connectionHeading":false});
+        let diagnostic: CoreFieldDiagnostic = serde_json::from_value(value.clone()).unwrap();
+        let ack = CoreDiagnostic {
+            core_index: 1,
+            step: CoreDiagnosticStep::SaveAcknowledged,
+            metadata: None,
+        };
+        assert!(
+            validate_core_field_diagnostic(
+                SavedDeliberationUiPhase::CoreReconfirmation,
+                Some(ack),
+                diagnostic
+            )
+            .is_ok()
+        );
+        for step in [
+            None,
+            Some(CoreDiagnostic {
+                core_index: 0,
+                ..ack
+            }),
+            Some(CoreDiagnostic {
+                step: CoreDiagnosticStep::SaveRequested,
+                ..ack
+            }),
+            Some(CoreDiagnostic {
+                step: CoreDiagnosticStep::FieldSettled,
+                ..ack
+            }),
+        ] {
+            assert!(
+                validate_core_field_diagnostic(
+                    SavedDeliberationUiPhase::CoreReconfirmation,
+                    step,
+                    diagnostic
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            validate_core_field_diagnostic(
+                SavedDeliberationUiPhase::ConsentReady,
+                Some(ack),
+                diagnostic
+            )
+            .is_err()
+        );
+        assert!(
+            validate_core_field_diagnostic(
+                SavedDeliberationUiPhase::CoreReconfirmation,
+                Some(ack),
+                CoreFieldDiagnostic {
+                    core_index: 3,
+                    ..diagnostic
+                }
+            )
+            .is_err()
+        );
+        for key in [
+            "capturedConnected",
+            "currentPresent",
+            "currentEqualsCaptured",
+            "capturedSaving",
+            "currentSaving",
+            "capturedStale",
+            "currentStale",
+            "selectDisabled",
+            "currentAlertPresent",
+            "connectionHeading",
+        ] {
+            let mut missing = value.clone();
+            missing.as_object_mut().unwrap().remove(key);
+            assert!(serde_json::from_value::<CoreFieldDiagnostic>(missing).is_err());
+            let mut wrong = value.clone();
+            wrong[key] = serde_json::json!("false");
+            assert!(serde_json::from_value::<CoreFieldDiagnostic>(wrong).is_err());
+        }
+        let mut extra = value;
+        extra["rawText"] = serde_json::json!("denied");
+        assert!(serde_json::from_value::<CoreFieldDiagnostic>(extra).is_err());
+    }
+}
+#[cfg(test)]
+mod connection_diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn core_read_metadata_is_closed_bounded_and_changes_without_step_regression() {
+        let metadata = CoreReadMetadata {
+            before_revision: 1,
+            expected_revision: 2,
+            after_revision: Some(1),
+            selection_state: CoreReadSelectionState::Stale,
+            revision_matches: false,
+            profile_matches: true,
+            profile_revision_matches: true,
+            model_ref_matches: true,
+        };
+        let first = CoreDiagnostic {
+            core_index: 1,
+            step: CoreDiagnosticStep::SaveReadReceived,
+            metadata: Some(metadata),
+        };
+        let changed = CoreDiagnostic {
+            metadata: Some(CoreReadMetadata {
+                after_revision: Some(2),
+                selection_state: CoreReadSelectionState::Selected,
+                revision_matches: true,
+                ..metadata
+            }),
+            ..first
+        };
+        let phase = SavedDeliberationUiPhase::CoreReconfirmation;
+        assert!(validate_core_diagnostic(phase, Some(first), changed).is_ok());
+        assert!(validate_core_diagnostic(phase, Some(changed), first).is_ok());
+        assert!(
+            validate_core_diagnostic(
+                phase,
+                None,
+                CoreDiagnostic {
+                    metadata: None,
+                    ..first
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            validate_core_diagnostic(
+                phase,
+                None,
+                CoreDiagnostic {
+                    metadata: Some(CoreReadMetadata {
+                        expected_revision: 3,
+                        ..metadata
+                    }),
+                    ..first
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            validate_core_diagnostic(
+                phase,
+                None,
+                CoreDiagnostic {
+                    metadata: Some(CoreReadMetadata {
+                        after_revision: Some(9_007_199_254_740_992),
+                        ..metadata
+                    }),
+                    ..first
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<CoreReadSelectionState>(serde_json::json!("ready")).is_err()
+        );
+        assert!(
+            serde_json::from_value::<CoreReadMetadata>(serde_json::json!({
+                "beforeRevision":1,"expectedRevision":2,"afterRevision":null,
+                "selectionState":"unknown","revisionMatches":false,"profileMatches":false,
+                "profileRevisionMatches":false,"modelRefMatches":false,"ready":true
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn closed_core_steps_reject_wrong_phase_index_and_backward_progress() {
+        let first = CoreDiagnostic {
+            core_index: 0,
+            step: CoreDiagnosticStep::SelectionRequested,
+            metadata: None,
+        };
+        let saved = CoreDiagnostic {
+            core_index: 0,
+            step: CoreDiagnosticStep::SaveAcknowledged,
+            metadata: None,
+        };
+        assert!(
+            validate_core_diagnostic(
+                SavedDeliberationUiPhase::CoreReconfirmation,
+                Some(first),
+                saved
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_core_diagnostic(
+                SavedDeliberationUiPhase::CoreReconfirmation,
+                Some(saved),
+                saved
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_core_diagnostic(
+                SavedDeliberationUiPhase::CoreReconfirmation,
+                Some(saved),
+                first
+            )
+            .is_err()
+        );
+        assert!(
+            validate_core_diagnostic(SavedDeliberationUiPhase::ConsentReady, None, first).is_err()
+        );
+        assert!(
+            validate_core_diagnostic(
+                SavedDeliberationUiPhase::CoreReconfirmation,
+                None,
+                CoreDiagnostic {
+                    core_index: 3,
+                    ..first
+                }
+            )
+            .is_err()
+        );
+        for value in [
+            serde_json::json!({"coreIndex":0,"step":"unknown"}),
+            serde_json::json!({"coreIndex":0,"step":"save_requested","ready":true}),
+        ] {
+            assert!(serde_json::from_value::<CoreDiagnostic>(value).is_err());
+        }
+    }
+
+    #[test]
+    fn closed_connection_steps_reject_unknown_fields_and_backward_progress() {
+        let first = ConnectionDiagnostic {
+            profile_index: 0,
+            step: ConnectionDiagnosticStep::SelectionRequested,
+        };
+        let confirmed = ConnectionDiagnostic {
+            profile_index: 0,
+            step: ConnectionDiagnosticStep::SelectionConfirmed,
+        };
+        assert!(
+            validate_connection_diagnostic(
+                SavedDeliberationUiPhase::ConnectionVerification,
+                Some(first),
+                confirmed
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_connection_diagnostic(
+                SavedDeliberationUiPhase::ConnectionVerification,
+                Some(confirmed),
+                confirmed
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_connection_diagnostic(
+                SavedDeliberationUiPhase::ConnectionVerification,
+                Some(confirmed),
+                first
+            )
+            .is_err()
+        );
+        assert!(
+            validate_connection_diagnostic(SavedDeliberationUiPhase::ConsentReady, None, first)
+                .is_err()
+        );
+        assert!(
+            validate_connection_diagnostic(
+                SavedDeliberationUiPhase::ConnectionVerification,
+                None,
+                ConnectionDiagnostic {
+                    profile_index: 3,
+                    ..first
+                }
+            )
+            .is_err()
+        );
+        for value in [
+            serde_json::json!({"profileIndex":0,"step":"unknown"}),
+            serde_json::json!({"profileIndex":0,"step":"selection_requested","ready":true}),
+            serde_json::json!({"profileIndex":-1,"step":"selection_requested"}),
+        ] {
+            assert!(serde_json::from_value::<ConnectionDiagnostic>(value).is_err());
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ConfirmationBlockReason {
+    None,
+    ActiveRun,
+    ProfileStore,
+    CoreConnection,
+    Roles,
+    Storage,
+    Disclosure,
+    Budget,
+    Unknown,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConfirmationDiagnostic {
+    checkbox_present: bool,
+    checkbox_disabled: bool,
+    heading_is_confirmation: bool,
+    block_reason_category: ConfirmationBlockReason,
+    destination_needs_check_count: u8,
+}
+fn validate_confirmation_diagnostic(
+    phase: SavedDeliberationUiPhase,
+    diagnostic: ConfirmationDiagnostic,
+) -> Result<(), String> {
+    if phase != SavedDeliberationUiPhase::ConsentReady
+        || diagnostic.destination_needs_check_count > 3
+        || (!diagnostic.checkbox_present && diagnostic.checkbox_disabled)
+    {
+        return Err("UI confirmation diagnostic fenced".into());
+    }
+    Ok(())
+}
+#[cfg(test)]
+mod confirmation_diagnostic_tests {
+    use super::*;
+    #[test]
+    fn confirmation_metadata_is_closed_and_phase_bounded() {
+        let value = serde_json::json!({"checkboxPresent":true,"checkboxDisabled":true,"headingIsConfirmation":true,"blockReasonCategory":"core_connection","destinationNeedsCheckCount":3});
+        let diagnostic: ConfirmationDiagnostic = serde_json::from_value(value.clone()).unwrap();
+        assert!(
+            validate_confirmation_diagnostic(SavedDeliberationUiPhase::ConsentReady, diagnostic)
+                .is_ok()
+        );
+        assert!(
+            validate_confirmation_diagnostic(SavedDeliberationUiPhase::StartReady, diagnostic)
+                .is_err()
+        );
+        assert!(
+            validate_confirmation_diagnostic(
+                SavedDeliberationUiPhase::ConsentReady,
+                ConfirmationDiagnostic {
+                    destination_needs_check_count: 4,
+                    ..diagnostic
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            validate_confirmation_diagnostic(
+                SavedDeliberationUiPhase::ConsentReady,
+                ConfirmationDiagnostic {
+                    checkbox_present: false,
+                    ..diagnostic
+                }
+            )
+            .is_err()
+        );
+        for (key, replacement) in [
+            ("blockReasonCategory", serde_json::json!("ready")),
+            ("unexpected", serde_json::json!(true)),
+        ] {
+            let mut invalid = value.clone();
+            invalid[key] = replacement;
+            assert!(serde_json::from_value::<ConfirmationDiagnostic>(invalid).is_err());
+        }
+    }
+}
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SavedDeliberationUiProgress {
+    nonce: String,
+    phase: SavedDeliberationUiPhase,
+    #[serde(default)]
+    connection_step: Option<ConnectionDiagnostic>,
+    #[serde(default)]
+    core_step: Option<CoreDiagnostic>,
+    #[serde(default)]
+    confirmation_diagnostic: Option<ConfirmationDiagnostic>,
+    #[serde(default)]
+    core_field_diagnostic: Option<CoreFieldDiagnostic>,
+}
+#[tauri::command]
+fn saved_deliberation_ui_progress(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, SavedDeliberationUiState>,
+    input: SavedDeliberationUiProgress,
+) -> Result<(), String> {
+    if window.label() != "main"
+        || state.nonce.lock().map_err(|_| "UI nonce lock")?.as_deref() != Some(input.nonce.as_str())
+        || state
+            .outcome
+            .lock()
+            .map_err(|_| "UI outcome lock")?
+            .is_some()
+    {
+        return Err("UI progress fenced".into());
+    }
+    let mut progress = state.progress.lock().map_err(|_| "UI progress lock")?;
+    if progress.is_some_and(|prior| input.phase < prior) {
+        return Err("UI progress cannot move backwards".into());
+    }
+    if let Some(next) = input.connection_step {
+        let mut step = state
+            .connection_step
+            .lock()
+            .map_err(|_| "UI connection diagnostic lock")?;
+        validate_connection_diagnostic(input.phase, *step, next)?;
+        if *step != Some(next) {
+            eprintln!(
+                "native actual UI connection: profile_index={}; step={:?}",
+                next.profile_index, next.step
+            );
+            *step = Some(next);
+        }
+    }
+    if let Some(next) = input.core_step {
+        let mut step = state
+            .core_step
+            .lock()
+            .map_err(|_| "UI core diagnostic lock")?;
+        validate_core_diagnostic(input.phase, *step, next)?;
+        if *step != Some(next) {
+            eprintln!(
+                "native actual UI core: core_index={}; step={:?}; metadata={:?}",
+                next.core_index, next.step, next.metadata
+            );
+            *step = Some(next);
+        }
+    }
+    if let Some(next) = input.core_field_diagnostic {
+        let step = *state
+            .core_step
+            .lock()
+            .map_err(|_| "UI core diagnostic lock")?;
+        validate_core_field_diagnostic(input.phase, step, next)?;
+        let mut previous = state
+            .core_field_diagnostic
+            .lock()
+            .map_err(|_| "UI core field diagnostic lock")?;
+        if *previous != Some(next) {
+            eprintln!("native actual UI core field: {:?}", next);
+            *previous = Some(next);
+        }
+    }
+    if let Some(next) = input.confirmation_diagnostic {
+        validate_confirmation_diagnostic(input.phase, next)?;
+        let mut previous = state
+            .confirmation_diagnostic
+            .lock()
+            .map_err(|_| "UI confirmation diagnostic lock")?;
+        if *previous != Some(next) {
+            eprintln!("native actual UI confirmation: {:?}", next);
+            *previous = Some(next);
+        }
+    }
+    if *progress != Some(input.phase) {
+        eprintln!("native actual UI phase: {:?}", input.phase);
+        *progress = Some(input.phase);
+    }
+    Ok(())
+}
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SavedDeliberationUiReport {
+    nonce: String,
+    failure: String,
+}
+#[tauri::command]
+fn saved_deliberation_ui_report(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, SavedDeliberationUiState>,
+    input: SavedDeliberationUiReport,
+) -> Result<(), String> {
+    if window.label() != "main"
+        || state.nonce.lock().map_err(|_| "UI nonce lock")?.as_deref() != Some(input.nonce.as_str())
+    {
+        return Err("UI report fenced".into());
+    }
+    let mut outcome = state.outcome.lock().map_err(|_| "UI outcome lock")?;
+    if outcome.is_some() {
+        return Err("UI report duplicate".into());
+    }
+    *outcome = Some({
+        let failure = input.failure;
+        let category = match failure.as_str() {
+            "physical_ui_bridge_ready"
+            | "physical_ui_document_ready"
+            | "physical_ui_new_deliberation"
+            | "physical_ui_question_writable"
+            | "physical_ui_connection_verification"
+            | "physical_ui_model_reconfirmation"
+            | "physical_ui_core_reconfirmation"
+            | "physical_ui_draft_restored"
+            | "physical_ui_sources_view"
+            | "physical_ui_native_picker"
+            | "physical_ui_capture_complete"
+            | "physical_ui_input_review"
+            | "physical_ui_consent_ready"
+            | "physical_ui_start_ready"
+            | "physical_ui_start_receipt" => failure.as_str(),
+            _ => "unknown_ui_action",
+        };
+        Err(format!("actual UI action failed: {category}"))
+    });
+    Ok(())
+}
+
+#[tauri::command]
+async fn start_deliberation(
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, commands::DesktopState>,
+    input: profiles::StartDeliberationInputDto,
+) -> Result<profiles::StartDeliberationReceiptDto, profiles::LiveRunError> {
+    let request = serde_json::to_value(&input);
+    let main_window = window.label() == "main";
+    let observed_nonce = if main_window {
+        let observer = app.state::<SavedDeliberationUiState>();
+        observer.nonce.lock().ok().and_then(|nonce| nonce.clone())
+    } else {
+        None
+    };
+    let result = profiles::start_deliberation(window, app.clone(), state, input).await;
+    if main_window && let Ok(receipt) = &result {
+        let observer = app.state::<SavedDeliberationUiState>();
+        if let (Ok(nonce), Ok(mut progress), Ok(mut outcome)) = (
+            observer.nonce.lock(),
+            observer.progress.lock(),
+            observer.outcome.lock(),
+        ) && observed_nonce.is_some()
+            && *nonce == observed_nonce
+            && *progress == Some(SavedDeliberationUiPhase::StartReady)
+            && outcome.is_none()
+        {
+            *outcome = Some(match (request, serde_json::to_value(receipt)) {
+                (Ok(mut request), Ok(receipt)) => {
+                    if let Some(object) = request.as_object_mut() {
+                        object.remove("admissionAuthority");
+                    }
+                    *progress = Some(SavedDeliberationUiPhase::StartReceipt);
+                    eprintln!("native actual UI phase: StartReceipt");
+                    Ok(serde_json::json!({"receipt":receipt,"request":request}))
+                }
+                _ => Err("actual UI receipt observation unavailable".into()),
+            });
+        }
+    }
+    result
+}
+
+#[cfg(test)]
+mod saved_ui_report_contract_tests {
+    use super::SavedDeliberationUiReport;
+
+    #[test]
+    fn renderer_can_report_failure_but_cannot_supply_execution_receipt() {
+        assert!(
+            serde_json::from_value::<SavedDeliberationUiReport>(
+                serde_json::json!({"nonce":"observed","failure":"physical_ui_start_ready"})
+            )
+            .is_ok()
+        );
+        for forged in [
+            serde_json::json!({"nonce":"observed","receipt":{"runId":"forged"},"request":{}}),
+            serde_json::json!({"nonce":"observed","failure":"physical_ui_start_ready","receipt":{"runId":"forged"}}),
+            serde_json::json!({"nonce":"observed","failure":null}),
+        ] {
+            assert!(serde_json::from_value::<SavedDeliberationUiReport>(forged).is_err());
+        }
+    }
+}
+
+fn physical_probe_bundle_identifier() -> Result<String, String> {
+    let executable = std::env::current_exe()
+        .and_then(|path| path.canonicalize())
+        .map_err(|_| "physical probe executable unavailable")?;
+    let macos = executable
+        .parent()
+        .ok_or("physical probe executable parent missing")?;
+    let contents = macos.parent().ok_or("physical probe contents missing")?;
+    let bundle = contents.parent().ok_or("physical probe bundle missing")?;
+    if macos.file_name() != Some(std::ffi::OsStr::new("MacOS"))
+        || contents.file_name() != Some(std::ffi::OsStr::new("Contents"))
+        || bundle.extension() != Some(std::ffi::OsStr::new("app"))
+    {
+        return Err("physical probe requires its packaged application host".into());
+    }
+    read_physical_probe_identifier(&contents.join("Info.plist"))
+}
+
+fn read_physical_probe_identifier(path: &Path) -> Result<String, String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|_| "physical probe bundle metadata unavailable")?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| "physical probe bundle metadata unavailable")?;
+    if !metadata.is_file() || metadata.len() > 64 * 1024 {
+        return Err("physical probe bundle metadata invalid".into());
+    }
+    let mut bytes = Vec::new();
+    file.take(64 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "physical probe bundle metadata unreadable")?;
+    parse_physical_probe_identifier(&bytes)
+}
+
+fn parse_physical_probe_identifier(bytes: &[u8]) -> Result<String, String> {
+    if bytes.len() > 64 * 1024 {
+        return Err("physical probe bundle metadata oversized".into());
+    }
+    let value = plist::Value::from_reader(std::io::Cursor::new(bytes))
+        .map_err(|_| "physical probe bundle metadata malformed")?;
+    let identifier = value
+        .as_dictionary()
+        .and_then(|dictionary| dictionary.get("CFBundleIdentifier"))
+        .and_then(plist::Value::as_string)
+        .ok_or("physical probe bundle identifier unavailable")?;
+    if identifier != "local.magi.installed.probe" {
+        return Err("physical probe bundle identity mismatch".into());
+    }
+    Ok(identifier.into())
+}
+
+#[cfg(test)]
+mod physical_probe_identity_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_binary_and_xml_identity_fail_closed_for_invalid_or_nonregular_inputs() {
+        struct OwnedRoot(PathBuf);
+        impl Drop for OwnedRoot {
+            fn drop(&mut self) {
+                if let Err(error) = std::fs::remove_dir_all(&self.0) {
+                    if std::thread::panicking() {
+                        eprintln!("Owned bundle identity fixture cleanup failed: {error}");
+                    } else {
+                        panic!("Owned bundle identity fixture cleanup failed: {error}");
+                    }
+                }
+            }
+        }
+        let path =
+            std::env::temp_dir().join(format!("magi-bundle-identity-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&path).unwrap();
+        let root = OwnedRoot(path);
+        let path = root.0.join("Info.plist");
+        let mut dictionary = plist::Dictionary::new();
+        dictionary.insert(
+            "CFBundleIdentifier".into(),
+            plist::Value::String("local.magi.installed.probe".into()),
+        );
+        let value = plist::Value::Dictionary(dictionary);
+        let mut binary = Vec::new();
+        value.to_writer_binary(&mut binary).unwrap();
+        let mut xml = Vec::new();
+        value.to_writer_xml(&mut xml).unwrap();
+        for bytes in [binary, xml] {
+            std::fs::write(&path, bytes).unwrap();
+            assert_eq!(
+                read_physical_probe_identifier(&path).unwrap(),
+                "local.magi.installed.probe"
+            );
+        }
+        let mut wrong = plist::Dictionary::new();
+        wrong.insert(
+            "CFBundleIdentifier".into(),
+            plist::Value::String("other.application".into()),
+        );
+        let mut bytes = Vec::new();
+        plist::Value::Dictionary(wrong)
+            .to_writer_xml(&mut bytes)
+            .unwrap();
+        assert!(parse_physical_probe_identifier(&bytes).is_err());
+        let mut wrong_type = plist::Dictionary::new();
+        wrong_type.insert("CFBundleIdentifier".into(), plist::Value::Boolean(true));
+        let mut wrong_type_bytes = Vec::new();
+        plist::Value::Dictionary(wrong_type)
+            .to_writer_binary(&mut wrong_type_bytes)
+            .unwrap();
+        assert!(parse_physical_probe_identifier(&wrong_type_bytes).is_err());
+        assert!(parse_physical_probe_identifier(b"malformed").is_err());
+        assert!(parse_physical_probe_identifier(&vec![b'x'; 64 * 1024 + 1]).is_err());
+        std::fs::write(&path, vec![b'x'; 64 * 1024 + 1]).unwrap();
+        assert!(read_physical_probe_identifier(&path).is_err());
+        assert!(read_physical_probe_identifier(&root.0).is_err());
+        let link = root.0.join("symlink.plist");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(read_physical_probe_identifier(&link).is_err());
+    }
+}
+
 fn prepare_saved_profile_run_store() -> Result<(), String> {
     let source = PathBuf::from(
         std::env::var_os("MAGI_TEST_SAVED_PROFILE_SOURCE_ROOT")
@@ -1685,7 +2813,16 @@ fn prepare_saved_profile_run_store_at(
     Ok(())
 }
 
-fn main() {
+pub(crate) fn run() {
+    if std::env::args().nth(1).as_deref() == Some("--prepare-retained-saved-profile-backup") {
+        assert_eq!(
+            std::env::args().count(),
+            2,
+            "closed backup preparation arguments required"
+        );
+        prepare_retained_saved_profile_backup().expect("retained backup preparation failed");
+        return;
+    }
     if std::env::args().nth(1).as_deref() == Some("--prepare-saved-profile-run-store") {
         assert_eq!(
             std::env::args().count(),
@@ -1835,7 +2972,7 @@ fn main() {
         );
     }
     let root = root.canonicalize().expect("canonical disposable data root");
-    let mut context = tauri::generate_context!();
+    let mut context = crate::desktop::product_context();
     if purpose == ProbePurpose::RecoveryCancel {
         assert!(
             std::env::var_os("MAGI_TEST_FRONTEND_MODE").is_none(),
@@ -1872,7 +3009,18 @@ fn main() {
             }
         }
     }
-    context.config_mut().identifier = format!("local.magi.probe.p{}", std::process::id());
+    context.config_mut().identifier = if std::env::var("MAGI_TEST_ACTUAL_DOM_START").ok().as_deref()
+        == Some("1")
+    {
+        assert_eq!(
+            purpose,
+            ProbePurpose::SavedProfileDeliberation,
+            "physical start requires saved-profile purpose"
+        );
+        physical_probe_bundle_identifier().expect("physical probe packaged host identity required")
+    } else {
+        format!("local.magi.probe.p{}", std::process::id())
+    };
     context.config_mut().app.app_directories_override = Some(
         tauri::utils::config::AppDirectoriesOverride::Root(root.clone()),
     );
@@ -1887,67 +3035,43 @@ fn main() {
     });
     let setup_monitor = monitor.clone();
     let app = tauri::Builder::default()
+        .plugin(
+            tauri_plugin_updater::Builder::new()
+                .pubkey(crate::release::updater_public_key())
+                .build(),
+        )
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![
-            pdf_ui_probe_report,
-            connections_ui_probe_report,
-            crate::pdf_capture::prepare_pdf_range_capture,
-            crate::pdf_capture::apply_pdf_range_capture,
-            crate::pdf_capture::discard_pdf_range_capture,
-            get_console_snapshot,
-            crate::commands::load_run_dossier,
-            crate::commands::select_context_files,
-            crate::commands::select_context_directory,
-            crate::preferences::get_console_preferences,
-            crate::preferences::save_console_preferences,
-            crate::commands::shell_context,
-            crate::commands::shell_open_console,
-            crate::commands::shell_open_settings,
-            crate::commands::shell_close_companion,
-            crate::commands::shell_request_exit,
-            crate::commands::shell_confirm_exit,
-            crate::profiles::list_recent_runs,
-            crate::profiles::list_acp_adapters,
-            crate::profiles::list_provider_profiles,
-            crate::profiles::list_provider_source_scopes,
-            crate::profiles::pick_provider_source_directory,
-            crate::profiles::add_provider_source_scope,
-            crate::profiles::revoke_provider_source_scope,
-            crate::profiles::load_active_provider_profile_selection,
-            crate::profiles::save_provider_profile,
-            crate::profiles::set_active_provider_profile,
-            crate::profiles::validate_provider_profile,
-            crate::profiles::authenticate_provider_profile,
-            crate::profiles::cancel_provider_authentication,
-            crate::profiles::refresh_provider_model_catalog,
-            crate::profiles::load_provider_catalog,
-            crate::profiles::refresh_provider_catalog,
-            crate::profiles::select_provider_model,
-            crate::profiles::load_core_model_selections,
-            crate::profiles::load_core_execution_witnesses,
-            crate::profiles::select_core_model,
-            crate::profiles::register_deliberation_request,
-            crate::profiles::register_clarification_request,
-            crate::profiles::start_clarification,
-            crate::profiles::cancel_clarification_request,
-            crate::profiles::start_deliberation,
-            crate::profiles::load_run_clarification,
-            crate::commands::create_clarification_draft,
-            crate::commands::load_clarification_draft,
-            crate::commands::list_clarification_drafts,
-            crate::commands::save_clarification_question,
-            crate::commands::discard_clarification_draft,
-            crate::profiles::start_live_run,
-            crate::profiles::get_live_run_snapshot,
-            crate::profiles::cancel_live_run,
-            crate::profiles::cancel_deliberation,
-            crate::profiles::cancel_deliberation_request,
-            crate::profiles::list_role_presets,
-            crate::profiles::load_active_role_preset_selection,
-            crate::profiles::set_active_role_preset,
-            crate::profiles::clone_role_preset,
-            crate::profiles::save_role_preset
-        ])
+        .on_page_load(|webview, payload| {
+            if webview.label() == "main" {
+                let url = payload.url();
+                let owned_debug_origin = url.scheme() == "http"
+                    && url.host_str() == Some("127.0.0.1")
+                    && url.port_or_known_default() == Some(1427);
+                eprintln!(
+                    "native main page load: event={:?}; owned_debug_origin={owned_debug_origin}",
+                    payload.event()
+                );
+            }
+        })
+        .invoke_handler({
+            let start_handler: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool =
+                tauri::generate_handler![start_deliberation];
+            let product_handler: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool =
+                crate::desktop::product_invoke_handler!(
+                    get_console_snapshot,
+                    pdf_ui_probe_report,
+                    connections_ui_probe_report,
+                    saved_deliberation_ui_progress,
+                    saved_deliberation_ui_report,
+                );
+            move |invoke: tauri::ipc::Invoke<tauri::Wry>| {
+                if invoke.message.command() == "start_deliberation" {
+                    start_handler(invoke)
+                } else {
+                    product_handler(invoke)
+                }
+            }
+        })
         .setup(move |app| {
             setup_monitor.mark("setup");
             app.manage(saved_input.clone());
@@ -1963,6 +3087,7 @@ fn main() {
                 },
             );
             app.manage(PdfUiProbeState::default());
+            app.manage(SavedDeliberationUiState::default());
             app.manage(ConnectionsUiState {
                 enabled: purpose == ProbePurpose::ConnectionsUi,
                 ..ConnectionsUiState::default()
@@ -2329,131 +3454,289 @@ async fn probe(
         .ok_or("factory role missing")?;
     let command_id = uuid::Uuid::new_v4().to_string();
     monitor.ensure_running()?;
-    monitor.mark("capturing_sources");
-    let draft_id = uuid::Uuid::new_v4().to_string();
-    let capture_storage = storage.clone();
-    let capture_draft = draft_id.clone();
-    let expected_source_digest = std::env::var("MAGI_TEST_POLICY_SOURCE_DIGEST")
-        .map_err(|_| "explicit approved canonical source digest required")?;
-    if expected_source_digest.len() != 64
-        || !expected_source_digest
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit())
+    let physical = std::env::var("MAGI_TEST_ACTUAL_DOM_START").ok().as_deref() == Some("1");
+    if physical && purpose != ProbePurpose::SavedProfileDeliberation {
+        return Err("physical start requires saved-profile purpose".into());
+    }
+    #[derive(serde::Serialize, PartialEq, Eq)]
+    #[serde(rename_all = "kebab-case")]
+    enum PhysicalSourceMode {
+        File,
+        QuestionOnly,
+    }
+    let source_mode = match std::env::var("MAGI_TEST_PHYSICAL_SOURCE_MODE") {
+        Err(std::env::VarError::NotPresent) => PhysicalSourceMode::File,
+        Ok(value) if value == "file" => PhysicalSourceMode::File,
+        Ok(value) if value == "question-only" && physical => PhysicalSourceMode::QuestionOnly,
+        _ => return Err("invalid explicit physical source mode".into()),
+    };
+    let (draft_id, context_revision, expected_source_digest) = if source_mode
+        == PhysicalSourceMode::File
     {
-        return Err("invalid approved canonical source digest".into());
-    }
-    let capture_lease = monitor
-        .lifecycle
-        .lease()
-        .map_err(|_| "source capture revoked")?;
-    let capture_operation = app
-        .state::<commands::DesktopState>()
-        .resource_coordinator
-        .enter(Some(monitor.lifecycle.verification.clone()))
-        .map_err(|_| "source capture resources frozen")?;
-    let approved_digest = expected_source_digest.clone();
-    let resource_root = app
-        .path()
-        .resource_dir()
-        .map_err(|_| "source capture resources")?;
-    let captured = tauri::async_runtime::spawn_blocking(move || {
-        let _capture_lease = capture_lease;
-        let _capture_operation = capture_operation;
-        _capture_operation
-            .check()
-            .map_err(|_| "source capture resources frozen".to_owned())?;
-        let approved_source = verified_policy_resource(&resource_root, &expected_source_digest)
-            .map_err(str::to_owned)?;
-        commands::capture_context_files(
-            capture_storage,
-            capture_draft,
-            None,
-            vec![approved_source],
-            &resource_root,
-        )
-    })
-    .await
-    .map_err(|_| "source capture worker")??;
-    monitor.ensure_running()?;
-    let captured = serde_json::to_value(captured).map_err(|_| "source capture summary")?;
-    if captured["sources"].as_array().map(Vec::len) != Some(1)
-        || captured["sources"][0]["status"] != "captured"
-        || captured["sources"][0]["digest"].as_str() != Some(approved_digest.as_str())
-    {
-        return Err("the approved canonical source was not fully captured".into());
-    }
-    let context_revision = captured["revision"]
-        .as_u64()
-        .ok_or("source capture revision")?;
-    let draft = storage
-        .load_context_draft(&draft_id)
-        .map_err(|_| "source capture durable read")?
-        .ok_or("source capture durable draft missing")?;
-    let source = draft
-        .manifest
-        .content
-        .sources
-        .first()
-        .ok_or("source capture durable entry missing")?;
-    if draft.revision != context_revision
-        || draft.manifest.content.sources.len() != 1
-        || source
-            .object_digest
-            .as_ref()
-            .map(magi_domain::Digest::as_str)
-            != captured["sources"][0]["digest"].as_str()
-        || source.included_locators.is_empty()
-    {
-        return Err("source capture durable authority mismatch".into());
-    }
-    let capture_evidence = serde_json::json!({"capture":captured,"canonicalSourceDigest":source.object_digest,"manifestDigest":draft.manifest.digest,"includedLocators":source.included_locators});
-    std::fs::write(
-        root.join("approved-policy-source-capture.json"),
-        serde_json::to_vec_pretty(&capture_evidence)
-            .map_err(|_| "source capture evidence encoding")?,
-    )
-    .map_err(|_| "source capture evidence")?;
-    let question = "Using only the explicitly captured product security contract, produce the confirmation checklist for this desktop product before a saved subscription profile sends an approved source representation to its selected external provider. Identify the fields that must be disclosed and the changes that require reconfirmation. The captured contract already defines the decision scope: do not request additional user data, do not infer facts outside the source, and record unknown provider retention, training, deletion, or cancellation behavior as a non-essential limitation of the policy. Return a complete policy decision grounded in the approved source so the review can proceed to cross-review, synthesis, and private ballots.";
-    let mut request = serde_json::json!({"commandId":command_id,"idempotencyKey":command_id,"question":question,"contextDraftId":draft_id,"contextRevision":context_revision,"coreBindings":core_bindings,"rolePresetId":role.preset_id,"roleRevision":role.revision,"disclosureConfirmed":true});
-    monitor.ensure_running()?;
-    *monitor.active_request.lock().map_err(|_| "request reference lock")? = Some(serde_json::from_value(serde_json::json!({"request":request,"commandId":uuid::Uuid::new_v4().to_string(),"idempotencyKey":uuid::Uuid::new_v4().to_string()})).map_err(|_| "cancellation intent encoding")?);
-    let registration = profiles::register_deliberation_request_inner(
-        window.clone(),
-        app.clone(),
-        app.state(),
-        serde_json::from_value(request.clone()).map_err(|_| "registration request encoding")?,
-        Some(&monitor.lifecycle),
-    )
-    .await
-    .map_err(|_| "request registration")?;
-    monitor.ensure_running()?;
-    let registration = serde_json::to_value(registration).map_err(|_| "registration output")?;
-    if registration["kind"] != "registered" {
-        return Err("fresh probe request unexpectedly replayed".into());
-    }
-    let authority = &registration["admissionAuthority"];
-    request["admissionAuthority"] =
-        serde_json::json!({"token":authority["token"],"processEpoch":authority["processEpoch"]});
-    let input =
-        serde_json::from_value(request.clone()).map_err(|_| "deliberation input encoding")?;
-    request
-        .as_object_mut()
-        .ok_or("request object")?
-        .remove("admissionAuthority");
-    if let Some(reference) = monitor
-        .active_request
-        .lock()
-        .map_err(|_| "request reference lock")?
-        .as_mut()
-    {
-        reference.admission_authority = Some(serde_json::from_value(serde_json::json!({"token":authority["token"],"processEpoch":authority["processEpoch"]})).map_err(|_| "cancellation authority encoding")?);
-    }
-    monitor.ensure_running()?;
-    monitor.mark_verified(app, "admitting", &root);
-    let receipt = profiles::start_deliberation(window.clone(), app.clone(), app.state(), input)
+        monitor.mark("capturing_sources");
+        let draft_id = uuid::Uuid::new_v4().to_string();
+        let capture_storage = storage.clone();
+        let capture_draft = draft_id.clone();
+        let expected_source_digest = std::env::var("MAGI_TEST_POLICY_SOURCE_DIGEST")
+            .map_err(|_| "explicit approved canonical source digest required")?;
+        if expected_source_digest.len() != 64
+            || !expected_source_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err("invalid approved canonical source digest".into());
+        }
+        let capture_lease = monitor
+            .lifecycle
+            .lease()
+            .map_err(|_| "source capture revoked")?;
+        let capture_operation = app
+            .state::<commands::DesktopState>()
+            .resource_coordinator
+            .enter(Some(monitor.lifecycle.verification.clone()))
+            .map_err(|_| "source capture resources frozen")?;
+        let approved_digest = expected_source_digest.clone();
+        let resource_root = app
+            .path()
+            .resource_dir()
+            .map_err(|_| "source capture resources")?;
+        let capture_digest = expected_source_digest.clone();
+        let captured = tauri::async_runtime::spawn_blocking(move || {
+            let _capture_lease = capture_lease;
+            let _capture_operation = capture_operation;
+            _capture_operation
+                .check()
+                .map_err(|_| "source capture resources frozen".to_owned())?;
+            let approved_source =
+                verified_policy_resource(&resource_root, &capture_digest).map_err(str::to_owned)?;
+            commands::capture_context_files(
+                capture_storage,
+                capture_draft,
+                None,
+                vec![approved_source],
+                &resource_root,
+            )
+        })
         .await
-        .map_err(|e| format!("admission: {e:?}"))?;
-    let receipt = serde_json::to_value(receipt).map_err(|_| "admission receipt")?;
+        .map_err(|_| "source capture worker")??;
+        monitor.ensure_running()?;
+        let captured = serde_json::to_value(captured).map_err(|_| "source capture summary")?;
+        if captured["sources"].as_array().map(Vec::len) != Some(1)
+            || captured["sources"][0]["status"] != "captured"
+            || captured["sources"][0]["digest"].as_str() != Some(approved_digest.as_str())
+        {
+            return Err("the approved canonical source was not fully captured".into());
+        }
+        let context_revision = captured["revision"]
+            .as_u64()
+            .ok_or("source capture revision")?;
+        let draft = storage
+            .load_context_draft(&draft_id)
+            .map_err(|_| "source capture durable read")?
+            .ok_or("source capture durable draft missing")?;
+        let source = draft
+            .manifest
+            .content
+            .sources
+            .first()
+            .ok_or("source capture durable entry missing")?;
+        if draft.revision != context_revision
+            || draft.manifest.content.sources.len() != 1
+            || source
+                .object_digest
+                .as_ref()
+                .map(magi_domain::Digest::as_str)
+                != captured["sources"][0]["digest"].as_str()
+            || source.included_locators.is_empty()
+        {
+            return Err("source capture durable authority mismatch".into());
+        }
+        let capture_evidence = serde_json::json!({"capture":captured,"canonicalSourceDigest":source.object_digest,"manifestDigest":draft.manifest.digest,"includedLocators":source.included_locators});
+        std::fs::write(
+            root.join("approved-policy-source-capture.json"),
+            serde_json::to_vec_pretty(&capture_evidence)
+                .map_err(|_| "source capture evidence encoding")?,
+        )
+        .map_err(|_| "source capture evidence")?;
+        (
+            Some(draft_id),
+            Some(context_revision),
+            Some(expected_source_digest),
+        )
+    } else {
+        monitor.mark("question_only_no_capture");
+        (None, None, None)
+    };
+    let policy_question = "Using only the explicitly captured product security contract, produce the confirmation checklist for this desktop product before a saved subscription profile sends an approved source representation to its selected external provider. Identify the fields that must be disclosed and the changes that require reconfirmation. The captured contract already defines the decision scope: do not request additional user data, do not infer facts outside the source, and record unknown provider retention, training, deletion, or cancellation behavior as a non-essential limitation of the policy. Return a complete policy decision grounded in the approved source so the review can proceed to cross-review, synthesis, and private ballots.";
+    let question = if source_mode == PhysicalSourceMode::File {
+        policy_question
+    } else {
+        "Decide whether a small desktop team should adopt a weekly 30-minute internal retrospective for the next four weeks. The team has three engineers, works remotely, has no contractual meeting requirement, and can reserve this time within its existing schedule at no additional cost. Compare adopting the retrospective with keeping the current asynchronous weekly written updates. Evaluate coordination value, interruption cost, and reversibility. Recommend one complete decision, specify a four-week success criterion and a stop condition, and give each viewpoint enough information for cross-review, synthesis, and private ballots. All facts needed for this decision are stated here; no files, external research, or additional user information are required."
+    };
+    let receipt = if physical {
+        commands::focus_main_window(app).map_err(|_| "physical console restoration failed")?;
+        if !window
+            .is_visible()
+            .map_err(|_| "physical console visibility unavailable")?
+        {
+            return Err("physical console is not visible".into());
+        }
+        let state = app.state::<SavedDeliberationUiState>();
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        *state.nonce.lock().map_err(|_| "UI nonce lock")? = Some(nonce.clone());
+        let config = serde_json::to_string(
+            &serde_json::json!({"nonce":nonce,"question":question,"sourceMode":source_mode,"selections":observed_selections}),
+        )
+        .map_err(|_| "UI config encoding")?;
+        window
+            .eval(format!(
+                "window.__MAGI_SAVED_UI_CONFIG={config};\n{}",
+                include_str!("../native/saved-deliberation-ui-probe.js")
+            ))
+            .map_err(|_| "UI script")?;
+        monitor.mark("physical_ui_confirmation");
+        let deadline = Instant::now() + Duration::from_secs(300);
+        let observed = loop {
+            monitor.ensure_running()?;
+            if let Some(outcome) = state.outcome.lock().map_err(|_| "UI outcome lock")?.take() {
+                break outcome?;
+            }
+            if Instant::now() >= deadline {
+                return Err("actual UI start deadline".into());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        *state.nonce.lock().map_err(|_| "UI nonce lock")? = None;
+        let request = observed["request"].clone();
+        if request["question"] != question || request["disclosureConfirmed"] != true {
+            return Err("actual UI admitted input differs from reviewed saved selections".into());
+        }
+        let mut current_bindings = Vec::new();
+        for original in &core_bindings {
+            let core = storage
+                .load_core_model_selection(original.core_id)
+                .map_err(|_| "UI current core authority")?
+                .ok_or("UI current core missing")?;
+            let model = storage
+                .load_provider_model_selection(&original.provider_profile_id)
+                .map_err(|_| "UI current model authority")?
+                .ok_or("UI current model missing")?;
+            let fixed = observed_selections
+                .iter()
+                .find(|choice| {
+                    choice["coreId"] == serde_json::to_value(original.core_id).unwrap_or_default()
+                })
+                .ok_or("UI fixed selection missing")?;
+            if core.provider_profile_id != original.provider_profile_id
+                || core.profile_revision != original.profile_revision
+                || core.model_selection_revision != model.selection_revision
+                || model.binding.profile_revision != original.profile_revision
+                || serde_json::to_value(&model.binding.model_id).map_err(|_| "UI model encoding")?
+                    != fixed["modelId"]
+                || serde_json::to_value(&model.binding.mode_id).map_err(|_| "UI mode encoding")?
+                    != fixed["modeId"]
+                || serde_json::to_value(&model.binding.artifact_set_digest)
+                    .map_err(|_| "UI artifact encoding")?
+                    != fixed["artifactSetDigest"]
+                || serde_json::to_value(&model.binding.adapter_digest)
+                    .map_err(|_| "UI executable encoding")?
+                    != fixed["acpExecutableSha256"]
+            {
+                return Err("UI changed fixed saved execution identity".into());
+            }
+            current_bindings.push(magi_storage::CoreBindingReference {
+                core_id: core.core_id,
+                provider_profile_id: core.provider_profile_id,
+                profile_revision: core.profile_revision,
+                model_selection_revision: core.model_selection_revision,
+                core_selection_revision: core.selection_revision,
+            });
+        }
+        if request["coreBindings"]
+            != serde_json::to_value(&current_bindings).map_err(|_| "UI binding encoding")?
+        {
+            return Err("UI bindings differ from authoritative current selections".into());
+        }
+        let current_witnesses = profiles::load_core_execution_witnesses(
+            window.clone(),
+            app.state(),
+            serde_json::from_value(serde_json::json!({"coreBindings":current_bindings}))
+                .map_err(|_| "UI witness input")?,
+        )
+        .map_err(|_| "UI fresh execution authority missing")?;
+        std::fs::write(
+            root.join("physical-ui-current-witnesses.json"),
+            serde_json::to_vec_pretty(&current_witnesses).map_err(|_| "UI witness encoding")?,
+        )
+        .map_err(|_| "UI witness output")?;
+        core_bindings = current_bindings;
+        if source_mode == PhysicalSourceMode::QuestionOnly {
+            if !request["contextDraftId"].is_null() || !request["contextRevision"].is_null() {
+                return Err("question-only UI unexpectedly supplied captured context".into());
+            }
+        } else {
+            let actual_draft = storage
+                .load_context_draft(
+                    request["contextDraftId"]
+                        .as_str()
+                        .ok_or("UI capture identity missing")?,
+                )
+                .map_err(|_| "UI capture reload")?
+                .ok_or("UI capture missing")?;
+            if Some(actual_draft.revision) != request["contextRevision"].as_u64()
+                || actual_draft.manifest.content.sources.len() != 1
+                || actual_draft.manifest.content.sources[0]
+                    .object_digest
+                    .as_ref()
+                    .map(magi_domain::Digest::as_str)
+                    != expected_source_digest.as_deref()
+            {
+                return Err("actual UI source differs from approved policy".into());
+            }
+        }
+        *monitor.active_request.lock().map_err(|_|"request reference lock")?=Some(serde_json::from_value(serde_json::json!({"request":request,"commandId":uuid::Uuid::new_v4().to_string(),"idempotencyKey":uuid::Uuid::new_v4().to_string()})).map_err(|_|"UI cancellation intent")?);
+        observed["receipt"].clone()
+    } else {
+        let mut request = serde_json::json!({"commandId":command_id,"idempotencyKey":command_id,"question":question,"contextDraftId":draft_id,"contextRevision":context_revision,"coreBindings":core_bindings,"rolePresetId":role.preset_id,"roleRevision":role.revision,"disclosureConfirmed":true});
+        monitor.ensure_running()?;
+        *monitor.active_request.lock().map_err(|_| "request reference lock")? = Some(serde_json::from_value(serde_json::json!({"request":request,"commandId":uuid::Uuid::new_v4().to_string(),"idempotencyKey":uuid::Uuid::new_v4().to_string()})).map_err(|_| "cancellation intent encoding")?);
+        let registration = profiles::register_deliberation_request_inner(
+            window.clone(),
+            app.clone(),
+            app.state(),
+            serde_json::from_value(request.clone()).map_err(|_| "registration request encoding")?,
+            Some(&monitor.lifecycle),
+        )
+        .await
+        .map_err(|_| "request registration")?;
+        monitor.ensure_running()?;
+        let registration = serde_json::to_value(registration).map_err(|_| "registration output")?;
+        if registration["kind"] != "registered" {
+            return Err("fresh probe request unexpectedly replayed".into());
+        }
+        let authority = &registration["admissionAuthority"];
+        request["admissionAuthority"] = serde_json::json!({"token":authority["token"],"processEpoch":authority["processEpoch"]});
+        let input =
+            serde_json::from_value(request.clone()).map_err(|_| "deliberation input encoding")?;
+        request
+            .as_object_mut()
+            .ok_or("request object")?
+            .remove("admissionAuthority");
+        if let Some(reference) = monitor
+            .active_request
+            .lock()
+            .map_err(|_| "request reference lock")?
+            .as_mut()
+        {
+            reference.admission_authority = Some(serde_json::from_value(serde_json::json!({"token":authority["token"],"processEpoch":authority["processEpoch"]})).map_err(|_| "cancellation authority encoding")?);
+        }
+        monitor.ensure_running()?;
+        monitor.mark_verified(app, "admitting", &root);
+        let receipt = profiles::start_deliberation(window.clone(), app.clone(), app.state(), input)
+            .await
+            .map_err(|e| format!("admission: {e:?}"))?;
+        serde_json::to_value(receipt).map_err(|_| "admission receipt")?
+    };
     let run_id = receipt["runId"].as_str().ok_or("run id missing")?;
     std::fs::write(root.join("admission.json"), serde_json::to_vec_pretty(&serde_json::json!({"runId":run_id,"observedSelections":observed_selections,"coreBindings":core_bindings})).map_err(|_| "admission evidence encoding")?).map_err(|_| "admission evidence output")?;
     eprintln!("native live probe: production deliberation admitted; run {run_id}");
@@ -2463,6 +3746,22 @@ async fn probe(
         let dossier = storage
             .load_run_dossier(run_id)
             .map_err(|_| "durable dossier read")?;
+        if source_mode == PhysicalSourceMode::QuestionOnly
+            && (dossier.capture_manifest.is_some()
+                || !dossier.snapshot.input.context_manifest.sources.is_empty()
+                || dossier.snapshot.input.common_context_budget.is_none()
+                || dossier
+                    .snapshot
+                    .input
+                    .request_provenance
+                    .as_ref()
+                    .is_none_or(|provenance| {
+                        provenance.context_draft_id.is_some()
+                            || provenance.context_revision.is_some()
+                    }))
+        {
+            return Err("question-only durable source or budget authority mismatch".into());
+        }
         if dossier.snapshot.submitted_ballot_count < 3
             && dossier.snapshot.ballots_revealed.is_some()
         {
@@ -4191,6 +5490,38 @@ mod saved_activation_tests {
             bindings,
         };
         (storage, input)
+    }
+
+    #[test]
+    fn retained_backup_copies_coherently_without_mutating_original() {
+        let root = std::env::temp_dir().join(format!(
+            "magi-retained-backup-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let _owned = OwnedPreparationPath {
+            path: root.clone(),
+            keep: false,
+        };
+        let retained = root.join("retained");
+        let (storage, _input) = saved_profile_fixture(&retained);
+        drop(storage);
+        let before = std::fs::read(retained.join("state/magi.sqlite")).unwrap();
+        let copy = root.join("copy");
+        let backup = root.join("backup");
+        prepare_retained_saved_profile_backup_at(retained.clone(), copy.clone(), backup.clone())
+            .unwrap();
+        assert!(!copy.exists());
+        assert_eq!(
+            std::fs::read(retained.join("state/magi.sqlite")).unwrap(),
+            before
+        );
+        let manifest: magi_storage::BackupManifest =
+            serde_json::from_slice(&std::fs::read(backup.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest.schema_version, 18);
+        let restored = Storage::restore_backup(&backup, &root.join("verified-restored")).unwrap();
+        assert_eq!(restored.store_id, manifest.store_id);
+        assert!(prepare_retained_saved_profile_backup_at(retained, copy, backup).is_err());
     }
 
     #[test]

@@ -13,12 +13,10 @@ use std::{
     sync::{
         Mutex, OnceLock,
         atomic::{AtomicUsize, Ordering},
-        mpsc,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Manager, State, WebviewWindow};
-use tauri_plugin_dialog::DialogExt;
 
 const TOKEN_TTL: Duration = Duration::from_secs(600);
 const MAX_PENDING: usize = 4;
@@ -216,23 +214,26 @@ pub(crate) async fn prepare_pdf_range_capture(
     let storage = state.storage()?;
     let draft_id = draft_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     check_revision(&storage, &draft_id, context_revision)?;
-    let (sender, receiver) = mpsc::sync_channel(1);
-    app.dialog()
-        .file()
-        .add_filter("PDF", &["pdf"])
-        .pick_file(move |path| {
-            let _ = sender.send(path);
-        });
-    let selected = tauri::async_runtime::spawn_blocking(move || receiver.recv())
-        .await
-        .map_err(|_| "The PDF selection could not be processed safely.")?
-        .map_err(|_| "The PDF selection could not be processed safely.")?;
-    let Some(selected) = selected else {
-        return Ok(None);
+    let selected = crate::native_source_picker::select_request(
+        &window,
+        crate::native_source_picker::PickerRequest::SingleFile {
+            filters: vec![crate::native_source_picker::PickerFilter {
+                label: "PDF".into(),
+                extensions: vec!["pdf".into()],
+            }],
+        },
+    )
+    .await
+    .map_err(|error| error.message().to_owned())?;
+    let path = match selected {
+        crate::native_source_picker::PickerOutcome::Cancelled => return Ok(None),
+        crate::native_source_picker::PickerOutcome::Selected(mut paths)
+            if paths.len() == 1 && paths[0].is_absolute() =>
+        {
+            paths.remove(0)
+        }
+        _ => return Err("The selected local path is unavailable.".to_owned()),
     };
-    let path = selected
-        .into_path()
-        .map_err(|_| "The selected PDF is unavailable.")?;
     let resource_root = app
         .path()
         .resource_dir()
@@ -486,11 +487,10 @@ mod tests {
     #[test]
     #[ignore = "Requires explicit owned signed installation in a dedicated process."]
     fn signed_pdf_range_freezes_bytes_and_fences_draft_and_retry() {
-        let installation =
+        let mut installation =
             crate::commands::resource_quiescence_tests::SignedInstallationFixture::open();
         let resource_root = installation.publication.clone();
-        let root = std::env::temp_dir().join(format!("pdf-range-{}", uuid::Uuid::new_v4()));
-        fs::create_dir(&root).unwrap();
+        let root = installation.create_capture_root("pdf-range");
         let path = root.join("Selected.pdf");
         let original = many_page_pdf(3);
         fs::write(&path, &original).unwrap();
@@ -554,9 +554,10 @@ mod tests {
         assert!(apply_pending(&storage, &mut pending, "range-draft", None, 2, 2).is_err());
         std::os::unix::fs::symlink(&path, root.join("Linked.pdf")).unwrap();
         assert!(read_selected(&root.join("Linked.pdf")).is_err());
+        drop(pending);
         drop(storage);
         installation.finish();
-        fs::remove_dir_all(root).unwrap();
+        assert!(!root.exists());
     }
     #[test]
     fn pinned_parent_preserves_selected_inode_despite_ancestor_namespace_replacement() {
@@ -627,10 +628,9 @@ mod tests {
     #[test]
     #[ignore = "Requires explicit owned signed installation in a dedicated process."]
     fn signed_native_image_capture_persists_raw_and_derived_objects() {
-        let installation =
+        let mut installation =
             crate::commands::resource_quiescence_tests::SignedInstallationFixture::open();
-        let root = std::env::temp_dir().join(format!("image-capture-{}", uuid::Uuid::new_v4()));
-        fs::create_dir(&root).unwrap();
+        let root = installation.create_capture_root("image-capture");
         let path = root.join("Selected.png");
         fs::write(&path, PNG).unwrap();
         let storage = std::sync::Arc::new(Storage::open_or_create(root.join("store")).unwrap());
@@ -669,7 +669,7 @@ mod tests {
         assert!(parsed.pages.is_empty());
         drop(storage);
         installation.finish();
-        fs::remove_dir_all(root).unwrap();
+        assert!(!root.exists());
     }
 
     fn many_page_pdf(count: usize) -> Vec<u8> {
@@ -716,5 +716,281 @@ mod tests {
             .as_bytes(),
         );
         bytes
+    }
+}
+
+fn frozen_pdf_representation(
+    storage: &Storage,
+    draft_id: &str,
+    revision: u64,
+    source_id: &str,
+) -> Result<
+    (
+        magi_storage::ContextDraft,
+        usize,
+        magi_context::NativeExtraction,
+    ),
+    String,
+> {
+    let draft = storage
+        .load_context_draft(draft_id)
+        .map_err(|_| "pdf_context_unavailable")?
+        .ok_or("pdf_context_unavailable")?;
+    if draft.revision != revision {
+        return Err("pdf_context_revision_changed".into());
+    }
+    let index = draft
+        .manifest
+        .content
+        .sources
+        .iter()
+        .position(|source| source.source_id == source_id)
+        .ok_or("pdf_source_unavailable")?;
+    let source = &draft.manifest.content.sources[index];
+    if source.state != ManifestSourceState::Captured
+        || source.mime_type.as_deref() != Some("application/pdf")
+    {
+        return Err("pdf_source_not_captured".into());
+    }
+    let digest = source
+        .derived_digest
+        .as_ref()
+        .ok_or("pdf_representation_unavailable")?;
+    let bytes = storage
+        .read_source_object(digest)
+        .map_err(|_| "pdf_representation_unavailable")?;
+    if Digest::from_bytes(&bytes) != *digest {
+        return Err("pdf_representation_digest_mismatch".into());
+    }
+    let extracted: magi_context::NativeExtraction =
+        serde_json::from_slice(&bytes).map_err(|_| "pdf_representation_invalid")?;
+    if extracted.schema_version != 1
+        || extracted.mime_type != "application/pdf"
+        || extracted.pages.is_empty()
+        || extracted.pages.len() != source.included_locators.len()
+        || extracted.kind
+            != source
+                .representation_kind
+                .ok_or("pdf_representation_invalid")?
+    {
+        return Err("pdf_representation_invalid".into());
+    }
+    let mut previous = 0;
+    for (page, locator) in extracted.pages.iter().zip(&source.included_locators) {
+        if page.page <= previous
+            || locator.page != Some(page.page)
+            || locator.source_id != source_id
+            || Some(&locator.object_digest) != source.object_digest.as_ref()
+            || locator.width != page.width
+            || locator.height != page.height
+        {
+            return Err("pdf_page_locator_mismatch".into());
+        }
+        previous = page.page;
+    }
+    Ok((draft, index, extracted))
+}
+
+#[tauri::command]
+pub(crate) async fn load_context_pdf_page_count(
+    window: WebviewWindow,
+    state: State<'_, DesktopState>,
+    draft_id: String,
+    context_revision: u64,
+    source_id: String,
+) -> Result<u32, String> {
+    main_only(&window)?;
+    let storage = state.storage()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let (_, _, extracted) =
+            frozen_pdf_representation(&storage, &draft_id, context_revision, &source_id)?;
+        // The stored worker metadata is authoritative; no original/live PDF is read here.
+        extracted
+            .total_pages
+            .ok_or("pdf_total_page_count_unavailable".into())
+    })
+    .await
+    .map_err(|_| "pdf_page_count_worker_failed".to_owned())?
+}
+
+fn shrink_pdf_selection(
+    storage: &Storage,
+    draft_id: &str,
+    revision: u64,
+    source_id: &str,
+    start_page: u32,
+    end_page: u32,
+) -> Result<ContextSelectionSummary, String> {
+    let (draft, index, mut extracted) =
+        frozen_pdf_representation(storage, draft_id, revision, source_id)?;
+    if start_page == 0 || end_page < start_page || end_page - start_page + 1 > 200 {
+        return Err("pdf_page_range_invalid".into());
+    }
+    if (start_page..=end_page).any(|number| !extracted.pages.iter().any(|page| page.page == number))
+    {
+        return Err("pdf_range_expansion_requires_explicit_recapture".into());
+    }
+    let selected = extracted
+        .pages
+        .iter()
+        .filter(|page| page.page >= start_page && page.page <= end_page)
+        .count();
+    if selected == extracted.pages.len() {
+        return context_summary(draft);
+    }
+    extracted
+        .pages
+        .retain(|page| page.page >= start_page && page.page <= end_page);
+    let bytes = serde_json::to_vec(&extracted).map_err(|_| "pdf_representation_invalid")?;
+    let digest = Digest::from_bytes(&bytes);
+    let stored = storage
+        .put_source_object(&bytes)
+        .map_err(|_| "pdf_representation_save_failed")?;
+    if stored.digest != digest || stored.byte_length != bytes.len() as u64 {
+        return Err("pdf_representation_digest_mismatch".into());
+    }
+    let mut sources = draft.manifest.content.sources;
+    sources[index].derived_digest = Some(digest);
+    sources[index].included_locators.retain(|locator| {
+        locator
+            .page
+            .is_some_and(|page| page >= start_page && page <= end_page)
+    });
+    let manifest =
+        SourceCaptureManifest::draft(sources, now()).map_err(|_| "pdf_manifest_invalid")?;
+    let saved = storage
+        .save_context_draft(draft_id, Some(revision), &manifest, now())
+        .map_err(|_| "pdf_context_revision_changed")?;
+    context_summary(saved)
+}
+
+#[tauri::command]
+pub(crate) async fn select_context_pdf_pages(
+    window: WebviewWindow,
+    state: State<'_, DesktopState>,
+    draft_id: String,
+    context_revision: u64,
+    source_id: String,
+    start_page: u32,
+    end_page: u32,
+) -> Result<ContextSelectionSummary, String> {
+    main_only(&window)?;
+    let storage = state.storage()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        shrink_pdf_selection(
+            &storage,
+            &draft_id,
+            context_revision,
+            &source_id,
+            start_page,
+            end_page,
+        )
+    })
+    .await
+    .map_err(|_| "pdf_page_selection_worker_failed".to_owned())?
+}
+
+#[cfg(test)]
+mod retained_pdf_range_tests {
+    use super::*;
+    #[test]
+    fn retained_pages_shrink_with_cas_and_cannot_expand_without_recapture() {
+        let root = std::env::temp_dir().join(format!("magi-pdf-shrink-{}", uuid::Uuid::new_v4()));
+        let storage = Storage::open_or_create(&root).unwrap();
+        let original = storage
+            .put_source_object(b"immutable selected original")
+            .unwrap();
+        let extraction = magi_context::NativeExtraction {
+            schema_version: 1,
+            kind: magi_context::RepresentationKind::PdfText,
+            mime_type: "application/pdf".into(),
+            width: None,
+            height: None,
+            image_base64: None,
+            warnings: Vec::new(),
+            total_pages: Some(9),
+            pages: (2..=3)
+                .map(|page| magi_context::ExtractedPage {
+                    page,
+                    text: Some(format!("page-{page}")),
+                    mime_type: None,
+                    image_base64: None,
+                    width: None,
+                    height: None,
+                })
+                .collect(),
+        };
+        let derived = storage
+            .put_source_object(&serde_json::to_vec(&extraction).unwrap())
+            .unwrap();
+        let source = ManifestSource {
+            source_id: "pdf-source".into(),
+            display_name: "selected.pdf".into(),
+            state: ManifestSourceState::Captured,
+            byte_length: Some(original.byte_length),
+            mime_type: Some("application/pdf".into()),
+            object_digest: Some(original.digest.clone()),
+            derived_digest: Some(derived.digest),
+            representation_kind: Some(extraction.kind),
+            extractor_id: Some("macos-native-bounded".into()),
+            extractor_version: Some("1".into()),
+            included_locators: (2..=3)
+                .map(|page| EvidenceLocator {
+                    source_id: "pdf-source".into(),
+                    object_digest: original.digest.clone(),
+                    start_line: None,
+                    end_line: None,
+                    total_lines: None,
+                    page: Some(page),
+                    width: None,
+                    height: None,
+                })
+                .collect(),
+            omission: None,
+            captured_at_epoch_ms: Some(now()),
+            secret_pattern_findings: Vec::new(),
+            secret_scan_incomplete: true,
+        };
+        let manifest = SourceCaptureManifest::draft(vec![source], now()).unwrap();
+        let draft = storage
+            .save_context_draft("pdf-draft", None, &manifest, now())
+            .unwrap();
+        assert!(
+            shrink_pdf_selection(&storage, "pdf-draft", draft.revision, "pdf-source", 1, 3)
+                .is_err()
+        );
+        shrink_pdf_selection(&storage, "pdf-draft", draft.revision, "pdf-source", 2, 2).unwrap();
+        let current = storage.load_context_draft("pdf-draft").unwrap().unwrap();
+        assert_eq!(current.revision, draft.revision + 1);
+        assert_eq!(
+            current.manifest.content.sources[0].object_digest,
+            Some(original.digest.clone())
+        );
+        let bytes = storage
+            .read_source_object(
+                current.manifest.content.sources[0]
+                    .derived_digest
+                    .as_ref()
+                    .unwrap(),
+            )
+            .unwrap();
+        let stored: magi_context::NativeExtraction = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(stored.pages.len(), 1);
+        assert_eq!(stored.pages[0].page, 2);
+        assert_eq!(stored.total_pages, Some(9));
+        assert!(
+            shrink_pdf_selection(&storage, "pdf-draft", draft.revision, "pdf-source", 2, 2)
+                .is_err()
+        );
+        assert!(
+            shrink_pdf_selection(&storage, "pdf-draft", current.revision, "pdf-source", 2, 3)
+                .is_err()
+        );
+        assert_eq!(
+            storage.read_source_object(&original.digest).unwrap(),
+            b"immutable selected original"
+        );
+        drop(storage);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

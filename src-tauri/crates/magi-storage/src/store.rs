@@ -41,10 +41,18 @@ use crate::{
     StorageError, StoreIdentity, StoredEvent,
 };
 
+#[path = "active_clock.rs"]
+mod active_clock;
 #[path = "evidence.rs"]
 mod evidence;
+#[path = "grants.rs"]
+mod grants;
+pub use grants::GrantReservation;
 #[path = "lifecycle.rs"]
 mod lifecycle;
+pub use active_clock::ActiveClockBudget;
+#[path = "migration_guard.rs"]
+mod migration_guard;
 pub use lifecycle::{
     BackupManifest, DeletionReceipt, EvidenceDeletionPreview, EvidenceView, RestoreReceipt,
 };
@@ -63,7 +71,7 @@ struct LiveCancellationOutcome {
     failure: Option<LiveRunFailure>,
 }
 
-const SCHEMA_VERSION: u32 = 16;
+const SCHEMA_VERSION: u32 = 18;
 const LEGACY_V2_WEAK_MIGRATION_SHA256: &str =
     "19d2909b7e58e0c7f7ecd8cd4bec60e2265cc586633f1f31d8090cbfd6e2c021";
 pub const LIVE_RUN_QUEUE_CAPACITY: u8 = 10;
@@ -89,6 +97,8 @@ const MIGRATION_14: &str = include_str!("../migrations/0014_admission_execution_
 const MIGRATION_15: &str = include_str!("../migrations/0015_live_run_needs_input_pause.sql");
 const MIGRATION_16: &str =
     include_str!("../migrations/0016_clarification_descendant_authority.sql");
+const MIGRATION_17: &str = include_str!("../migrations/0017_execution_authentication_clock.sql");
+const MIGRATION_18: &str = include_str!("../migrations/0018_admission_request_budget_policy.sql");
 const MIGRATION_2_LEGACY_WEAK_CONTRACT: &str =
     include_str!("../schema_contracts/v2_legacy_weak.sql");
 
@@ -106,12 +116,48 @@ pub struct AdmissionPublication<'a, F> {
 }
 
 pub struct Storage {
+    // Fields drop in declaration order: close SQLite before releasing writer ownership.
     connection: Mutex<Connection>,
-    _writer_lock: File,
+    _writer_lock: WriterLease,
     objects_root: PathBuf,
     temp_root: PathBuf,
     identity: StoreIdentity,
     startup_recovery: crate::RecoveryReport,
+}
+
+struct WriterLease(File);
+
+impl WriterLease {
+    fn acquire(file: File) -> Result<Self, StorageError> {
+        match FileExt::try_lock_exclusive(&file) {
+            Ok(()) => Ok(Self(file)),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(StorageError::WriterAlreadyOpen)
+            }
+            Err(error) => Err(StorageError::Io(error)),
+        }
+    }
+}
+
+impl Drop for WriterLease {
+    fn drop(&mut self) {
+        for attempt in 0..3 {
+            match FileExt::unlock(&self.0) {
+                Ok(()) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted && attempt < 2 => {
+                    continue;
+                }
+                Err(error) => {
+                    eprintln!(
+                        "Storage writer lock release failed: kind={:?}, errno={:?}",
+                        error.kind(),
+                        error.raw_os_error()
+                    );
+                    break;
+                }
+            }
+        }
+    }
 }
 
 pub struct StorageReader {
@@ -703,7 +749,12 @@ impl Storage {
         validate_admission_binding_from(&transaction, &binding)?;
         validate_admission_command_namespace(&transaction, &binding)?;
         reject_cancelled_admission(&transaction, &binding)?;
-        insert_admission_binding(&transaction, &binding, accepted_at)?;
+        insert_admission_binding(
+            &transaction,
+            &binding,
+            accepted_at,
+            intent.request.common_context_budget.as_ref(),
+        )?;
         insert_clarification_intent(&transaction, intent, &manifest_digest, &base_digest)?;
         transaction.commit()?;
         Ok(binding)
@@ -738,6 +789,34 @@ impl Storage {
         )
     }
 
+    /// Reads the durable policy; callers must still validate the complete immutable intent binding.
+    pub fn load_admission_request_budget(
+        &self,
+        command_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<magi_domain::CommonContextBudgetPolicy>, StorageError> {
+        validate_text("command_id", command_id, 128)?;
+        validate_text("idempotency_key", idempotency_key, 256)?;
+        let connection = self.connection()?;
+        let mut statement = connection.prepare("SELECT idempotency_key,common_context_budget_json FROM admission_request_bindings WHERE command_id=?1 OR idempotency_key=?2")?;
+        let rows = statement.query_map(params![command_id, idempotency_key], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        let mut loaded = None;
+        for row in rows {
+            let (key, payload) = row?;
+            if key != idempotency_key {
+                return Err(StorageError::IdempotencyConflict);
+            }
+            let policy = decode_admission_budget(payload)?;
+            if loaded.as_ref().is_some_and(|previous| previous != &policy) {
+                return Err(StorageError::IdempotencyConflict);
+            }
+            loaded = Some(policy);
+        }
+        Ok(loaded.flatten())
+    }
+
     /// Registers immutable intent only; the binding does not grant execution permission.
     pub fn register_admission_request(
         &self,
@@ -752,7 +831,12 @@ impl Storage {
         validate_admission_binding_from(&transaction, &binding)?;
         validate_admission_command_namespace(&transaction, &binding)?;
         reject_cancelled_admission(&transaction, &binding)?;
-        insert_admission_binding(&transaction, &binding, accepted_at)?;
+        insert_admission_binding(
+            &transaction,
+            &binding,
+            accepted_at,
+            intent.common_context_budget.as_ref(),
+        )?;
         transaction.commit()?;
         Ok(binding)
     }
@@ -829,7 +913,12 @@ impl Storage {
                 params![command_id,idempotency_key], |row|row.get::<_,bool>(0))? {
             return Err(StorageError::IdempotencyConflict);
         }
-        insert_admission_binding(&transaction, &binding, accepted_at)?;
+        insert_admission_binding(
+            &transaction,
+            &binding,
+            accepted_at,
+            intent.common_context_budget.as_ref(),
+        )?;
         if let (Some((_, intent)), Some((_, manifest, base))) = (clarification, &rich) {
             insert_clarification_intent(&transaction, intent, manifest, base)?;
         }
@@ -895,21 +984,22 @@ impl Storage {
 
         let lock_path = state_root.join("writer.lock");
         reject_symlink_if_present(&lock_path)?;
-        let writer_lock = private_file(&lock_path)?;
-        match writer_lock.try_lock_exclusive() {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                return Err(StorageError::WriterAlreadyOpen);
-            }
-            Err(error) => return Err(StorageError::Io(error)),
-        }
+        let writer_lock = WriterLease::acquire(private_file(&lock_path)?)?;
 
         let database_path = state_root.join("magi.sqlite");
         reject_symlink_if_present(&database_path)?;
         let mut connection = Connection::open(&database_path)?;
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.pragma_update(None, "foreign_keys", true)?;
-        initialize_schema(&mut connection)?;
+        let migration = migration_guard::MigrationGuard::prepare(&connection, &data_root)?;
+        let schema_result = initialize_schema(&mut connection);
+        if let Some(guard) = migration {
+            let finish_result = guard.finish(schema_result.is_ok());
+            schema_result?;
+            finish_result?;
+        } else {
+            schema_result?;
+        }
         set_private_file_permissions(&database_path)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
@@ -1933,6 +2023,62 @@ impl Storage {
         Ok(core_selection_row(&connection, core_id)?.map(|row| row.selection_revision))
     }
 
+    /// Returns persisted choices without granting current execution authority.
+    pub fn load_provider_model_selection_intent(
+        &self,
+        profile_id: &str,
+    ) -> Result<Option<crate::ProviderModelSelection>, StorageError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let selection = model_selection_row(&transaction, profile_id)?;
+        if let Some(selection) = &selection {
+            validate_model_selection_intent(&transaction, selection)?;
+        }
+        transaction.commit()?;
+        Ok(selection)
+    }
+
+    /// Returns the saved core choice; callers must separately obtain an execution witness.
+    pub fn load_core_model_selection_intent(
+        &self,
+        core_id: CoreId,
+    ) -> Result<Option<crate::CoreModelSelection>, StorageError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let selection = core_selection_row(&transaction, core_id)?;
+        if let Some(core) = &selection {
+            let model = model_selection_row(&transaction, &core.provider_profile_id)?
+                .ok_or_else(|| StorageError::Corrupt("saved core model missing".into()))?;
+            validate_model_selection_intent(&transaction, &model)?;
+            if model.selection_revision < core.model_selection_revision {
+                return Err(StorageError::Corrupt(
+                    "saved core references a future model selection".into(),
+                ));
+            }
+            if model.selection_revision == core.model_selection_revision
+                && model.binding.profile_revision != core.profile_revision
+            {
+                return Err(StorageError::Corrupt(
+                    "saved core profile reference disagrees".into(),
+                ));
+            }
+            let historical: (String, String, String) = transaction.query_row(
+                "SELECT digest,runtime_home_id,payload_json FROM provider_profile_revisions WHERE provider_profile_id=?1 AND revision=?2",
+                params![core.provider_profile_id, to_sql_integer(core.profile_revision)?],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            decode_provider_profile(
+                &core.provider_profile_id,
+                to_sql_integer(core.profile_revision)?,
+                &historical.0,
+                &historical.1,
+                &historical.2,
+            )?;
+        }
+        transaction.commit()?;
+        Ok(selection)
+    }
+
     pub fn load_core_model_selection(
         &self,
         core_id: CoreId,
@@ -2240,6 +2386,15 @@ impl Storage {
             let current_status = parse_live_run_status(&current_status)?;
             let _provider_outcome = parse_live_run_provider_outcome(&provider_outcome)?;
             let change = live_run_change(&self.identity, run_id, outcome_revision, event_sequence);
+            if let Some(aggregate) = load_optional_deliberation(&transaction, run_id)? {
+                grants::revoke_cancel_in_transaction(
+                    self,
+                    &transaction,
+                    &aggregate.persistence_state(),
+                    command_id,
+                    at,
+                )?;
+            }
             transaction.commit()?;
             return Ok((
                 current_status,
@@ -2337,6 +2492,15 @@ impl Storage {
                     at,
                 )?;
             }
+            if expected_revision.is_none_or(|expected| expected == revision) {
+                grants::revoke_cancel_in_transaction(
+                    self,
+                    &transaction,
+                    &aggregate.persistence_state(),
+                    command_id,
+                    at,
+                )?;
+            }
             transaction.commit()?;
             return Ok((
                 terminal_status,
@@ -2353,6 +2517,15 @@ impl Storage {
                 expected,
                 actual: revision,
             });
+        }
+        if let Some(aggregate) = &aggregate {
+            grants::revoke_cancel_in_transaction(
+                self,
+                &transaction,
+                &aggregate.persistence_state(),
+                command_id,
+                at,
+            )?;
         }
         let generation = u64::try_from(raw_generation)
             .map_err(|_| StorageError::Corrupt("live run generation is negative".to_owned()))?;
@@ -2410,6 +2583,15 @@ impl Storage {
                 ));
             }
             let change = live_run_change(&self.identity, run_id, outcome_revision, event_sequence);
+            if let Some(aggregate) = load_optional_deliberation(&transaction, run_id)? {
+                grants::revoke_cancel_in_transaction(
+                    self,
+                    &transaction,
+                    &aggregate.persistence_state(),
+                    command_id,
+                    at,
+                )?;
+            }
             transaction.commit()?;
             return Ok((
                 accepted_status,
@@ -4200,6 +4382,7 @@ impl Storage {
             {
                 return Err(StorageError::IdempotencyConflict);
             }
+            grants::validate_admission_replay(self, &transaction, &prior_state)?;
             transaction.rollback()?;
             return Ok(LiveRunAdmissionOutcome::Accepted {
                 receipt,
@@ -4284,7 +4467,12 @@ impl Storage {
         validate_admission_binding_from(&transaction, &request_binding)?;
         validate_admission_command_namespace(&transaction, &request_binding)?;
         reject_cancelled_admission(&transaction, &request_binding)?;
-        insert_admission_binding(&transaction, &request_binding, accepted_at)?;
+        insert_admission_binding(
+            &transaction,
+            &request_binding,
+            accepted_at,
+            intent.common_context_budget.as_ref(),
+        )?;
         if let (Some(parent), Some((_, manifest, base))) = (clarification, &rich) {
             insert_clarification_intent(&transaction, parent, manifest, base)?;
         }
@@ -4336,6 +4524,7 @@ impl Storage {
         )?;
         persist_input_snapshots(&transaction, &state.input, accepted_at)?;
         insert_run(&transaction, &state.run, &state.input)?;
+        grants::persist_admission(self, &transaction, &state, accepted_at)?;
         bump_history_membership_generation(&transaction)?;
         persist_result_rows(&transaction, &state)?;
         let event_position = persist_events(&transaction, &event_drafts, &self.identity)?;
@@ -6352,6 +6541,32 @@ fn model_selection_row(
     .transpose()
 }
 
+fn validate_model_selection_intent(
+    connection: &Connection,
+    selection: &crate::ProviderModelSelection,
+) -> Result<(), StorageError> {
+    let binding = &selection.binding;
+    let catalog = load_provider_catalog_snapshot_from(connection, &binding.catalog_snapshot_id)?
+        .ok_or_else(|| StorageError::Corrupt("historical selection catalog missing".into()))?;
+    binding.validate_ready(&catalog)?;
+    let row: (String, String, String) = connection.query_row(
+        "SELECT digest,runtime_home_id,payload_json FROM provider_profile_revisions WHERE provider_profile_id=?1 AND revision=?2",
+        params![binding.provider_profile_id, to_sql_integer(binding.profile_revision)?],
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+    )?;
+    let profile = decode_provider_profile(
+        &binding.provider_profile_id,
+        to_sql_integer(binding.profile_revision)?,
+        &row.0,
+        &row.1,
+        &row.2,
+    )?;
+    if profile.provider_id != binding.provider_id {
+        return Err(StorageError::ProviderProfileProviderMismatch);
+    }
+    Ok(())
+}
+
 fn validate_model_selection(
     connection: &Connection,
     selection: &crate::ProviderModelSelection,
@@ -6767,6 +6982,9 @@ fn insert_clarification_intent(
 fn admission_request_binding(
     intent: &crate::AdmissionRequestIntent,
 ) -> Result<crate::AdmissionRequestBinding, StorageError> {
+    if let Some(policy) = &intent.common_context_budget {
+        policy.validate()?;
+    }
     validate_text("command_id", &intent.command_id, 128)?;
     validate_text("idempotency_key", &intent.idempotency_key, 256)?;
     validate_live_question(&intent.question)?;
@@ -6799,11 +7017,14 @@ fn admission_request_binding(
         question: &'a str,
         core_bindings: &'a [crate::CoreBindingReference],
         request_provenance: &'a magi_domain::DeliberationRequestProvenance,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        common_context_budget: Option<&'a magi_domain::CommonContextBudgetPolicy>,
     }
     let digest = Digest::from_bytes(&canonical_json(&IntentDocument {
         question: &intent.question,
         core_bindings: &references,
         request_provenance: provenance,
+        common_context_budget: intent.common_context_budget.as_ref(),
     })?);
     Ok(crate::AdmissionRequestBinding {
         command_id: intent.command_id.clone(),
@@ -6915,7 +7136,10 @@ fn admission_intent_from_input(
     idempotency_key: &str,
     input: &InputSnapshot,
 ) -> Result<crate::AdmissionRequestIntent, StorageError> {
+    input.validate()?;
+    input.common_context_token_limit()?;
     Ok(crate::AdmissionRequestIntent {
+        common_context_budget: input.common_context_budget.clone(),
         command_id: command_id.into(),
         idempotency_key: idempotency_key.into(),
         question: input.question.prompt.clone(),
@@ -6982,7 +7206,13 @@ fn validate_admission_binding_from(
     connection: &Connection,
     binding: &crate::AdmissionRequestBinding,
 ) -> Result<(), StorageError> {
-    let mut statement=connection.prepare("SELECT command_id,idempotency_key,intent_digest FROM admission_request_bindings WHERE command_id=?1 OR idempotency_key=?2")?;
+    let has_budget: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('admission_request_bindings') WHERE name='common_context_budget_json')", [], |row| row.get(0))?;
+    let sql = if has_budget {
+        "SELECT command_id,idempotency_key,intent_digest,common_context_budget_json FROM admission_request_bindings WHERE command_id=?1 OR idempotency_key=?2"
+    } else {
+        "SELECT command_id,idempotency_key,intent_digest,NULL FROM admission_request_bindings WHERE command_id=?1 OR idempotency_key=?2"
+    };
+    let mut statement = connection.prepare(sql)?;
     let rows = statement.query_map(
         params![binding.command_id, binding.idempotency_key],
         |row| {
@@ -6990,11 +7220,13 @@ fn validate_admission_binding_from(
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
             ))
         },
     )?;
     for row in rows {
-        let (_id, key, digest) = row?;
+        let (_id, key, digest, policy) = row?;
+        decode_admission_budget(policy)?;
         if key != binding.idempotency_key || digest != binding.intent_digest.as_str() {
             return Err(StorageError::IdempotencyConflict);
         }
@@ -7006,10 +7238,40 @@ fn insert_admission_binding(
     connection: &Connection,
     binding: &crate::AdmissionRequestBinding,
     accepted_at: &str,
+    policy: Option<&magi_domain::CommonContextBudgetPolicy>,
 ) -> Result<(), StorageError> {
     ensure_current_admission_binding(connection, binding)?;
-    connection.execute("INSERT INTO admission_request_bindings(command_id,idempotency_key,intent_digest,accepted_at) VALUES(?1,?2,?3,?4) ON CONFLICT(command_id) DO NOTHING",params![binding.command_id,binding.idempotency_key,binding.intent_digest.as_str(),accepted_at])?;
+    if let Some(policy) = policy {
+        policy.validate()?;
+    }
+    let payload = policy.map(serde_json::to_string).transpose()?;
+    connection.execute("INSERT INTO admission_request_bindings(command_id,idempotency_key,intent_digest,accepted_at,common_context_budget_json) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(command_id) DO NOTHING",params![binding.command_id,binding.idempotency_key,binding.intent_digest.as_str(),accepted_at,payload])?;
+    let mut statement = connection.prepare("SELECT common_context_budget_json FROM admission_request_bindings WHERE command_id=?1 OR idempotency_key=?2")?;
+    let rows = statement.query_map(
+        params![binding.command_id, binding.idempotency_key],
+        |row| row.get::<_, Option<String>>(0),
+    )?;
+    for row in rows {
+        if decode_admission_budget(row?)?.as_ref() != policy {
+            return Err(StorageError::IdempotencyConflict);
+        }
+    }
     Ok(())
+}
+
+fn decode_admission_budget(
+    payload: Option<String>,
+) -> Result<Option<magi_domain::CommonContextBudgetPolicy>, StorageError> {
+    payload
+        .map(|payload| {
+            if payload.len() > 4096 {
+                return Err(StorageError::DispatchFenced);
+            }
+            let policy: magi_domain::CommonContextBudgetPolicy = serde_json::from_str(&payload)?;
+            policy.validate()?;
+            Ok(policy)
+        })
+        .transpose()
 }
 
 fn validate_admission_command_namespace(
@@ -10724,6 +10986,8 @@ fn migration_sql(version: u32) -> Option<&'static str> {
         14 => Some(MIGRATION_14),
         15 => Some(MIGRATION_15),
         16 => Some(MIGRATION_16),
+        17 => Some(MIGRATION_17),
+        18 => Some(MIGRATION_18),
         _ => None,
     }
 }
@@ -12274,9 +12538,60 @@ mod saved_model_selection_tests {
         assert!(storage.load_core_execution_witnesses(&references).is_err());
         assert_eq!(
             storage
+                .load_provider_model_selection_intent(&references[0].provider_profile_id)
+                .unwrap(),
+            Some(originals[0].1.clone())
+        );
+        let saved_core = storage
+            .load_core_model_selection_intent(CoreId::Melchior1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            saved_core.selection_revision,
+            references[0].core_selection_revision
+        );
+        assert!(
+            storage
+                .load_core_model_selection(CoreId::Melchior1)
+                .is_err()
+        );
+        let selected = storage
+            .select_provider_model(&model_input(
+                &changed,
+                "model",
+                Some(originals[0].1.selection_revision),
+            ))
+            .unwrap();
+        assert_eq!(
+            storage
+                .load_core_model_selection_intent(CoreId::Melchior1)
+                .unwrap(),
+            Some(saved_core.clone())
+        );
+        assert!(
+            storage
+                .load_core_model_selection(CoreId::Melchior1)
+                .is_err()
+        );
+        assert!(storage.load_core_execution_witnesses(&references).is_err());
+        let updated = storage
+            .select_core_model(&crate::CoreModelSelectionInput {
+                core_id: CoreId::Melchior1,
+                provider_profile_id: references[0].provider_profile_id.clone(),
+                profile_revision: references[0].profile_revision,
+                model_selection_revision: selected.selection_revision,
+                expected_selection_revision: Some(saved_core.selection_revision),
+                updated_at: at.into(),
+            })
+            .unwrap();
+        references[0].model_selection_revision = selected.selection_revision;
+        references[0].core_selection_revision = updated.selection_revision;
+        assert!(storage.load_core_execution_witnesses(&references).is_ok());
+        assert_eq!(
+            storage
                 .provider_model_selection_revision(&references[0].provider_profile_id)
                 .unwrap(),
-            Some(originals[0].1.selection_revision)
+            Some(selected.selection_revision)
         );
         drop(storage);
         std::fs::remove_dir_all(root).unwrap();
@@ -13210,7 +13525,12 @@ mod saved_model_selection_tests {
             }
             historical
                 .execute_batch(&format!(
-                    "INSERT INTO main.\"{table}\" SELECT * FROM prior.\"{table}\";"
+                    "INSERT INTO main.\"{table}\" SELECT {} FROM prior.\"{table}\";",
+                    if table == "admission_request_bindings" {
+                        "command_id,idempotency_key,intent_digest,accepted_at"
+                    } else {
+                        "*"
+                    }
                 ))
                 .unwrap();
         }
@@ -13408,10 +13728,12 @@ mod saved_model_selection_tests {
         assert!(Storage::open_or_create(&root).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
-    fn cancellation_fixture() -> (PathBuf, Storage, RunAggregate) {
+    pub(super) fn cancellation_fixture() -> (PathBuf, Storage, RunAggregate) {
         cancellation_fixture_with_source(false)
     }
-    fn cancellation_fixture_with_source(with_source: bool) -> (PathBuf, Storage, RunAggregate) {
+    pub(super) fn cancellation_fixture_with_source(
+        with_source: bool,
+    ) -> (PathBuf, Storage, RunAggregate) {
         cancellation_fixture_with_source_bytes(with_source, None)
     }
     fn cancellation_fixture_with_source_bytes(
@@ -13421,7 +13743,7 @@ mod saved_model_selection_tests {
         cancellation_fixture_build(with_source, source_bytes, true)
     }
 
-    fn cancellation_fixture_build(
+    pub(super) fn cancellation_fixture_build(
         with_source: bool,
         source_bytes: Option<&[u8]>,
         admit: bool,
@@ -13611,7 +13933,10 @@ mod saved_model_selection_tests {
         (root, storage, aggregate)
     }
 
-    fn cancellation_claim(storage: &Storage, aggregate: &mut RunAggregate) -> LiveRunClaim {
+    pub(super) fn cancellation_claim(
+        storage: &Storage,
+        aggregate: &mut RunAggregate,
+    ) -> LiveRunClaim {
         let at = "2026-10-01T00:00:01Z";
         let claim = storage
             .claim_next_live_run("cancel-worker", at)
@@ -13685,7 +14010,7 @@ mod saved_model_selection_tests {
                 late = Some((claim, result));
             } else {
                 storage
-                    .begin_deliberation_cancel("run-core", "fixture")
+                    .begin_deliberation_cancel("run-core", "2030-10-03T00:00:03Z")
                     .unwrap();
             }
             let revision = storage
@@ -13879,7 +14204,7 @@ mod saved_model_selection_tests {
             .map(|digest| (digest.clone(), storage.read_source_object(digest).unwrap()))
             .collect();
         storage
-            .begin_deliberation_cancel("run-core", "fixture")
+            .begin_deliberation_cancel("run-core", "2030-10-03T00:00:03Z")
             .unwrap();
         let revision = storage
             .load_run_aggregate("run-core")
@@ -13978,7 +14303,7 @@ mod saved_model_selection_tests {
             );
         }
         storage
-            .begin_deliberation_cancel("run-core", "fixture")
+            .begin_deliberation_cancel("run-core", "2030-10-03T00:00:03Z")
             .unwrap();
         let revision = storage
             .load_run_aggregate("run-core")
@@ -14228,7 +14553,7 @@ mod saved_model_selection_tests {
             if unknown {
                 cancellation_claim(&storage, &mut aggregate);
                 let cancelled = storage
-                    .begin_deliberation_cancel("run-core", "fixture")
+                    .begin_deliberation_cancel("run-core", "2030-10-03T00:00:03Z")
                     .unwrap();
                 storage
                     .mark_live_run_cancel_unknown("run-core", cancelled.3, "fixture")
@@ -14357,7 +14682,7 @@ mod saved_model_selection_tests {
                     &request,
                     &refs,
                     Storage::admission_publication_with_authority(
-                        "fixture",
+                        "2026-10-03T00:00:03Z",
                         None,
                         stale,
                         || panic!("stale authority must not reach effects")
@@ -14389,7 +14714,12 @@ mod saved_model_selection_tests {
                 &mut aggregate,
                 &request,
                 &refs,
-                Storage::admission_publication_with_authority("fixture", None, &current, || Ok(())),
+                Storage::admission_publication_with_authority(
+                    "2026-10-03T00:00:03Z",
+                    None,
+                    &current,
+                    || Ok(()),
+                ),
             )
             .unwrap();
         let before =
@@ -14735,6 +15065,91 @@ mod saved_model_selection_tests {
         drop(reader);
         assert_eq!(fs::read(&db).unwrap(), before);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pending_budget_policy_is_immutable_reopens_and_cancels_without_live_settings() {
+        let (path, storage, aggregate) = cancellation_fixture_build(false, None, false);
+        struct OwnedRoot(PathBuf);
+        impl Drop for OwnedRoot {
+            fn drop(&mut self) {
+                if self.0.exists() {
+                    std::fs::remove_dir_all(&self.0).unwrap();
+                }
+            }
+        }
+        let prepared = (path, storage, aggregate);
+        let root = OwnedRoot(prepared.0.clone());
+        let (_, storage, aggregate) = prepared;
+        let legacy = admission_authority_fixture_intent(&aggregate);
+        let legacy_digest = admission_request_binding(&legacy).unwrap().intent_digest;
+        let serialized = serde_json::to_value(&legacy).unwrap();
+        assert!(serialized.get("commonContextBudget").is_none());
+        let decoded: crate::AdmissionRequestIntent = serde_json::from_value(serialized).unwrap();
+        assert_eq!(
+            admission_request_binding(&decoded).unwrap().intent_digest,
+            legacy_digest
+        );
+        let mut intent = legacy;
+        intent.common_context_budget =
+            Some(magi_domain::CommonContextBudgetPolicy::new(128_000, 7).unwrap());
+        let binding = storage
+            .register_admission_request(&intent, "2026-10-01T00:00:00Z")
+            .unwrap();
+        assert_ne!(binding.intent_digest, legacy_digest);
+        drop(storage);
+        let storage = Storage::open_or_create(&root.0).unwrap();
+        assert_eq!(storage.identity().schema_version, 18);
+        assert_eq!(
+            storage
+                .load_admission_request_budget(&intent.command_id, &intent.idempotency_key)
+                .unwrap(),
+            intent.common_context_budget
+        );
+        let mut changed = intent.clone();
+        changed.common_context_budget =
+            Some(magi_domain::CommonContextBudgetPolicy::new(32_000, 8).unwrap());
+        assert!(matches!(
+            storage.register_admission_request(&changed, "2026-10-01T00:01:00Z"),
+            Err(StorageError::IdempotencyConflict)
+        ));
+        assert!(matches!(
+            storage.cancel_admission_request(
+                &changed,
+                "wrong-budget",
+                "wrong-budget-key",
+                "2026-10-01T00:01:00Z"
+            ),
+            Err(StorageError::IdempotencyConflict)
+        ));
+        let receipt = storage
+            .cancel_admission_request(
+                &intent,
+                "budget-cancel",
+                "budget-cancel-key",
+                "2026-10-01T00:02:00Z",
+            )
+            .unwrap();
+        assert_eq!(
+            receipt,
+            storage
+                .cancel_admission_request(
+                    &intent,
+                    "budget-cancel",
+                    "budget-cancel-key",
+                    "2026-10-01T00:03:00Z"
+                )
+                .unwrap()
+        );
+        for payload in [
+            "null",
+            "{\"schemaVersion\":2,\"tokenLimit\":32000,\"settingsFieldRevision\":0}",
+            "{\"schemaVersion\":1,\"tokenLimit\":128001,\"settingsFieldRevision\":0}",
+            "{\"schemaVersion\":1,\"tokenLimit\":32000,\"settingsFieldRevision\":0,\"extra\":true}",
+        ] {
+            assert!(decode_admission_budget(Some(payload.into())).is_err());
+        }
+        drop(storage);
     }
 
     #[test]
@@ -15153,7 +15568,12 @@ mod saved_model_selection_tests {
             }
             twelve
                 .execute_batch(&format!(
-                    "INSERT INTO main.\"{table}\" SELECT * FROM prior.\"{table}\";"
+                    "INSERT INTO main.\"{table}\" SELECT {} FROM prior.\"{table}\";",
+                    if table == "admission_request_bindings" {
+                        "command_id,idempotency_key,intent_digest,accepted_at"
+                    } else {
+                        "*"
+                    }
                 ))
                 .unwrap();
         }
@@ -15253,7 +15673,12 @@ mod saved_model_selection_tests {
             }
             twelve
                 .execute_batch(&format!(
-                    "INSERT INTO main.\"{table}\" SELECT * FROM prior.\"{table}\";"
+                    "INSERT INTO main.\"{table}\" SELECT {} FROM prior.\"{table}\";",
+                    if table == "admission_request_bindings" {
+                        "command_id,idempotency_key,intent_digest,accepted_at"
+                    } else {
+                        "*"
+                    }
                 ))
                 .unwrap();
         }
@@ -16600,11 +17025,15 @@ mod saved_model_selection_tests {
         let original_input = aggregate.input().clone();
         let selections = CoreId::ALL.map(|core| storage.load_core_model_selection(core).unwrap());
         let connection = storage.connection().unwrap();
-        connection
-            .execute(
-                "INSERT INTO disclosure_grants(run_id,payload_json) VALUES('run-core','{}')",
+        let grant_payload: String = connection
+            .query_row(
+                "SELECT payload_json FROM disclosure_grants WHERE run_id='run-core'",
                 [],
+                |row| row.get(0),
             )
+            .unwrap();
+        assert!(!grant_payload.is_empty());
+        grants::validate_admission_replay(&storage, &connection, &aggregate.persistence_state())
             .unwrap();
         connection.execute("INSERT INTO provider_source_scopes(grant_id,provider_profile_id,canonical_path,root_device,root_inode,created_at) VALUES('source-scope','profile-0','/selected/source',1,1,'fixture')",[]).unwrap();
         drop(connection);
@@ -17395,7 +17824,12 @@ mod saved_model_selection_tests {
                 old.execute_batch("DELETE FROM store_meta;").unwrap();
             }
             old.execute_batch(&format!(
-                "INSERT INTO main.\"{table}\" SELECT * FROM prior.\"{table}\";"
+                "INSERT INTO main.\"{table}\" SELECT {} FROM prior.\"{table}\";",
+                if table == "admission_request_bindings" {
+                    "command_id,idempotency_key,intent_digest,accepted_at"
+                } else {
+                    "*"
+                }
             ))
             .unwrap();
         }
@@ -17513,7 +17947,7 @@ mod saved_model_selection_tests {
                         &intent.request.core_bindings,
                         Some((&intent, 20)),
                         Storage::admission_publication_with_authority(
-                            "fixture",
+                            "2026-10-03T00:00:03Z",
                             None,
                             &expected,
                             || Ok(()),
@@ -17586,7 +18020,7 @@ mod saved_model_selection_tests {
                             &refs,
                             &intent,
                             Storage::admission_publication_with_authority(
-                                "fixture",
+                                "2026-10-03T00:00:03Z",
                                 None,
                                 &expected,
                                 || {
@@ -17608,7 +18042,7 @@ mod saved_model_selection_tests {
                         &refs,
                         &intent,
                         Storage::admission_publication_with_authority(
-                            "fixture",
+                            "2026-10-03T00:00:03Z",
                             None,
                             &expected,
                             || Ok(()),
@@ -17652,7 +18086,7 @@ mod saved_model_selection_tests {
                                 &refs,
                                 &altered,
                                 Storage::admission_publication_with_authority(
-                                    "fixture",
+                                    "2026-10-03T00:00:03Z",
                                     None,
                                     &expected,
                                     || panic!("historical replay must have no effects")
@@ -17670,7 +18104,7 @@ mod saved_model_selection_tests {
                             &request,
                             &refs,
                             Storage::admission_publication_with_authority(
-                                "fixture",
+                                "2026-10-03T00:00:03Z",
                                 None,
                                 &expected,
                                 || panic!("generic replay must have no effects")
@@ -17695,7 +18129,7 @@ mod saved_model_selection_tests {
                             &refs,
                             &intent,
                             Storage::admission_publication_with_authority(
-                                "fixture",
+                                "2026-10-03T00:00:03Z",
                                 None,
                                 &expected,
                                 || panic!("historical replay must have no effects")
@@ -17729,7 +18163,7 @@ mod saved_model_selection_tests {
                     Some(receipt.run_id.as_str())
                 );
                 storage
-                    .begin_deliberation_cancel(&receipt.run_id, "fixture")
+                    .begin_deliberation_cancel(&receipt.run_id, "2030-10-03T00:00:03Z")
                     .unwrap();
                 assert_eq!(
                     storage
@@ -17751,7 +18185,7 @@ mod saved_model_selection_tests {
             );
             if !cancel_first {
                 storage
-                    .begin_deliberation_cancel(&parent.run().run_id, "fixture")
+                    .begin_deliberation_cancel(&parent.run().run_id, "2030-10-03T00:00:03Z")
                     .unwrap();
                 let mut replay =
                     RunAggregate::new(child.run().clone(), child.input().clone()).unwrap();
@@ -17851,7 +18285,7 @@ mod saved_model_selection_tests {
                 .unwrap();
             if parent_purge {
                 storage
-                    .begin_deliberation_cancel(&parent.run().run_id, "fixture")
+                    .begin_deliberation_cancel(&parent.run().run_id, "2030-10-03T00:00:03Z")
                     .unwrap();
                 let revision = storage
                     .load_run_aggregate(&parent.run().run_id)
@@ -18000,7 +18434,7 @@ mod saved_model_selection_tests {
                 .is_ok()
         );
         storage
-            .begin_deliberation_cancel(&parent.run().run_id, "fixture")
+            .begin_deliberation_cancel(&parent.run().run_id, "2030-10-03T00:00:03Z")
             .unwrap();
         assert!(
             storage
@@ -18048,7 +18482,7 @@ mod saved_model_selection_tests {
                 .is_err()
         );
         storage
-            .begin_deliberation_cancel(&parent.run().run_id, "fixture")
+            .begin_deliberation_cancel(&parent.run().run_id, "2030-10-03T00:00:03Z")
             .unwrap();
         let (active, _permission) = restored
             .activate_restored_execution_checked(&mut storage, |p| {
@@ -18229,7 +18663,7 @@ mod saved_model_selection_tests {
             )
             .unwrap();
         storage
-            .begin_deliberation_cancel("run-core", "fixture")
+            .begin_deliberation_cancel("run-core", "2030-10-03T00:00:03Z")
             .unwrap();
         assert_eq!(
             storage.get_live_run_snapshot("run-core", 0).unwrap().status,
@@ -18294,7 +18728,12 @@ mod saved_model_selection_tests {
             }
             twelve
                 .execute_batch(&format!(
-                    "INSERT INTO main.\"{table}\" SELECT * FROM prior.\"{table}\";"
+                    "INSERT INTO main.\"{table}\" SELECT {} FROM prior.\"{table}\";",
+                    if table == "admission_request_bindings" {
+                        "command_id,idempotency_key,intent_digest,accepted_at"
+                    } else {
+                        "*"
+                    }
                 ))
                 .unwrap();
         }
@@ -18400,7 +18839,7 @@ mod saved_model_selection_tests {
         let before = canonical_json(&aggregate.persistence_state()).unwrap();
         let revision = aggregate.run().revision;
         storage
-            .begin_deliberation_cancel("run-core", "fixture")
+            .begin_deliberation_cancel("run-core", "2030-10-03T00:00:03Z")
             .unwrap();
         assert!(
             storage
@@ -18611,5 +19050,82 @@ mod saved_model_selection_tests {
         );
         drop(storage);
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod writer_lease_tests {
+    use super::*;
+    struct TestRoot(PathBuf);
+    impl TestRoot {
+        fn new() -> Self {
+            Self(std::env::temp_dir().join(format!("magi-writer-lock-{}", Uuid::new_v4())))
+        }
+    }
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            if self.0.exists() {
+                std::fs::remove_dir_all(&self.0)
+                    .expect("writer fixture handles must be closed before cleanup");
+            }
+        }
+    }
+
+    #[test]
+    fn storage_releases_writer_ownership_even_when_duplicate_descriptor_survives() {
+        let root = TestRoot::new();
+        let first = Storage::open_or_create(&root.0).unwrap();
+        let duplicate = first._writer_lock.0.try_clone().unwrap();
+        assert!(matches!(
+            Storage::open_or_create(&root.0),
+            Err(StorageError::WriterAlreadyOpen)
+        ));
+        drop(first);
+        let second = Storage::open_or_create(&root.0)
+            .expect("duplicate descriptor cannot retain ended storage ownership");
+        assert!(matches!(
+            Storage::open_or_create(&root.0),
+            Err(StorageError::WriterAlreadyOpen)
+        ));
+        drop(duplicate);
+        assert!(matches!(
+            Storage::open_or_create(&root.0),
+            Err(StorageError::WriterAlreadyOpen)
+        ));
+        drop(second);
+        let third = Storage::open_or_create(&root.0).unwrap();
+        drop(third);
+    }
+
+    #[test]
+    fn cloned_descriptor_shares_lock_and_failed_initialization_releases_acquired_lease() {
+        let root = TestRoot::new();
+        create_private_dir(&root.0).unwrap();
+        let path = root.0.join("writer.lock");
+        let original = private_file(&path).unwrap();
+        FileExt::try_lock_exclusive(&original).unwrap();
+        let duplicate = original.try_clone().unwrap();
+        drop(original);
+        let competing = private_file(&path).unwrap();
+        assert_eq!(
+            FileExt::try_lock_exclusive(&competing).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        FileExt::unlock(&duplicate).unwrap();
+        FileExt::try_lock_exclusive(&competing).unwrap();
+        FileExt::unlock(&competing).unwrap();
+        drop(competing);
+        let mut inherited = None;
+        let failure = (|| -> Result<(), StorageError> {
+            let lease = WriterLease::acquire(private_file(&path)?)?;
+            inherited = Some(lease.0.try_clone()?);
+            let _connection = Connection::open(&root.0)?;
+            Ok(())
+        })();
+        assert!(failure.is_err());
+        let reopened = WriterLease::acquire(private_file(&path).unwrap()).unwrap();
+        drop(reopened);
+        drop(inherited);
+        drop(duplicate);
     }
 }

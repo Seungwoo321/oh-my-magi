@@ -3950,3 +3950,25 @@ html[data-font-scale="200"] .companion-card .core-topology.topology-compact .cor
   max-width: 100%;
   height: auto;
 }
+
+.evidence-source {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 32rem;
+  overflow-y: auto;
+}
+.evidence-image {
+  display: block;
+  max-width: 100%;
+  height: auto;
+}
+.context-range-fields {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-control);
+  padding: var(--space-gutter);
+  border: 1px solid var(--border-secondary);
+  background: var(--surface-console);
+}
+.context-range-fields legend { color: var(--text-secondary); }
+.context-range-fields code { overflow-wrap: anywhere; }

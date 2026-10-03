@@ -4,6 +4,14 @@ mod replay;
 mod store;
 
 pub use error::StorageError;
+
+pub struct DisclosureTurnRequest<'a> {
+    pub slot_ordinal: u8,
+    pub attempt_id: &'a str,
+    pub request_digest: &'a magi_domain::Digest,
+    pub content_kinds: &'a std::collections::BTreeSet<magi_context::DisclosureContentKind>,
+}
+
 pub use magi_domain::{
     AcpMode, AcpModelBindingSnapshot, Digest, LiveProviderResult, LiveProviderUsage, LiveRunEvent,
     LiveRunEventCursor, LiveRunEventKind, LiveRunFailure, LiveRunQueueProjection, LiveRunSnapshot,
@@ -27,9 +35,9 @@ pub use model::{
     SourceFreshnessRecord, StoreIdentity, StoredEvent,
 };
 pub use store::{
-    BackupManifest, DeletionReceipt, EvidenceDeletionPreview, EvidenceView,
-    LIVE_RUN_DISPATCH_CAPACITY, LIVE_RUN_QUEUE_CAPACITY, LiveRunPausePermission, MAX_OBJECT_BYTES,
-    RestoreReceipt, Storage, StorageReader,
+    ActiveClockBudget, BackupManifest, DeletionReceipt, EvidenceDeletionPreview, EvidenceView,
+    GrantReservation, LIVE_RUN_DISPATCH_CAPACITY, LIVE_RUN_QUEUE_CAPACITY, LiveRunPausePermission,
+    MAX_OBJECT_BYTES, RestoreReceipt, Storage, StorageReader,
 };
 
 pub use replay::{

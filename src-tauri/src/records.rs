@@ -1,15 +1,20 @@
 use crate::commands::DesktopState;
 use magi_context::{EvidenceLocator, FreshnessStatus, ManifestSourceState, RepresentationKind};
-use magi_domain::{CoreId, EventPayload, Outcome, RunStage, RunStatus, status_name};
+use magi_domain::{CoreId, Digest, EventPayload, Outcome, RunStage, RunStatus, status_name};
 use magi_storage::{
     BackupManifest, DeletionReceipt, EvidenceDeletionPreview, EvidenceView, ExternalReplay,
     ExternalReplaySummary, MAX_REPLAY_BYTES, RestoreReceipt, RunEventCursor, RunHistoryCursor,
     RunHistoryRequest, Storage, StorageError, StoredEvent,
 };
 use serde::Serialize;
-use std::{io::Read, path::Path, path::PathBuf, sync::mpsc, time::SystemTime};
+use std::{
+    fs::{self, OpenOptions},
+    io::{Read, Write},
+    path::Path,
+    path::PathBuf,
+    time::SystemTime,
+};
 use tauri::{AppHandle, Emitter, State, WebviewWindow};
-use tauri_plugin_dialog::DialogExt;
 
 fn require_main(label: &str) -> Result<(), String> {
     if label == "main" {
@@ -401,37 +406,49 @@ fn read_selected_replay(path: &Path) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-async fn choose_file(app: &AppHandle, folder: bool) -> Result<Option<PathBuf>, String> {
-    let (sender, receiver) = mpsc::sync_channel(1);
-    let dialog = app.dialog().file();
-    if folder {
-        dialog.pick_folder(move |path| {
-            let _ = sender.send(path);
-        });
-    } else {
-        dialog
-            .add_filter("MAGI replay", &["json"])
-            .pick_file(move |path| {
-                let _ = sender.send(path);
-            });
+fn record_picker_path(
+    result: Result<
+        crate::native_source_picker::PickerOutcome,
+        crate::native_source_picker::PickerError,
+    >,
+) -> Result<Option<PathBuf>, String> {
+    use crate::native_source_picker::{PickerError, PickerOutcome};
+    match result {
+        Ok(PickerOutcome::Cancelled) => Ok(None),
+        Ok(PickerOutcome::Selected(mut paths)) if paths.len() == 1 && paths[0].is_absolute() => {
+            Ok(paths.pop())
+        }
+        Ok(PickerOutcome::Selected(_)) | Err(PickerError::InvalidSelection) => {
+            Err("record_file_denied".into())
+        }
+        Err(PickerError::TimedOut) => Err("record_dialog_timed_out".into()),
+        Err(PickerError::Unavailable) => Err("record_dialog_failed".into()),
     }
-    let path = tauri::async_runtime::spawn_blocking(move || receiver.recv())
-        .await
-        .map_err(|_| "record_dialog_failed")?
-        .map_err(|_| "record_dialog_failed")?;
-    path.map(|path| path.into_path().map_err(|_| "record_file_denied".into()))
-        .transpose()
+}
+
+async fn choose_file(window: &WebviewWindow, folder: bool) -> Result<Option<PathBuf>, String> {
+    use crate::native_source_picker::{PickerFilter, PickerRequest, select_request};
+    let request = if folder {
+        PickerRequest::Directory
+    } else {
+        PickerRequest::SingleFile {
+            filters: vec![PickerFilter {
+                label: "MAGI replay".into(),
+                extensions: vec!["json".into()],
+            }],
+        }
+    };
+    record_picker_path(select_request(window, request).await)
 }
 
 #[tauri::command]
 pub async fn import_shared_replay(
     window: WebviewWindow,
-    app: AppHandle,
     state: State<'_, DesktopState>,
 ) -> Result<Option<ExternalReplay>, String> {
     require_main(window.label())?;
     let storage = state.storage()?;
-    let Some(path) = choose_file(&app, false).await? else {
+    let Some(path) = choose_file(&window, false).await? else {
         return Ok(None);
     };
     tauri::async_runtime::spawn_blocking(move || {
@@ -487,12 +504,11 @@ pub fn list_external_replays(
 #[tauri::command]
 pub async fn create_local_backup(
     window: WebviewWindow,
-    app: AppHandle,
     state: State<'_, DesktopState>,
 ) -> Result<Option<BackupManifest>, String> {
     require_main(window.label())?;
     let storage = state.storage()?;
-    let Some(path) = choose_file(&app, true).await? else {
+    let Some(path) = choose_file(&window, true).await? else {
         return Ok(None);
     };
     tauri::async_runtime::spawn_blocking(move || {
@@ -503,15 +519,12 @@ pub async fn create_local_backup(
 }
 
 #[tauri::command]
-pub async fn restore_local_backup(
-    window: WebviewWindow,
-    app: AppHandle,
-) -> Result<Option<RestoreReceipt>, String> {
+pub async fn restore_local_backup(window: WebviewWindow) -> Result<Option<RestoreReceipt>, String> {
     require_main(window.label())?;
-    let Some(backup) = choose_file(&app, true).await? else {
+    let Some(backup) = choose_file(&window, true).await? else {
         return Ok(None);
     };
-    let Some(destination) = choose_file(&app, true).await? else {
+    let Some(destination) = choose_file(&window, true).await? else {
         return Ok(None);
     };
     tauri::async_runtime::spawn_blocking(move || {
@@ -865,5 +878,394 @@ mod tests {
         );
         drop(reopened);
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+use magi_storage::{
+    PublicBallot, Redaction, ReplayEnd, ReplayEvent, ReplayPayload, ReplayPhase,
+    ReplayPublicContent, SharedProposal, SharedReplay, import_replay,
+};
+#[derive(Default)]
+struct ReplayClock {
+    first: Option<u64>,
+    last_time: Option<u64>,
+    last_offset: u64,
+}
+impl ReplayClock {
+    fn advance(&mut self, value: &str) -> Result<u64, String> {
+        let time = parse_recorded_time(value)?;
+        if self.last_time.is_some_and(|last| time < last) {
+            return Err("Recorded event times moved backwards; replay timing cannot be exported faithfully.".into());
+        }
+        let first = *self.first.get_or_insert(time);
+        self.last_offset = time
+            .checked_sub(first)
+            .ok_or("Recorded replay timing is invalid.")?;
+        self.last_time = Some(time);
+        Ok(self.last_offset)
+    }
+}
+fn parse_recorded_time(value: &str) -> Result<u64, String> {
+    let bad = || "Recorded event time is not a supported UTC timestamp.".to_string();
+    let b = value.as_bytes();
+    if b.len() < 20
+        || !value.is_ascii()
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+        || b.last() != Some(&b'Z')
+    {
+        return Err(bad());
+    }
+    let number = |a: usize, z: usize| -> Result<u64, String> {
+        if !b[a..z].iter().all(u8::is_ascii_digit) {
+            return Err(bad());
+        }
+        value[a..z].parse().map_err(|_| bad())
+    };
+    let year = number(0, 4)?;
+    let month = number(5, 7)?;
+    let day = number(8, 10)?;
+    let hour = number(11, 13)?;
+    let minute = number(14, 16)?;
+    let second = number(17, 19)?;
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let lengths = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    if year < 1970
+        || !(1..=12).contains(&month)
+        || day == 0
+        || day > lengths[month as usize - 1]
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return Err(bad());
+    }
+    let millis = if b.len() == 20 {
+        0
+    } else {
+        if b[19] != b'.' || !(22..=24).contains(&b.len()) {
+            return Err(bad());
+        }
+        let count = b.len() - 21;
+        number(20, b.len() - 1)? * 10u64.pow((3 - count) as u32)
+    };
+    let prior = year - 1;
+    let base = 1969;
+    let days = (year - 1970) * 365 + (prior / 4 - base / 4) - (prior / 100 - base / 100)
+        + (prior / 400 - base / 400)
+        + lengths[..month as usize - 1].iter().sum::<u64>()
+        + day
+        - 1;
+    Ok((days * 86400 + hour * 3600 + minute * 60 + second) * 1000 + millis)
+}
+fn stage(s: RunStage) -> ReplayPhase {
+    match s {
+        RunStage::IndependentReview => ReplayPhase::IndependentReview,
+        RunStage::CrossReview => ReplayPhase::CrossReview,
+        RunStage::Synthesis => ReplayPhase::Synthesis,
+        RunStage::Balloting => ReplayPhase::Balloting,
+    }
+}
+
+#[cfg(test)]
+mod replay_time_tests {
+    use super::*;
+    #[test]
+    fn recorded_offsets_preserve_elapsed_time_and_reject_backwards_clocks() {
+        let mut clock = ReplayClock::default();
+        assert_eq!(clock.advance("2026-10-01T00:00:00.125Z").unwrap(), 0);
+        assert_eq!(clock.advance("2026-10-01T00:00:01.375Z").unwrap(), 1250);
+        assert_eq!(clock.advance("2026-10-01T00:00:01.375Z").unwrap(), 1250);
+        assert!(clock.advance("2026-10-01T00:00:01.000Z").is_err());
+        assert_eq!(parse_recorded_time("1970-01-01T00:00:00Z").unwrap(), 0);
+        assert_eq!(
+            parse_recorded_time("2000-03-01T00:00:00Z").unwrap()
+                - parse_recorded_time("2000-02-28T00:00:00Z").unwrap(),
+            172800000
+        );
+    }
+    #[test]
+    fn malformed_recorded_times_are_not_replaced_with_invented_zero_offsets() {
+        for value in [
+            "",
+            "2026-02-29T00:00:00Z",
+            "2100-02-29T00:00:00Z",
+            "2026-13-01T00:00:00Z",
+            "2026-10-00T00:00:00Z",
+            "2026-10-01T24:00:00Z",
+            "2026-10-01T00:00:60Z",
+            "2026-10-01T00:00:00.Z",
+            "2026-10-01T00:00:00.1234Z",
+            "2026-10-01T00:00:00+09:00",
+        ] {
+            assert!(ReplayClock::default().advance(value).is_err(), "{value}");
+        }
+    }
+}
+fn preview(
+    storage: &Storage,
+    run_id: &str,
+    public: ReplayPublicContent,
+) -> Result<ExternalReplay, String> {
+    let d = storage
+        .load_run_dossier(run_id)
+        .map_err(|e| e.to_string())?;
+    let original = d
+        .snapshot
+        .proposal
+        .as_ref()
+        .ok_or("A frozen proposal is required for sharing.")?;
+    let ballots = d
+        .snapshot
+        .ballots_revealed
+        .as_ref()
+        .ok_or("Sealed ballots cannot be shared before reveal.")?;
+    if public.proposal.kind != original.kind
+        || public.assessments.len() != d.snapshot.assessments.len()
+        || public.ballot_rationales.len() != ballots.len()
+    {
+        return Err("The public preview does not match the recorded result structure.".into());
+    }
+    for (edited, stored) in public.assessments.iter().zip(&d.snapshot.assessments) {
+        if edited.core_id != stored.core_id {
+            return Err("Public assessment core differs from the recorded core.".into());
+        }
+    }
+    let digest = Digest::from_bytes(
+        &magi_domain::canonical_json(&public.proposal).map_err(|e| e.to_string())?,
+    );
+    let public_ballots = ballots
+        .iter()
+        .zip(&public.ballot_rationales)
+        .map(|(b, r)| PublicBallot {
+            core_id: b.core_id,
+            vote: b.vote,
+            rationale: r.clone(),
+            proposal_digest: digest.clone(),
+        })
+        .collect();
+    let page = storage
+        .events_after_for_run(&d.replay_cursor, 10_000)
+        .map_err(|e| e.to_string())?;
+    if !page.complete {
+        return Err("The replay exceeds the event export limit.".into());
+    }
+    let mut events = Vec::new();
+    let mut finished = false;
+    let mut last_phase = None;
+    let mut clock = ReplayClock::default();
+    for e in page.events {
+        let offset_ms = clock.advance(&e.event.created_at)?;
+        let payload = match e.event.payload {
+            EventPayload::RunStarted { stage: s, .. } => {
+                Some(ReplayPayload::PhaseEntered { phase: stage(s) })
+            }
+            EventPayload::PhaseAdvanced { to, .. } => {
+                Some(ReplayPayload::PhaseEntered { phase: stage(to) })
+            }
+            EventPayload::AssessmentAccepted { assessment_id, .. } => d
+                .snapshot
+                .assessments
+                .iter()
+                .position(|a| a.attempt_id == assessment_id)
+                .map(|i| ReplayPayload::AssessmentAvailable {
+                    assessment_id: public.assessments[i].assessment_id.clone(),
+                }),
+            EventPayload::ProposalFrozen { .. } => Some(ReplayPayload::ProposalFrozen {
+                proposal_digest: digest.clone(),
+            }),
+            EventPayload::BallotsRevealed { .. } => Some(ReplayPayload::BallotsRevealed {
+                proposal_digest: digest.clone(),
+            }),
+            EventPayload::RunCancelled => {
+                finished = true;
+                Some(ReplayPayload::RunEnded {
+                    status: ReplayEnd::Cancelled,
+                })
+            }
+            EventPayload::RunFailed { .. } => {
+                finished = true;
+                Some(ReplayPayload::RunEnded {
+                    status: ReplayEnd::Failed,
+                })
+            }
+            _ => None,
+        };
+        if let Some(payload) = payload {
+            if let ReplayPayload::PhaseEntered { phase } = payload {
+                if last_phase.is_some_and(|p| p >= phase) {
+                    continue;
+                }
+                last_phase = Some(phase);
+            }
+            events.push(ReplayEvent {
+                sequence: events.len() as u64 + 1,
+                offset_ms,
+                payload,
+            });
+        }
+    }
+    if !finished && matches!(d.snapshot.run.status, RunStatus::Completed { .. }) {
+        events.push(ReplayEvent {
+            sequence: events.len() as u64 + 1,
+            offset_ms: clock.last_offset,
+            payload: ReplayPayload::RunEnded {
+                status: ReplayEnd::Completed,
+            },
+        });
+    }
+    let mut redactions = vec![Redaction {
+        field: "source_objects,locators,grants,provider_metadata,record_identifiers".into(),
+        reason: "Private source and execution authority omitted from public replay.".into(),
+    }];
+    if public.question != d.snapshot.input.question.prompt {
+        redactions.push(Redaction {
+            field: "question".into(),
+            reason: "User reviewed public replacement.".into(),
+        });
+    }
+    if public.proposal.body != original.body {
+        redactions.push(Redaction {
+            field: "proposal.body".into(),
+            reason: "User reviewed public replacement; digest recomputed.".into(),
+        });
+    }
+    for (i, (a, b)) in public
+        .assessments
+        .iter()
+        .zip(&d.snapshot.assessments)
+        .enumerate()
+    {
+        if a.position_summary != b.position_summary {
+            redactions.push(Redaction {
+                field: format!("assessments[{i}].position_summary"),
+                reason: "User reviewed public replacement.".into(),
+            });
+        }
+    }
+    for (field, changed) in [
+        ("title", true),
+        (
+            "proposal.conditions",
+            public.proposal.conditions != original.conditions,
+        ),
+        (
+            "proposal.alternatives",
+            public.proposal.alternatives != original.alternatives,
+        ),
+        ("proposal.open_objections", true),
+    ] {
+        if changed {
+            redactions.push(Redaction {
+                field: field.into(),
+                reason: "User reviewed public replacement.".into(),
+            });
+        }
+    }
+    for (i, (edited, stored)) in public.ballot_rationales.iter().zip(ballots).enumerate() {
+        if edited != &stored.rationale {
+            redactions.push(Redaction {
+                field: format!("ballots[{i}].rationale"),
+                reason: "User reviewed public replacement; original vote preserved.".into(),
+            });
+        }
+    }
+    let data=SharedReplay{format:"magi-replay".into(),schema_version:1,title:public.title,question:public.question,cores:magi_domain::CoreId::ALL.to_vec(),assessments:public.assessments,proposal:SharedProposal{content:public.proposal,proposal_digest:digest},ballots:public_ballots,events,redacted:true,redactions,attribution:"Unofficial fan project. Public copy of recorded replay; ballots are display copies and were not recast on edited text.".into()};
+    data.validate().map_err(|e| e.to_string())?;
+    let b = serde_json::to_vec(&data).map_err(|e| e.to_string())?;
+    import_replay(&b, now()).map_err(|e| e.to_string())
+}
+#[tauri::command]
+pub fn preview_shared_replay(
+    window: WebviewWindow,
+    state: State<'_, DesktopState>,
+    run_id: String,
+    public_content: ReplayPublicContent,
+) -> Result<ExternalReplay, String> {
+    require_main(window.label())?;
+    preview(state.storage()?.as_ref(), &run_id, public_content)
+}
+#[tauri::command]
+pub async fn export_shared_replay(
+    window: WebviewWindow,
+    state: State<'_, DesktopState>,
+    run_id: String,
+    public_content: ReplayPublicContent,
+    expected_digest: String,
+) -> Result<Option<ExternalReplay>, String> {
+    require_main(window.label())?;
+    let replay = preview(state.storage()?.as_ref(), &run_id, public_content)?;
+    if replay.file_digest.as_str() != expected_digest {
+        return Err("The public preview changed. Review it again before export.".into());
+    }
+    let selected = crate::native_source_picker::select_request(
+        &window,
+        crate::native_source_picker::PickerRequest::SaveFile {
+            default_name: "magi-replay.json".into(),
+            filters: vec![crate::native_source_picker::PickerFilter {
+                label: "MAGI replay".into(),
+                extensions: vec!["json".into()],
+            }],
+        },
+    )
+    .await;
+    let Some(p) = record_picker_path(selected)? else {
+        return Ok(None);
+    };
+    let b = serde_json::to_vec(&replay.data).map_err(|e| e.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || write_export(p, &b))
+        .await
+        .map_err(|e| e.to_string())??;
+    Ok(Some(replay))
+}
+fn write_export(p: PathBuf, b: &[u8]) -> Result<(), String> {
+    if fs::symlink_metadata(&p).is_ok() {
+        return Err("Choose a new export filename to preserve existing files.".into());
+    }
+    let parent = p.parent().ok_or("The export destination has no parent.")?;
+    let temporary = parent.join(format!(".magi-replay-{}.part", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&temporary)
+            .map_err(|_| "The public export could not be created.")?;
+        file.write_all(b)
+            .and_then(|_| file.sync_all())
+            .map_err(|_| "The public export could not be completed.")?;
+        drop(file);
+        fs::hard_link(&temporary, &p)
+            .map_err(|_| "The public export destination already exists or is unavailable.")?;
+        fs::File::open(parent)
+            .and_then(|f| f.sync_all())
+            .map_err(|_| "The public export could not be durably published.")?;
+        Ok(())
+    })();
+    let cleanup = fs::remove_file(&temporary);
+    match (result, cleanup) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(_)) => Err("The public export temporary file could not be removed.".into()),
+        (Ok(()), Ok(())) => Ok(()),
     }
 }

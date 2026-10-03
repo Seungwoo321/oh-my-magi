@@ -1,3 +1,7 @@
+#[path = "local_observation.rs"]
+mod local_observation;
+#[path = "parent_guard.rs"]
+mod parent_guard;
 use crate::sandbox::{self, PreparedLaunch};
 use crate::{CODEX_ACP_VERSION, ProviderError, ProviderRemediation};
 use serde::{Deserialize, Serialize};
@@ -651,7 +655,81 @@ async fn begin_configuration_authority(
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ProviderPhaseSnapshot {
+    deadline: Option<std::time::Instant>,
+    generation: u64,
+    model_started: bool,
+}
+struct ProviderPhaseClock {
+    state: StdMutex<ProviderPhaseSnapshot>,
+    updates: watch::Sender<u64>,
+}
+impl ProviderPhaseClock {
+    fn new(deadline: Option<std::time::Instant>) -> Self {
+        Self {
+            state: StdMutex::new(ProviderPhaseSnapshot {
+                deadline,
+                generation: 0,
+                model_started: false,
+            }),
+            updates: watch::channel(0).0,
+        }
+    }
+    fn snapshot(&self) -> Result<ProviderPhaseSnapshot, ProviderError> {
+        self.state
+            .lock()
+            .map(|state| *state)
+            .map_err(|_| ProviderError::ProcessClosed)
+    }
+    fn deadline(&self) -> Option<std::time::Instant> {
+        self.snapshot()
+            .map(|phase| phase.deadline)
+            .unwrap_or(Some(std::time::Instant::now()))
+    }
+    fn transition(
+        &self,
+        deadline: std::time::Instant,
+        closed: &AtomicBool,
+    ) -> Result<(), ProviderError> {
+        let mut phase = self
+            .state
+            .lock()
+            .map_err(|_| ProviderError::ProcessClosed)?;
+        let now = std::time::Instant::now();
+        if closed.load(Ordering::Acquire)
+            || phase.model_started
+            || phase.deadline.is_none_or(|old| now >= old)
+            || deadline <= now
+            || deadline.duration_since(now) > Duration::from_secs(600)
+        {
+            return Err(ProviderError::Cancelled);
+        }
+        phase.deadline = Some(deadline);
+        phase.generation += 1;
+        phase.model_started = true;
+        self.updates.send_replace(phase.generation);
+        Ok(())
+    }
+    fn close_expired_snapshot(&self, snapshot: ProviderPhaseSnapshot, closed: &AtomicBool) -> bool {
+        let Ok(phase) = self.state.lock() else {
+            closed.store(true, Ordering::Release);
+            return true;
+        };
+        if *phase != snapshot
+            || phase
+                .deadline
+                .is_none_or(|deadline| std::time::Instant::now() < deadline)
+        {
+            return false;
+        }
+        closed.store(true, Ordering::Release);
+        true
+    }
+}
+
 struct Inner {
+    request_deadline: Arc<ProviderPhaseClock>,
     effect_authority: Option<crate::verification::EffectAuthority>,
     writer: Mutex<ChildStdin>,
     pending: Mutex<HashMap<u64, PendingRequest>>,
@@ -659,6 +737,7 @@ struct Inner {
     active_session_id: Mutex<Option<String>>,
     source_reader: Option<Arc<dyn ClientFileReader>>,
     subscription: Mutex<Option<Arc<crate::subscription::SubscriptionBroker>>>,
+    subscription_authenticated: AtomicBool,
     rpc_failure: Mutex<Option<RpcFailureDiagnostic>>,
     provider_notices: Mutex<Vec<ProviderNoticeDiagnostic>>,
     event_gate: Mutex<()>,
@@ -676,8 +755,14 @@ async fn lock_effect_writer<'a, W>(
     writer: &'a Mutex<W>,
     authority: Option<&crate::verification::EffectAuthority>,
     remediation: ProviderRemediation,
+    deadline: Option<std::time::Instant>,
 ) -> Result<tokio::sync::MutexGuard<'a, W>, ProviderError> {
-    let lock = timeout(WRITE_TIMEOUT, writer.lock());
+    let remaining = deadline.map_or(WRITE_TIMEOUT, |deadline| {
+        deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .min(WRITE_TIMEOUT)
+    });
+    let lock = timeout(remaining, writer.lock());
     let result = match authority {
         Some(authority) => tokio::select! {
             biased;
@@ -689,15 +774,56 @@ async fn lock_effect_writer<'a, W>(
     result.map_err(|_| ProviderError::RpcTimeout { remediation })
 }
 
+#[cfg(test)]
 async fn write_effect_frame<W: AsyncWrite + Unpin>(
     writer: &mut W,
     bytes: &[u8],
     authority: Option<&crate::verification::EffectAuthority>,
+    boundary: Option<(std::time::Instant, &AtomicBool)>,
 ) -> Result<(), ProviderError> {
+    write_authorized_effect_frame(writer, bytes, authority, boundary, None).await
+}
+
+async fn write_authorized_effect_frame<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    bytes: &[u8],
+    authority: Option<&crate::verification::EffectAuthority>,
+    boundary: Option<(std::time::Instant, &AtomicBool)>,
+    authorization: Option<&crate::verification::PromptPublicationAuthorization>,
+) -> Result<(), ProviderError> {
+    if authorization.is_some() && authority.is_none() {
+        return Err(ProviderError::Cancelled);
+    }
+    let remaining = || {
+        boundary.map_or(WRITE_TIMEOUT, |(deadline, _)| {
+            deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .min(WRITE_TIMEOUT)
+        })
+    };
+    let check = || {
+        if boundary.is_some_and(|(deadline, closed)| {
+            closed.load(Ordering::Acquire) || std::time::Instant::now() >= deadline
+        }) {
+            Err(ProviderError::ProcessClosed)
+        } else {
+            Ok(())
+        }
+    };
     let mut written = 0;
     while written < bytes.len() {
         let next = std::future::poll_fn(|context| {
-            let mut poll = || Pin::new(&mut *writer).poll_write(context, &bytes[written..]);
+            let mut poll = || {
+                if let Err(error) = authorization
+                    .map_or(Ok(()), |a| a.check())
+                    .and_then(|()| check())
+                {
+                    return Poll::Ready(Err(error));
+                }
+                Pin::new(&mut *writer)
+                    .poll_write(context, &bytes[written..])
+                    .map_err(|_| ProviderError::ProcessClosed)
+            };
             match authority {
                 Some(authority) => match authority.publish(poll) {
                     Ok(value) => value.map_err(|_| ProviderError::ProcessClosed),
@@ -710,9 +836,11 @@ async fn write_effect_frame<W: AsyncWrite + Unpin>(
             Some(authority) => tokio::select! {
                 biased;
                 _ = authority.cancelled() => Err(ProviderError::Cancelled),
-                result = next => result,
+                result = timeout(remaining(), next) => result.unwrap_or(Err(ProviderError::ProcessClosed)),
             },
-            None => next.await,
+            None => timeout(remaining(), next)
+                .await
+                .unwrap_or(Err(ProviderError::ProcessClosed)),
         };
         match result {
             Ok(0) => return Err(ProviderError::ProcessClosed),
@@ -722,7 +850,17 @@ async fn write_effect_frame<W: AsyncWrite + Unpin>(
         }
     }
     let flush = std::future::poll_fn(|context| {
-        let mut poll = || Pin::new(&mut *writer).poll_flush(context);
+        let mut poll = || {
+            if let Err(error) = authorization
+                .map_or(Ok(()), |a| a.check())
+                .and_then(|()| check())
+            {
+                return Poll::Ready(Err(error));
+            }
+            Pin::new(&mut *writer)
+                .poll_flush(context)
+                .map_err(|_| ProviderError::ProcessClosed)
+        };
         match authority {
             Some(authority) => match authority.publish(poll) {
                 Ok(value) => value.map_err(|_| ProviderError::ProcessClosed),
@@ -735,9 +873,11 @@ async fn write_effect_frame<W: AsyncWrite + Unpin>(
         Some(authority) => tokio::select! {
             biased;
             _ = authority.cancelled() => Err(ProviderError::ProcessClosed),
-            result = flush => result,
+            result = timeout(remaining(), flush) => result.unwrap_or(Err(ProviderError::ProcessClosed)),
         },
-        None => flush.await,
+        None => timeout(remaining(), flush)
+            .await
+            .unwrap_or(Err(ProviderError::ProcessClosed)),
     }
 }
 
@@ -747,6 +887,7 @@ struct PendingRequest {
 }
 
 struct PendingRpc {
+    deadline: Option<std::time::Instant>,
     id: u64,
     method: String,
     response: oneshot::Receiver<Result<Value, ProviderError>>,
@@ -754,7 +895,12 @@ struct PendingRpc {
 
 impl PendingRpc {
     async fn wait(self, inner: &Inner) -> Result<Value, ProviderError> {
-        let response = match timeout(REQUEST_TIMEOUT, self.response).await {
+        let remaining = self
+            .deadline
+            .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()))
+            .unwrap_or(REQUEST_TIMEOUT)
+            .min(REQUEST_TIMEOUT);
+        let response = match timeout(remaining, self.response).await {
             Err(_) => {
                 inner.pending.lock().await.remove(&self.id);
                 inner.poison().await;
@@ -776,7 +922,19 @@ impl PendingRpc {
                 inner.pending.lock().await.remove(&self.id);
                 Err(error)
             }
-            Ok(result) => Ok(result),
+            Ok(result) => {
+                if self
+                    .deadline
+                    .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+                {
+                    inner.poison().await;
+                    Err(ProviderError::RpcTimeout {
+                        remediation: rpc_remediation(&self.method),
+                    })
+                } else {
+                    Ok(result)
+                }
+            }
         }
     }
 }
@@ -784,9 +942,33 @@ impl PendingRpc {
 struct ProcessControl {
     process_group_id: i32,
     exit_status: watch::Receiver<Option<i32>>,
+    observation: StdMutex<local_observation::LocalObservation>,
 }
 
 impl ProcessControl {
+    fn observation_is_fresh(&self) -> bool {
+        self.observation
+            .lock()
+            .map(|last| last.elapsed() < Duration::from_secs(15))
+            .unwrap_or(false)
+    }
+
+    fn observe_owned_process(&self) -> bool {
+        if self.exit_status.borrow().is_some() || !self.observation_is_fresh() {
+            return false;
+        }
+        if unsafe { libc::kill(self.process_group_id, 0) } != 0 {
+            return false;
+        }
+        match self.observation.lock() {
+            Ok(mut last) if last.elapsed() < Duration::from_secs(15) => {
+                *last = local_observation::LocalObservation::now();
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn signal_group(&self, signal: i32) {
         signal_process_group(self.process_group_id, signal);
     }
@@ -1065,7 +1247,7 @@ struct ProviderNetworkProxy {
     proxy_url: String,
     state: Arc<ProxyState>,
     accept_task: Option<ThreadJoinHandle<()>>,
-    _activity: Option<crate::verification::ActivityLease>,
+    _activity: StdMutex<Option<crate::verification::ActivityLease>>,
 }
 
 impl ProviderNetworkProxy {
@@ -1131,7 +1313,7 @@ impl ProviderNetworkProxy {
             proxy_url: format!("http://magi:{token}@127.0.0.1:{}", address.port()),
             state,
             accept_task: Some(accept_task),
-            _activity: activity,
+            _activity: StdMutex::new(activity),
         })
     }
 
@@ -1142,6 +1324,57 @@ impl ProviderNetworkProxy {
     fn proxy_url(&self) -> &str {
         &self.proxy_url
     }
+}
+
+impl ProviderNetworkProxy {
+    async fn stop_and_observe(&self, deadline: std::time::Instant) -> bool {
+        self.state.stopping.store(true, Ordering::Release);
+        if let Ok(active) = self.state.active.lock() {
+            for sockets in active.values() {
+                let _ = sockets.client.shutdown(Shutdown::Both);
+                if let Some(upstream) = &sockets.upstream {
+                    let _ = upstream.shutdown(Shutdown::Both);
+                }
+            }
+        } else {
+            return false;
+        }
+        loop {
+            let accept_done = self
+                .accept_task
+                .as_ref()
+                .is_none_or(ThreadJoinHandle::is_finished);
+            let workers_done = self
+                .state
+                .workers
+                .lock()
+                .map(|workers| workers.iter().all(ThreadJoinHandle::is_finished))
+                .unwrap_or(false);
+            let sockets_closed = self
+                .state
+                .active
+                .lock()
+                .map(|active| active.is_empty())
+                .unwrap_or(false);
+            if accept_done && workers_done && sockets_closed {
+                let Ok(mut activity) = self._activity.lock() else {
+                    return false;
+                };
+                activity.take();
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+}
+fn owned_process_exit_confirmed(process: &ProcessControl) -> bool {
+    process.process_group_id > 0
+        && process.exit_status.borrow().is_some()
+        && unsafe { libc::kill(-process.process_group_id, 0) } == -1
+        && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
 impl Drop for ProviderNetworkProxy {
@@ -1691,11 +1924,13 @@ pub struct CodexAcpClient {
     resource_custody: Mutex<Option<crate::verification::ArtifactClientCustody>>,
     activity_request: Option<crate::VerificationRequest>,
     _home_operation_lock: HomeOperationLock,
+    _parent_lease: parent_guard::ParentLease,
     network_proxy: ProviderNetworkProxy,
     auth_methods: Mutex<Vec<AuthMethod>>,
     session_state: Mutex<Option<SessionAuthority>>,
     initializing: AtomicBool,
     initialized: AtomicBool,
+    image_prompt_supported: AtomicBool,
     session_opening: Arc<AtomicBool>,
     catalog_listing: AtomicBool,
     auth_progress: watch::Receiver<AuthProgressStage>,
@@ -2237,6 +2472,8 @@ impl CodexAcpClient {
         certificate_policy.apply(&mut command);
         home_operation_lock.install_on(&mut command);
         command.kill_on_drop(true);
+        let parent_lease =
+            parent_guard::install(&mut command).map_err(|_| ProviderError::ProcessStart)?;
         if let Some((artifact, request)) = &verified {
             artifact.check(request)?;
         }
@@ -2260,6 +2497,7 @@ impl CodexAcpClient {
             let process = Arc::new(ProcessControl {
                 process_group_id,
                 exit_status,
+                observation: StdMutex::new(local_observation::LocalObservation::now()),
             });
             startup.process = Some(process.clone());
             startup.exit_sender = Some(exit_sender.clone());
@@ -2278,6 +2516,7 @@ impl CodexAcpClient {
             let (auth_progress_sender, auth_progress) = watch::channel(AuthProgressStage::Opening);
             let (auth_browser_request_sender, auth_browser_requests) = mpsc::channel(1);
             let inner = Arc::new(Inner {
+                request_deadline: Arc::new(ProviderPhaseClock::new(verified.as_ref().map(|(_,request)|request.deadline()))),
                 effect_authority,
                 writer: Mutex::new(stdin),
                 pending: Mutex::new(HashMap::new()),
@@ -2285,6 +2524,7 @@ impl CodexAcpClient {
                 active_session_id: Mutex::new(None),
                 source_reader,
                 subscription: Mutex::new(None),
+                subscription_authenticated: AtomicBool::new(false),
                 rpc_failure: Mutex::new(None),
                 provider_notices: Mutex::new(Vec::new()),
                 event_gate: Mutex::new(()),
@@ -2293,6 +2533,29 @@ impl CodexAcpClient {
                 process: process.clone(),
             });
 
+            let observed_inner=Arc::downgrade(&inner);
+            let phase_clock=inner.request_deadline.clone();
+            let mut phase_updates=phase_clock.updates.subscribe();
+            tokio::spawn(async move {
+                loop {
+                    let Ok(snapshot)=phase_clock.snapshot() else {break;};
+                    let deadline_reached=match snapshot.deadline {
+                        Some(deadline)=>tokio::select!{biased;
+                            changed=phase_updates.changed()=>{if changed.is_err(){break;} continue;},
+                            _=tokio::time::sleep_until(tokio::time::Instant::from_std(deadline))=>true,
+                            _=tokio::time::sleep(Duration::from_secs(5))=>false,
+                        },
+                        None=>tokio::select!{changed=phase_updates.changed()=>{if changed.is_err(){break;}continue;},_=tokio::time::sleep(Duration::from_secs(5))=>false,},
+                    };
+                    let Some(inner)=observed_inner.upgrade() else {break;};
+                    if inner.closed.load(Ordering::Acquire){break;}
+                    if deadline_reached {
+                        if !phase_clock.close_expired_snapshot(snapshot,&inner.closed){continue;}
+                        inner.poison().await;break;
+                    }
+                    if !inner.process.observe_owned_process(){inner.poison().await;break;}
+                }
+            });
             let reader_inner = inner.clone();
             startup.reader_task = Some(tokio::spawn(async move {
                 let _activity = reader_activity;
@@ -2328,11 +2591,13 @@ impl CodexAcpClient {
                 resource_custody: Mutex::new(resource_custody),
                 activity_request: verified.as_ref().map(|(_, request)| request.clone()),
                 _home_operation_lock: home_operation_lock,
+                _parent_lease: parent_lease,
                 network_proxy,
                 auth_methods: Mutex::new(Vec::new()),
                 session_state: Mutex::new(None),
                 initializing: AtomicBool::new(false),
                 initialized: AtomicBool::new(false),
+                image_prompt_supported: AtomicBool::new(false),
                 session_opening: Arc::new(AtomicBool::new(false)),
                 catalog_listing: AtomicBool::new(false),
                 auth_progress,
@@ -2420,6 +2685,69 @@ impl CodexAcpClient {
         if response.get("authenticated").and_then(Value::as_bool) != Some(true) {
             return Err(ProviderError::Unauthenticated);
         }
+        self.inner
+            .subscription_authenticated
+            .store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Enters the model-call phase once after the exact authenticated session is configured.
+    /// The native caller supplies the remaining durable Run budget; this is not a renewal API.
+    pub async fn begin_authenticated_model_phase(
+        &self,
+        expected: &SessionInfo,
+        deadline: std::time::Instant,
+    ) -> Result<(), ProviderError> {
+        self.ensure_initialized()?;
+        let request = self
+            .activity_request
+            .as_ref()
+            .ok_or(ProviderError::ArtifactVerification)?;
+        request.check()?;
+        self.verified_runtime
+            .as_ref()
+            .ok_or(ProviderError::ArtifactVerification)?
+            .check(request)?;
+        if !self
+            .inner
+            .subscription_authenticated
+            .load(Ordering::Acquire)
+        {
+            return Err(ProviderError::Unauthenticated);
+        }
+        let subscription = self.inner.subscription.lock().await;
+        subscription
+            .as_ref()
+            .ok_or(ProviderError::Unauthenticated)?
+            .connect_parameters()
+            .map_err(|_| ProviderError::Unauthenticated)?;
+        let session = self.session_state.lock().await;
+        if session
+            .as_ref()
+            .is_none_or(|current| current.info != *expected)
+            || !expected.selected_model_available
+        {
+            return Err(ProviderError::SessionUnavailable);
+        }
+        let pending = self.inner.pending.lock().await;
+        let prompts = self.inner.prompts.lock().await;
+        if !pending.is_empty() || !prompts.is_empty() {
+            return Err(ProviderError::PromptInProgress);
+        }
+        let _writer = self
+            .inner
+            .writer
+            .try_lock()
+            .map_err(|_| ProviderError::PromptInProgress)?;
+        self.inner
+            .effect_authority
+            .as_ref()
+            .ok_or(ProviderError::ArtifactVerification)?
+            .publish(|| {
+                self.inner
+                    .request_deadline
+                    .transition(deadline, &self.inner.closed)
+            })??;
         Ok(())
     }
 
@@ -2476,6 +2804,13 @@ impl CodexAcpClient {
             })
             .unwrap_or_default();
         *self.auth_methods.lock().await = authentication_methods.clone();
+        self.image_prompt_supported.store(
+            result
+                .pointer("/agentCapabilities/promptCapabilities/image")
+                .and_then(Value::as_bool)
+                == Some(true),
+            Ordering::Release,
+        );
         self.initialized.store(true, Ordering::Release);
         Ok(InitializeResult {
             protocol_version,
@@ -2772,14 +3107,125 @@ impl CodexAcpClient {
             .confirm_model(&pending.session_id, &pending.model_id)
     }
 
+    pub fn public_text_token_count(model_id: &str, text: &str) -> Result<u64, ProviderError> {
+        let slug = match model_id.split_once('[') {
+            None => model_id,
+            Some((slug, "low]" | "medium]" | "high]" | "xhigh]")) => slug,
+            _ => return Err(ProviderError::InvalidResponse),
+        };
+        if !matches!(slug, "gpt-5.5" | "gpt-5.4") {
+            // UTF-8 bytes bound public text tokens without guessing a model encoding.
+            return if text.len() <= 8192 {
+                Ok(text.len() as u64)
+            } else {
+                Err(ProviderError::InvalidResponse)
+            };
+        }
+        // The official GPT-5 tokenizer prefix maps to o200k_base. This counts public text only.
+        Ok(tiktoken_rs::o200k_base_singleton()
+            .encode_ordinary(text)
+            .len() as u64)
+    }
+
+    pub fn validate_prompt_blocks(blocks: &[Value]) -> Result<(), ProviderError> {
+        use base64::Engine;
+        if blocks.is_empty() || blocks.len() > 201 {
+            return Err(ProviderError::InputLimit);
+        }
+        for (index, block) in blocks.iter().enumerate() {
+            let object = block.as_object().ok_or(ProviderError::InvalidResponse)?;
+            match block.get("type").and_then(Value::as_str) {
+                Some("text") if index == 0 && object.len() == 2 && object.contains_key("text") => {
+                    block
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .ok_or(ProviderError::InvalidResponse)?;
+                }
+                Some("image")
+                    if index > 0
+                        && object.len() == 3
+                        && object.contains_key("data")
+                        && object.contains_key("mimeType") =>
+                {
+                    let mime = block
+                        .get("mimeType")
+                        .and_then(Value::as_str)
+                        .ok_or(ProviderError::InvalidResponse)?;
+                    let data = block
+                        .get("data")
+                        .and_then(Value::as_str)
+                        .ok_or(ProviderError::InvalidResponse)?;
+                    if data.len() > MAX_PROMPT_BYTES {
+                        return Err(ProviderError::InputLimit);
+                    }
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(data)
+                        .map_err(|_| ProviderError::InvalidResponse)?;
+                    let valid = match mime {
+                        "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+                        "image/jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
+                        _ => false,
+                    };
+                    if !valid {
+                        return Err(ProviderError::InvalidResponse);
+                    }
+                }
+                _ => return Err(ProviderError::InvalidResponse),
+            }
+        }
+        if serde_json::to_vec(blocks)
+            .map_err(|_| ProviderError::InvalidResponse)?
+            .len()
+            > MAX_PROMPT_BYTES
+        {
+            return Err(ProviderError::InputLimit);
+        }
+        Ok(())
+    }
+
     pub async fn prompt(
         &self,
         session_id: &str,
         text: String,
     ) -> Result<PromptHandle, ProviderError> {
+        self.prompt_blocks(session_id, vec![json!({"type":"text","text":text})])
+            .await
+    }
+
+    pub async fn prompt_blocks(
+        &self,
+        session_id: &str,
+        blocks: Vec<Value>,
+    ) -> Result<PromptHandle, ProviderError> {
+        self.prompt_blocks_with_authorization(session_id, blocks, None)
+            .await
+    }
+
+    pub async fn prompt_blocks_authorized(
+        &self,
+        session_id: &str,
+        blocks: Vec<Value>,
+        expires_at_epoch_ms: u64,
+        check_current: Arc<dyn Fn() -> Result<(), ProviderError> + Send + Sync>,
+    ) -> Result<PromptHandle, ProviderError> {
+        let authorization = crate::verification::PromptPublicationAuthorization::new(
+            expires_at_epoch_ms,
+            check_current,
+        )?;
+        self.prompt_blocks_with_authorization(session_id, blocks, Some(authorization))
+            .await
+    }
+
+    async fn prompt_blocks_with_authorization(
+        &self,
+        session_id: &str,
+        blocks: Vec<Value>,
+        authorization: Option<crate::verification::PromptPublicationAuthorization>,
+    ) -> Result<PromptHandle, ProviderError> {
         self.ensure_initialized()?;
-        if text.len() > MAX_PROMPT_BYTES {
-            return Err(ProviderError::InputLimit);
+        Self::validate_prompt_blocks(&blocks)?;
+        if blocks.len() > 1 && !self.image_prompt_supported.load(Ordering::Acquire) {
+            return Err(ProviderError::ToolDenied);
         }
         let (event_sender, events) = mpsc::channel(PROMPT_EVENT_QUEUE);
         let (terminal_sender, terminal_outcome) = watch::channel(PromptTerminalOutcome::Pending);
@@ -2839,15 +3285,16 @@ impl CodexAcpClient {
         });
 
         let request_session_id = session_id.to_owned();
-        let prompt_text = text;
+        let prompt_blocks = blocks;
         let request = match self
             .inner
-            .begin_call(
+            .begin_call_authorized(
                 "session/prompt",
                 json!({
                     "sessionId": request_session_id,
-                    "prompt": [{ "type": "text", "text": prompt_text }]
+                    "prompt": prompt_blocks
                 }),
+                authorization.as_ref(),
             )
             .await
         {
@@ -3007,6 +3454,55 @@ impl CodexAcpClient {
         }
     }
 
+    /// Confirms only local owned process, transport and proxy cleanup; no remote completion is inferred.
+    pub async fn shutdown_local_stop_confirmed(&self) -> bool {
+        self.inner.closed.store(true, Ordering::Release);
+        self.inner.process.signal_group(libc::SIGTERM);
+        if !self.inner.process.wait_for_exit(CANCEL_GRACE).await {
+            self.inner.process.signal_group(libc::SIGKILL);
+            if !self
+                .inner
+                .process
+                .wait_for_exit(Duration::from_secs(5))
+                .await
+            {
+                return false;
+            }
+        }
+        if !owned_process_exit_confirmed(&self.inner.process) {
+            return false;
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        if !self.network_proxy.stop_and_observe(deadline).await {
+            return false;
+        }
+        close_transport(&self.inner, ProviderError::ProcessExited).await;
+        for tasks in [
+            &self.auth_progress_task,
+            &self.reader_task,
+            &self.supervisor_task,
+        ] {
+            let mut slot = tasks.lock().await;
+            if let Some(mut task) = slot.take() {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if !matches!(timeout(remaining, &mut task).await, Ok(Ok(()))) {
+                    *slot = Some(task);
+                    return false;
+                }
+            }
+        }
+        if self.activity_request.as_ref().is_some_and(|request| {
+            let state = request.settlement();
+            state.provider_operations != 0 || state.unresolved_cleanup != 0
+        }) {
+            return false;
+        }
+        if let Some(custody) = self.resource_custody.lock().await.take() {
+            custody.retain_until_settlement();
+        }
+        owned_process_exit_confirmed(&self.inner.process)
+    }
+
     pub async fn shutdown(&self) {
         self.terminate().await;
         if let Some(task) = self.auth_progress_task.lock().await.take() {
@@ -3059,6 +3555,13 @@ impl Drop for CodexAcpClient {
 impl Inner {
     async fn poison(&self) {
         self.closed.store(true, Ordering::Release);
+        if self
+            .request_deadline
+            .deadline()
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            self.process.signal_group(libc::SIGKILL);
+        }
         if timeout(WRITE_TIMEOUT, self.writer.lock()).await.is_err() {
             self.process.signal_group(libc::SIGKILL);
         }
@@ -3073,23 +3576,36 @@ impl Inner {
     }
 
     async fn begin_call(&self, method: &str, params: Value) -> Result<PendingRpc, ProviderError> {
+        self.begin_call_authorized(method, params, None).await
+    }
+
+    async fn begin_call_authorized(
+        &self,
+        method: &str,
+        params: Value,
+        authorization: Option<&crate::verification::PromptPublicationAuthorization>,
+    ) -> Result<PendingRpc, ProviderError> {
         if self.closed.load(Ordering::Acquire) {
             return Err(ProviderError::ProcessClosed);
         }
         let id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = oneshot::channel();
-        self.pending.lock().await.insert(
+        let mut pending = self.pending.lock().await;
+        let deadline = self.request_deadline.deadline();
+        pending.insert(
             id,
             PendingRequest {
                 method: method.to_owned(),
                 sender,
             },
         );
+        drop(pending);
         if let Err(error) = self
-            .write_message(
+            .write_message_authorized(
                 json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }),
                 rpc_remediation(method),
                 FramePurpose::Effect,
+                authorization,
             )
             .await
         {
@@ -3097,6 +3613,7 @@ impl Inner {
             return Err(error);
         }
         Ok(PendingRpc {
+            deadline,
             id,
             method: method.to_owned(),
             response: receiver,
@@ -3134,6 +3651,25 @@ impl Inner {
         remediation: ProviderRemediation,
         purpose: FramePurpose,
     ) -> Result<(), ProviderError> {
+        self.write_message_authorized(message, remediation, purpose, None)
+            .await
+    }
+
+    async fn write_message_authorized(
+        &self,
+        message: Value,
+        remediation: ProviderRemediation,
+        purpose: FramePurpose,
+        authorization: Option<&crate::verification::PromptPublicationAuthorization>,
+    ) -> Result<(), ProviderError> {
+        let frame_deadline = self.request_deadline.deadline();
+        if matches!(purpose, FramePurpose::Effect)
+            && (!self.process.observation_is_fresh()
+                || frame_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline))
+        {
+            self.poison().await;
+            return Err(ProviderError::ProcessClosed);
+        }
         let mut bytes = zeroize::Zeroizing::new(
             serde_json::to_vec(&message).map_err(|_| ProviderError::Protocol)?,
         );
@@ -3145,7 +3681,18 @@ impl Inner {
             FramePurpose::Effect => self.effect_authority.as_ref(),
             FramePurpose::CancelOwnedPrompt => None,
         };
-        let mut writer = match lock_effect_writer(&self.writer, authority, remediation).await {
+        let mut writer = match lock_effect_writer(
+            &self.writer,
+            authority,
+            remediation,
+            if matches!(purpose, FramePurpose::Effect) {
+                frame_deadline
+            } else {
+                None
+            },
+        )
+        .await
+        {
             Ok(writer) => writer,
             Err(ProviderError::Cancelled) => return Err(ProviderError::Cancelled),
             Err(error) => {
@@ -3156,9 +3703,27 @@ impl Inner {
         if self.closed.load(Ordering::Acquire) {
             return Err(ProviderError::ProcessClosed);
         }
+        if matches!(purpose, FramePurpose::Effect)
+            && (!self.process.observation_is_fresh()
+                || frame_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline))
+        {
+            drop(writer);
+            self.poison().await;
+            return Err(ProviderError::ProcessClosed);
+        }
         let write = timeout(
             WRITE_TIMEOUT,
-            write_effect_frame(&mut *writer, &bytes, authority),
+            write_authorized_effect_frame(
+                &mut *writer,
+                &bytes,
+                authority,
+                if matches!(purpose, FramePurpose::Effect) {
+                    frame_deadline.map(|deadline| (deadline, &self.closed))
+                } else {
+                    None
+                },
+                authorization,
+            ),
         )
         .await;
         match write {
@@ -4043,6 +4608,7 @@ mod rpc_diagnostic_tests {
                 &queued_writer,
                 Some(&authority),
                 ProviderRemediation::ReviewRequest,
+                None,
             )
             .await
             .map(|mut value| value.push(1))
@@ -4108,7 +4674,7 @@ mod rpc_diagnostic_tests {
                 stall_flush: false,
             };
             let task = tokio::spawn(async move {
-                write_effect_frame(&mut writer, b"ab", Some(&authority)).await
+                write_effect_frame(&mut writer, b"ab", Some(&authority), None).await
             });
             observed.await.unwrap();
             let mut accepted = [0_u8; 1];
@@ -4138,7 +4704,7 @@ mod rpc_diagnostic_tests {
         assert!(phase.check().is_ok());
         let authority = phase.effect_authority();
         let (mut writer, mut reader) = tokio::io::duplex(32);
-        write_effect_frame(&mut writer, b"bounded-frame", Some(&authority))
+        write_effect_frame(&mut writer, b"bounded-frame", Some(&authority), None)
             .await
             .unwrap();
         let mut bytes = [0_u8; 13];
@@ -4146,7 +4712,7 @@ mod rpc_diagnostic_tests {
         assert_eq!(&bytes, b"bounded-frame");
         root.revoke();
         assert!(matches!(
-            write_effect_frame(&mut writer, b"late", Some(&authority)).await,
+            write_effect_frame(&mut writer, b"late", Some(&authority), None).await,
             Err(ProviderError::Cancelled)
         ));
     }
@@ -4164,7 +4730,7 @@ mod rpc_diagnostic_tests {
             stall_flush: true,
         };
         let task = tokio::spawn(async move {
-            write_effect_frame(&mut writer, b"frame", Some(&authority)).await
+            write_effect_frame(&mut writer, b"frame", Some(&authority), None).await
         });
         observed.await.unwrap();
         request.revoke();
@@ -5791,6 +6357,7 @@ mod bounded_stream_tests {
         let mut child = command.spawn().unwrap();
         let (_, exit_status) = watch::channel(None);
         let inner = Arc::new(Inner {
+            request_deadline: Arc::new(ProviderPhaseClock::new(None)),
             effect_authority: Some(root.effect_authority()),
             writer: Mutex::new(child.stdin.take().unwrap()),
             pending: Mutex::new(HashMap::new()),
@@ -5798,6 +6365,7 @@ mod bounded_stream_tests {
             active_session_id: Mutex::new(Some("bounded-session".into())),
             source_reader: None,
             subscription: Mutex::new(None),
+            subscription_authenticated: AtomicBool::new(false),
             rpc_failure: Mutex::new(None),
             provider_notices: Mutex::new(vec![]),
             event_gate: Mutex::new(()),
@@ -5806,6 +6374,7 @@ mod bounded_stream_tests {
             process: Arc::new(ProcessControl {
                 process_group_id: child.id().unwrap() as i32,
                 exit_status,
+                observation: StdMutex::new(local_observation::LocalObservation::now()),
             }),
         });
         inner
@@ -5919,5 +6488,403 @@ mod bounded_stream_tests {
         ));
         assert!(!closed.event_limited.load(Ordering::Acquire));
         assert!(closed.consumer_closed.load(Ordering::Acquire));
+    }
+}
+
+#[cfg(test)]
+mod public_wire_budget_tests {
+    use super::*;
+    #[test]
+    fn public_text_count_is_not_a_byte_limit_and_unknown_models_are_rejected() {
+        let text = "a ".repeat(6 * 1024);
+        assert!(text.len() > 8192);
+        assert!(CodexAcpClient::public_text_token_count("gpt-5.5[high]", &text).unwrap() < 8192);
+        assert!(CodexAcpClient::public_text_token_count("gpt-6-astra", &text).is_err());
+        assert_eq!(
+            CodexAcpClient::public_text_token_count("unknown-model", "safe").unwrap(),
+            4
+        );
+        assert!(CodexAcpClient::public_text_token_count("gpt-5.5[latest]", &text).is_err());
+    }
+    #[test]
+    fn wire_blocks_deny_remote_images_and_unknown_fields() {
+        let text = json!({"type":"text","text":"public fixture"});
+        assert!(CodexAcpClient::validate_prompt_blocks(std::slice::from_ref(&text)).is_ok());
+        assert!(
+            CodexAcpClient::validate_prompt_blocks(&[
+                text.clone(),
+                json!({"type":"image","uri":"https://example.com/image.png","mimeType":"image/png"})
+            ])
+            .is_err()
+        );
+        assert!(
+            CodexAcpClient::validate_prompt_blocks(&[
+                json!({"type":"text","text":"fixture","private":"extra"})
+            ])
+            .is_err()
+        );
+        assert!(
+            CodexAcpClient::validate_prompt_blocks(&[
+                text,
+                json!({"type":"image","data":"YQ==","mimeType":"image/png"})
+            ])
+            .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod local_process_freshness_tests {
+    use super::*;
+    #[tokio::test]
+    async fn stale_owned_process_cannot_be_refreshed_by_concurrent_observers() {
+        let mut child = tokio::process::Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let (_sender, exit_status) = watch::channel(None);
+        let process = Arc::new(ProcessControl {
+            process_group_id: child.id().unwrap() as i32,
+            exit_status,
+            observation: StdMutex::new(local_observation::LocalObservation::now()),
+        });
+        assert!(process.observe_owned_process());
+        *process.observation.lock().unwrap() =
+            local_observation::LocalObservation::aged_for_test(Duration::from_secs(16));
+        let first = process.clone();
+        let second = process.clone();
+        let (a, b) = tokio::join!(
+            tokio::task::spawn_blocking(move || first.observe_owned_process()),
+            tokio::task::spawn_blocking(move || second.observe_owned_process())
+        );
+        assert!(!a.unwrap());
+        assert!(!b.unwrap());
+        assert!(!process.observation_is_fresh());
+        process.signal_group(libc::SIGKILL);
+        child.wait().await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod fixed_provider_deadline_tests {
+    use super::*;
+    #[tokio::test]
+    async fn authenticated_phase_extends_once_without_old_watchdog_killing_new_phase() {
+        let startup = std::time::Instant::now() + Duration::from_millis(100);
+        let clock = ProviderPhaseClock::new(Some(startup));
+        let closed = AtomicBool::new(false);
+        let old = clock.snapshot().unwrap();
+        let old_rpc_deadline = old.deadline;
+        let mut updates = clock.updates.subscribe();
+        let model = std::time::Instant::now() + Duration::from_millis(600);
+        clock.transition(model, &closed).unwrap();
+        updates.changed().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(!clock.close_expired_snapshot(old, &closed));
+        assert!(!closed.load(Ordering::Acquire));
+        assert!(old_rpc_deadline.unwrap() < std::time::Instant::now());
+        assert!(
+            clock
+                .deadline()
+                .unwrap()
+                .saturating_duration_since(std::time::Instant::now())
+                > Duration::from_millis(300)
+        );
+        assert!(
+            clock
+                .transition(std::time::Instant::now() + Duration::from_secs(1), &closed)
+                .is_err()
+        );
+        let model_snapshot = clock.snapshot().unwrap();
+        tokio::time::sleep_until(tokio::time::Instant::from_std(model)).await;
+        assert!(clock.close_expired_snapshot(model_snapshot, &closed));
+        assert!(
+            clock
+                .transition(std::time::Instant::now() + Duration::from_secs(1), &closed)
+                .is_err()
+        );
+        let expired =
+            ProviderPhaseClock::new(Some(std::time::Instant::now() - Duration::from_millis(1)));
+        assert!(expired.transition(model, &AtomicBool::new(false)).is_err());
+    }
+    #[tokio::test]
+    async fn local_stop_proof_requires_positive_child_reap_and_finished_proxy_workers() {
+        let request =
+            crate::VerificationRequest::until(std::time::Instant::now() + Duration::from_secs(5));
+        let proxy = ProviderNetworkProxy::start_tracked(Some(request.provider_activity().unwrap()))
+            .unwrap();
+        let mut child = tokio::process::Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let (sender, status) = watch::channel(None);
+        let process = ProcessControl {
+            process_group_id: child.id().unwrap() as i32,
+            exit_status: status,
+            observation: StdMutex::new(local_observation::LocalObservation::now()),
+        };
+        assert!(!owned_process_exit_confirmed(&process));
+        process.signal_group(libc::SIGKILL);
+        let exit = child.wait().await.unwrap();
+        sender.send_replace(Some(exit.code().unwrap_or(-1)));
+        assert!(owned_process_exit_confirmed(&process));
+        assert!(
+            proxy
+                .stop_and_observe(std::time::Instant::now() + Duration::from_secs(1))
+                .await
+        );
+        assert_eq!(request.settlement().provider_operations, 0);
+        assert!(request.check().is_ok());
+        let (_, missing_status) = watch::channel(None);
+        let missing = ProcessControl {
+            process_group_id: process.process_group_id,
+            exit_status: missing_status,
+            observation: StdMutex::new(local_observation::LocalObservation::now()),
+        };
+        assert!(!owned_process_exit_confirmed(&missing));
+    }
+    #[tokio::test]
+    async fn blocked_writer_deadline_prevents_late_bytes_without_revoking_shared_root() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let request =
+            crate::VerificationRequest::until(std::time::Instant::now() + Duration::from_secs(3));
+        let authority = request.effect_authority();
+        let closed = AtomicBool::new(false);
+        let (mut writer, mut reader) = tokio::io::duplex(1);
+        writer.write_all(b"x").await.unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_millis(100);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                write_effect_frame(
+                    &mut writer,
+                    b"late",
+                    Some(&authority),
+                    Some((deadline, &closed))
+                )
+            )
+            .await
+            .unwrap()
+            .is_err()
+        );
+        let mut byte = [0];
+        reader.read_exact(&mut byte).await.unwrap();
+        assert_eq!(&byte, b"x");
+        assert!(
+            write_effect_frame(
+                &mut writer,
+                b"late",
+                Some(&authority),
+                Some((deadline, &closed))
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), reader.read(&mut byte))
+                .await
+                .is_err()
+        );
+        assert!(request.check().is_ok());
+        let lock = Mutex::new(Vec::<u8>::new());
+        let _held = lock.lock().await;
+        assert!(
+            lock_effect_writer(
+                &lock,
+                Some(&authority),
+                ProviderRemediation::ReviewRequest,
+                Some(deadline)
+            )
+            .await
+            .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn fixed_deadline_stops_real_unanswered_rpc_and_reaps_owned_process() {
+        let request =
+            crate::VerificationRequest::until(std::time::Instant::now() + Duration::from_secs(3));
+        let mut child = tokio::process::Command::new("/bin/cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap() as i32;
+        let (exit_sender, exit_status) = watch::channel(None);
+        let deadline = std::time::Instant::now() + Duration::from_millis(200);
+        let inner = Arc::new(Inner {
+            request_deadline: Arc::new(ProviderPhaseClock::new(Some(deadline))),
+            effect_authority: Some(request.effect_authority()),
+            writer: Mutex::new(child.stdin.take().unwrap()),
+            pending: Mutex::new(HashMap::new()),
+            prompts: Arc::new(Mutex::new(HashMap::new())),
+            active_session_id: Mutex::new(None),
+            source_reader: None,
+            subscription: Mutex::new(None),
+            subscription_authenticated: AtomicBool::new(false),
+            rpc_failure: Mutex::new(None),
+            provider_notices: Mutex::new(vec![]),
+            event_gate: Mutex::new(()),
+            next_request_id: AtomicU64::new(1),
+            closed: AtomicBool::new(false),
+            process: Arc::new(ProcessControl {
+                process_group_id: pid,
+                exit_status,
+                observation: StdMutex::new(local_observation::LocalObservation::now()),
+            }),
+        });
+        let supervised = tokio::spawn(supervise_child(inner.clone(), child, exit_sender, None));
+        let rpc = inner
+            .begin_call("fixture/unanswered", json!({"fixture":true}))
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), rpc.wait(&inner))
+            .await
+            .expect("fixed request deadline must beat the generic thirty-minute timeout");
+        assert!(matches!(result, Err(ProviderError::RpcTimeout { .. })));
+        tokio::time::timeout(Duration::from_secs(1), supervised)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(inner.closed.load(Ordering::Acquire));
+        assert!(inner.process.exit_status.borrow().is_some());
+        assert_ne!(unsafe { libc::kill(pid, 0) }, 0);
+        assert!(
+            request.check().is_ok(),
+            "local timeout must not revoke the shared root needed to persist unknown failure"
+        );
+        assert!(
+            inner
+                .write_message(
+                    json!({"jsonrpc":"2.0","method":"fixture/late","params":{}}),
+                    ProviderRemediation::ReviewRequest,
+                    FramePurpose::Effect
+                )
+                .await
+                .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod disclosure_publication_tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    fn epoch_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    }
+
+    #[tokio::test]
+    async fn database_wait_crossing_expiry_publishes_zero_bytes() {
+        let request =
+            crate::VerificationRequest::until(std::time::Instant::now() + Duration::from_secs(2));
+        let authority = request.effect_authority();
+        let authorization = crate::verification::PromptPublicationAuthorization::new(
+            epoch_ms() + 30,
+            Arc::new(|| {
+                std::thread::sleep(Duration::from_millis(60));
+                Ok(())
+            }),
+        )
+        .unwrap();
+        let (mut writer, mut reader) = tokio::io::duplex(8);
+        assert!(
+            write_authorized_effect_frame(
+                &mut writer,
+                b"secret",
+                Some(&authority),
+                None,
+                Some(&authorization)
+            )
+            .await
+            .is_err()
+        );
+        drop(writer);
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+        assert!(bytes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn partial_write_rechecks_exact_reservation_without_late_bytes() {
+        let request =
+            crate::VerificationRequest::until(std::time::Instant::now() + Duration::from_secs(2));
+        let authority = request.effect_authority();
+        let count = Arc::new(AtomicUsize::new(0));
+        let polls = count.clone();
+        let authorization = crate::verification::PromptPublicationAuthorization::new(
+            epoch_ms() + 1000,
+            Arc::new(move || {
+                if polls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(())
+                } else {
+                    Err(ProviderError::Cancelled)
+                }
+            }),
+        )
+        .unwrap();
+        let (mut writer, mut reader) = tokio::io::duplex(1);
+        assert!(
+            write_authorized_effect_frame(
+                &mut writer,
+                b"ab",
+                Some(&authority),
+                None,
+                Some(&authorization)
+            )
+            .await
+            .is_err()
+        );
+        drop(writer);
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, b"a");
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn flush_rechecks_grant_and_never_claims_complete_after_revoke() {
+        let request =
+            crate::VerificationRequest::until(std::time::Instant::now() + Duration::from_secs(2));
+        let authority = request.effect_authority();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let authorization = crate::verification::PromptPublicationAuthorization::new(
+            epoch_ms() + 1000,
+            Arc::new(move || {
+                if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(())
+                } else {
+                    Err(ProviderError::Cancelled)
+                }
+            }),
+        )
+        .unwrap();
+        let (mut writer, mut reader) = tokio::io::duplex(8);
+        assert!(
+            write_authorized_effect_frame(
+                &mut writer,
+                b"frame",
+                Some(&authority),
+                None,
+                Some(&authorization)
+            )
+            .await
+            .is_err()
+        );
+        drop(writer);
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, b"frame");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }

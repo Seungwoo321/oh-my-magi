@@ -20,7 +20,7 @@ const CODEX_SOURCE_SHA256: &str =
     "1ac6a92e7318b8acf3d767170c5c5e6dceeffdc074c73b1c5d422b46f0de4daf";
 const CODEX_SOURCE_PATCH_ID: &str = "codex-http-ca-preserve-backend-v1";
 const CODEX_SOURCE_PATCH_SHA256: &str =
-    "2ed2741afc0cecc14da03cf05a4474176bbc9a81f6e7657078c069f2d584ec5b";
+    "b08f4099725b6394e5657691e10d2dc8d9696cd119623fa6155db28a70d76d54";
 const CODEX_SOURCE_LOCK_SHA256: &str =
     "d722f05fc760bcd1f5749ec452452d81058458b788df3b765b80500d757eba4a";
 
@@ -59,6 +59,8 @@ chronicle = false
 plugins = false
 worktrees = false
 view_image = false
+unified_image_budget = false
+realtime_conversation = false
 sleep_tool = false
 shell_snapshot = false
 "#;

@@ -11,24 +11,13 @@ use crate::commands::{ExitAuthorization, focus_main_window};
 const POPOVER_WIDTH: f64 = 440.0;
 const POPOVER_HEIGHT: f64 = 560.0;
 
-pub(crate) fn run() {
-    let app = tauri::Builder::default()
-        .plugin(tauri_plugin_dialog::init())
-        .menu(build_app_menu)
-        .on_menu_event(|app, event| match event.id().as_ref() {
-            "magi-console-open" => {
-                focus_main_window_or_report(app);
-            }
-            "magi-settings" => {
-                if focus_main_window_or_report(app) {
-                    let _ = app.emit_to("main", "magi:open-settings", ());
-                }
-            }
-            _ => {}
-        })
-        .invoke_handler(tauri::generate_handler![
-            get_console_snapshot,
+// Keep product IPC registration shared while each native host owns its snapshot entry.
+macro_rules! product_invoke_handler {
+    ($snapshot:path $(, $extra:path)* $(,)?) => {
+        tauri::generate_handler![
+            $snapshot,
             crate::commands::load_run_dossier,
+            crate::core_dispatch::load_run_core_dispatches,
             crate::records::list_records,
             crate::records::load_record_replay,
             crate::records::list_record_evidence,
@@ -42,11 +31,29 @@ pub(crate) fn run() {
             crate::records::list_external_replays,
             crate::records::create_local_backup,
             crate::records::restore_local_backup,
+            crate::records::preview_shared_replay,
+            crate::records::export_shared_replay,
+            crate::role_files::preview_role_preset_import,
+            crate::role_files::apply_role_preset_import,
+            crate::role_files::export_role_preset,
+            crate::source_observations::select_source_freshness_file,
+            crate::source_observations::recheck_source_freshness,
+            crate::source_observations::revoke_source_freshness_access,
+            crate::release::check_for_update,
+            crate::release::install_update,
+            crate::release::restart_after_update,
+            crate::store_selection::get_store_selection_state,
+            crate::store_selection::select_restored_store,
+            crate::store_selection::activate_restored_store,
+            crate::store_selection::cancel_store_selection,
+            crate::store_selection::restart_into_selected_store,
             crate::commands::select_context_files,
             crate::commands::select_context_directory,
             crate::pdf_capture::prepare_pdf_range_capture,
             crate::pdf_capture::apply_pdf_range_capture,
             crate::pdf_capture::discard_pdf_range_capture,
+            crate::pdf_capture::load_context_pdf_page_count,
+            crate::pdf_capture::select_context_pdf_pages,
             crate::preferences::get_console_preferences,
             crate::preferences::save_console_preferences,
             crate::commands::shell_context,
@@ -75,6 +82,7 @@ pub(crate) fn run() {
             crate::profiles::load_core_model_selections,
             crate::profiles::load_core_execution_witnesses,
             crate::profiles::select_core_model,
+            crate::profiles::preview_deliberation_budget,
             crate::profiles::register_deliberation_request,
             crate::profiles::register_clarification_request,
             crate::profiles::start_clarification,
@@ -95,15 +103,46 @@ pub(crate) fn run() {
             crate::profiles::load_active_role_preset_selection,
             crate::profiles::set_active_role_preset,
             crate::profiles::clone_role_preset,
-            crate::profiles::save_role_preset
-        ])
+            crate::profiles::save_role_preset,
+            $($extra,)*
+        ]
+    };
+}
+#[cfg(feature = "native-live-probe")]
+pub(crate) use product_invoke_handler;
+
+pub(crate) fn product_context() -> tauri::Context<Wry> {
+    tauri::generate_context!()
+}
+
+pub(crate) fn run() {
+    let app = tauri::Builder::default()
+        .plugin(
+            tauri_plugin_updater::Builder::new()
+                .pubkey(crate::release::updater_public_key())
+                .build(),
+        )
+        .plugin(tauri_plugin_dialog::init())
+        .menu(build_app_menu)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "magi-console-open" => {
+                focus_main_window_or_report(app);
+            }
+            "magi-settings" => {
+                if focus_main_window_or_report(app) {
+                    let _ = app.emit_to("main", "magi:open-settings", ());
+                }
+            }
+            _ => {}
+        })
+        .invoke_handler(product_invoke_handler!(get_console_snapshot))
         .setup(|app| {
             app.manage(ExitAuthorization::new());
             app.manage(crate::commands::DesktopState::open(app.handle()));
             install_tray(app.handle())?;
             Ok(())
         })
-        .build(tauri::generate_context!())
+        .build(product_context())
         .expect("failed to initialize MAGI CONSOLE");
 
     app.run(handle_run_event);
@@ -234,7 +273,7 @@ fn focus_main_window_or_report(app: &AppHandle<Wry>) -> bool {
             app.dialog()
                 .message(message)
                 .title("MAGI CONSOLE")
-                .blocking_show();
+                .show(|_| {});
             false
         }
     }

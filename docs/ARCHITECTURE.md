@@ -234,4 +234,4 @@ import는 별도의 `ExternalReplay`를 생성한다. 이 객체는 `external_re
 
 심의 엔진은 대화·근거·역할·제안·표결 계약을 소유하고 MAGI 이름·도형·음원·연출은 presentation package가 소유한다. 역할 preset은 버전 있는 데이터이며 실행 코드·셸·외부 MCP URL을 포함하지 않는다. import한 preset도 스키마와 권한 검사를 거친다.
 
-제품 구조의 선택은 [기본 설계 결정](decisions/0001-command-console.md), macOS 호스트와 메뉴 막대의 선택은 [데스크톱 설계 결정](decisions/0003-desktop-menu-bar.md)에 둔다.
+제품 구조의 선택은 [기본 설계 결정](decisions/0001-command-console.md), macOS 호스트와 메뉴 막대의 선택은 [데스크톱 설계 결정](decisions/0003-desktop-menu-bar.md)에 둔다. 인증 대기와 실행 시간 권위의 분리는 [영속 인증 시간 결정](decisions/0008-durable-authentication-clock.md)에 둔다. 실행물의 빌드 검증 입력 수명은 [출처 입력 수명 결정](decisions/0009-runtime-build-provenance-lifetime.md)에 둔다.

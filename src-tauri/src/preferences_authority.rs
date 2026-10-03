@@ -60,6 +60,12 @@ pub struct PreferencePatch {
         skip_serializing_if = "Option::is_none"
     )]
     pub language: Option<super::UiLanguage>,
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub common_context_token_limit: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,6 +101,12 @@ pub struct ExpectedFieldRevisions {
         skip_serializing_if = "Option::is_none"
     )]
     pub language: Option<u64>,
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub common_context_token_limit: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,6 +117,8 @@ pub struct FieldRevisions {
     pub theme: u64,
     pub font_scale: u64,
     pub language: u64,
+    #[serde(default)]
+    pub common_context_token_limit: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,6 +131,14 @@ pub struct SettingsSnapshot {
 }
 
 impl SettingsSnapshot {
+    pub fn common_context_budget(&self) -> Result<(u32, u64), SettingsError> {
+        self.validate()?;
+        Ok((
+            self.preferences.common_context_token_limit,
+            self.field_revisions.common_context_token_limit,
+        ))
+    }
+
     fn validate(&self) -> Result<(), SettingsError> {
         self.preferences
             .validate()
@@ -129,6 +151,7 @@ impl SettingsSnapshot {
                 self.field_revisions.theme,
                 self.field_revisions.font_scale,
                 self.field_revisions.language,
+                self.field_revisions.common_context_token_limit,
             ]
             .iter()
             .any(|value| *value > self.revision)
@@ -177,6 +200,10 @@ impl SettingsCommand {
                 self.patch.language.is_some(),
                 self.expected_field_revisions.language,
             ),
+            (
+                self.patch.common_context_token_limit.is_some(),
+                self.expected_field_revisions.common_context_token_limit,
+            ),
         ];
         if self.schema_version != VERSION
             || self.target != "console_preferences"
@@ -187,6 +214,10 @@ impl SettingsCommand {
                 *dirty != expected.is_some()
                     || expected.is_some_and(|revision| revision > MAX_SAFE_REVISION)
             })
+            || self
+                .patch
+                .common_context_token_limit
+                .is_some_and(|value| !(1..=128_000).contains(&value))
             || self
                 .patch
                 .font_scale
@@ -324,7 +355,10 @@ pub(super) fn initialize_with_defaults(
         }
         let preferences = match legacy {
             Some(bytes) => parse_legacy(bytes)?,
-            None => defaults,
+            None => ConsolePreferences {
+                common_context_token_limit: super::default_common_context_token_limit(),
+                ..defaults
+            },
         };
         let snapshot = SettingsSnapshot {
             schema_version: VERSION,
@@ -374,7 +408,7 @@ pub(super) fn load(connection: &Connection) -> Result<SettingsSnapshot, Settings
         |row| row.get(0),
     ))?;
     let snapshot: SettingsSnapshot = decode(&payload)?;
-    snapshot.validate()?;
+    snapshot.common_context_budget()?;
     let (commands, events, maximum): (u64, u64, u64) = database(connection.query_row(
         "SELECT (SELECT COUNT(*) FROM settings_commands),COUNT(*),COALESCE(MAX(revision),0) FROM settings_events",
         [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
@@ -428,6 +462,7 @@ fn merge(snapshot: &mut SettingsSnapshot, command: &SettingsCommand) -> Result<(
     field!(theme);
     field!(font_scale);
     field!(language);
+    field!(common_context_token_limit);
     snapshot.revision = next_revision(snapshot.revision)?;
     snapshot.validate()
 }
@@ -469,6 +504,7 @@ fn validate_receipt(
     field!(theme);
     field!(font_scale);
     field!(language);
+    field!(common_context_token_limit);
     Ok(())
 }
 
@@ -645,6 +681,7 @@ fn initialize(connection: &mut Connection, legacy: Option<&[u8]>) -> Result<(), 
             theme: super::ThemePreference::Command,
             font_scale: 100,
             language: super::UiLanguage::Ko,
+            common_context_token_limit: super::default_common_context_token_limit(),
         },
     )
 }
@@ -686,6 +723,128 @@ mod tests {
                 ..Default::default()
             },
         )
+    }
+
+    #[test]
+    fn common_budget_uses_field_cas_bounds_and_exact_idempotent_projection() {
+        let mut connection = initialized();
+        assert_eq!(
+            load(&connection).unwrap().common_context_budget().unwrap(),
+            (32_000, 0)
+        );
+        let budget = command(
+            "budget",
+            PreferencePatch {
+                common_context_token_limit: Some(128_000),
+                ..Default::default()
+            },
+            ExpectedFieldRevisions {
+                common_context_token_limit: Some(0),
+                ..Default::default()
+            },
+        );
+        let first = apply(&mut connection, &budget, "accepted").unwrap();
+        assert_eq!(
+            first.snapshot.common_context_budget().unwrap(),
+            (128_000, 1)
+        );
+        assert_eq!(apply(&mut connection, &budget, "later").unwrap(), first);
+        apply(&mut connection, &theme("other-field"), "later").unwrap();
+        assert_eq!(
+            load(&connection).unwrap().common_context_budget().unwrap(),
+            (128_000, 1)
+        );
+        let mut stale = budget.clone();
+        stale.command_id = "stale-budget".into();
+        stale.idempotency_key = "stale-budget-key".into();
+        assert_eq!(
+            apply(&mut connection, &stale, "later"),
+            Err(SettingsError::Conflict)
+        );
+        let before = load(&connection).unwrap();
+        for invalid in [0, 128_001, u32::MAX] {
+            let invalid = command(
+                &format!("invalid-{invalid}"),
+                PreferencePatch {
+                    common_context_token_limit: Some(invalid),
+                    ..Default::default()
+                },
+                ExpectedFieldRevisions {
+                    common_context_token_limit: Some(1),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                apply(&mut connection, &invalid, "later"),
+                Err(SettingsError::InvalidInput)
+            );
+            assert_eq!(load(&connection).unwrap(), before);
+        }
+        let events = pending_events(&mut connection, 100).unwrap();
+        assert_eq!(events.events.len(), 2);
+        assert_eq!(
+            events.events[0].snapshot.common_context_budget().unwrap(),
+            (128_000, 1)
+        );
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!(1.5),
+            serde_json::json!(-1),
+        ] {
+            let invalid = serde_json::json!({"schemaVersion":1,"commandId":"bad","idempotencyKey":"bad","target":"console_preferences","patch":{"commonContextTokenLimit":value},"expectedFieldRevisions":{"commonContextTokenLimit":0}});
+            assert!(serde_json::from_value::<SettingsCommand>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn client_defaults_cannot_choose_execution_budget_without_native_cas() {
+        let mut connection = initialized();
+        let mut defaults = load(&connection).unwrap().preferences;
+        defaults.common_context_token_limit = 128_000;
+        connection = Connection::open_in_memory().unwrap();
+        initialize_with_defaults(&mut connection, None, defaults).unwrap();
+        assert_eq!(
+            load(&connection).unwrap().common_context_budget().unwrap(),
+            (32_000, 0)
+        );
+    }
+
+    #[test]
+    fn old_settings_missing_budget_defaults_but_present_corruption_is_rejected() {
+        let mut connection = initialized();
+        let mut old = serde_json::to_value(load(&connection).unwrap()).unwrap();
+        old["preferences"]
+            .as_object_mut()
+            .unwrap()
+            .remove("commonContextTokenLimit");
+        old["fieldRevisions"]
+            .as_object_mut()
+            .unwrap()
+            .remove("commonContextTokenLimit");
+        connection
+            .execute("UPDATE settings_state SET payload=?1", [old.to_string()])
+            .unwrap();
+        initialize(&mut connection, None).unwrap();
+        assert_eq!(
+            load(&connection).unwrap().common_context_budget().unwrap(),
+            (32_000, 0)
+        );
+        for invalid in [
+            serde_json::json!(0),
+            serde_json::json!(128001),
+            serde_json::Value::Null,
+            serde_json::json!(1.5),
+        ] {
+            let mut corrupt = old.clone();
+            corrupt["preferences"]["commonContextTokenLimit"] = invalid;
+            connection
+                .execute(
+                    "UPDATE settings_state SET payload=?1",
+                    [corrupt.to_string()],
+                )
+                .unwrap();
+            assert_eq!(load(&connection), Err(SettingsError::CorruptAuthority));
+        }
     }
 
     #[test]
