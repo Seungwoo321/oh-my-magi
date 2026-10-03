@@ -1840,15 +1840,61 @@ fn prepare_retained_saved_profile_backup_at(
 #[derive(Default)]
 struct SavedDeliberationUiState {
     nonce: Mutex<Option<String>>,
+    progress: Mutex<Option<SavedDeliberationUiPhase>>,
     outcome: Mutex<Option<Result<serde_json::Value, String>>>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SavedDeliberationUiPhase {
+    BridgeReady,
+    DocumentReady,
+    NewDeliberation,
+    QuestionWritable,
+    SourcesView,
+    NativePicker,
+    CaptureComplete,
+    InputReview,
+    ConsentReady,
+    StartReady,
+    StartReceipt,
+}
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SavedDeliberationUiProgress {
+    nonce: String,
+    phase: SavedDeliberationUiPhase,
+}
+#[tauri::command]
+fn saved_deliberation_ui_progress(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, SavedDeliberationUiState>,
+    input: SavedDeliberationUiProgress,
+) -> Result<(), String> {
+    if window.label() != "main"
+        || state.nonce.lock().map_err(|_| "UI nonce lock")?.as_deref() != Some(input.nonce.as_str())
+        || state
+            .outcome
+            .lock()
+            .map_err(|_| "UI outcome lock")?
+            .is_some()
+    {
+        return Err("UI progress fenced".into());
+    }
+    let mut progress = state.progress.lock().map_err(|_| "UI progress lock")?;
+    if progress.is_some_and(|prior| input.phase < prior) {
+        return Err("UI progress cannot move backwards".into());
+    }
+    if *progress != Some(input.phase) {
+        eprintln!("native actual UI phase: {:?}", input.phase);
+        *progress = Some(input.phase);
+    }
+    Ok(())
 }
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SavedDeliberationUiReport {
     nonce: String,
-    receipt: Option<serde_json::Value>,
-    request: Option<serde_json::Value>,
-    failure: Option<String>,
+    failure: String,
 }
 #[tauri::command]
 fn saved_deliberation_ui_report(
@@ -1865,7 +1911,8 @@ fn saved_deliberation_ui_report(
     if outcome.is_some() {
         return Err("UI report duplicate".into());
     }
-    *outcome = Some(if let Some(failure) = input.failure {
+    *outcome = Some({
+        let failure = input.failure;
         let category = match failure.as_str() {
             "physical_ui_bridge_ready"
             | "physical_ui_document_ready"
@@ -1881,12 +1928,73 @@ fn saved_deliberation_ui_report(
             _ => "unknown_ui_action",
         };
         Err(format!("actual UI action failed: {category}"))
-    } else {
-        Ok(
-            serde_json::json!({"receipt":input.receipt.ok_or("UI receipt missing")?,"request":input.request.ok_or("UI request missing")?}),
-        )
     });
     Ok(())
+}
+
+#[tauri::command]
+async fn start_deliberation(
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, commands::DesktopState>,
+    input: profiles::StartDeliberationInputDto,
+) -> Result<profiles::StartDeliberationReceiptDto, profiles::LiveRunError> {
+    let request = serde_json::to_value(&input);
+    let main_window = window.label() == "main";
+    let observed_nonce = if main_window {
+        let observer = app.state::<SavedDeliberationUiState>();
+        observer.nonce.lock().ok().and_then(|nonce| nonce.clone())
+    } else {
+        None
+    };
+    let result = profiles::start_deliberation(window, app.clone(), state, input).await;
+    if main_window && let Ok(receipt) = &result {
+        let observer = app.state::<SavedDeliberationUiState>();
+        if let (Ok(nonce), Ok(mut progress), Ok(mut outcome)) = (
+            observer.nonce.lock(),
+            observer.progress.lock(),
+            observer.outcome.lock(),
+        ) && observed_nonce.is_some()
+            && *nonce == observed_nonce
+            && *progress == Some(SavedDeliberationUiPhase::StartReady)
+            && outcome.is_none()
+        {
+            *outcome = Some(match (request, serde_json::to_value(receipt)) {
+                (Ok(mut request), Ok(receipt)) => {
+                    if let Some(object) = request.as_object_mut() {
+                        object.remove("admissionAuthority");
+                    }
+                    *progress = Some(SavedDeliberationUiPhase::StartReceipt);
+                    eprintln!("native actual UI phase: StartReceipt");
+                    Ok(serde_json::json!({"receipt":receipt,"request":request}))
+                }
+                _ => Err("actual UI receipt observation unavailable".into()),
+            });
+        }
+    }
+    result
+}
+
+#[cfg(test)]
+mod saved_ui_report_contract_tests {
+    use super::SavedDeliberationUiReport;
+
+    #[test]
+    fn renderer_can_report_failure_but_cannot_supply_execution_receipt() {
+        assert!(
+            serde_json::from_value::<SavedDeliberationUiReport>(
+                serde_json::json!({"nonce":"observed","failure":"physical_ui_start_ready"})
+            )
+            .is_ok()
+        );
+        for forged in [
+            serde_json::json!({"nonce":"observed","receipt":{"runId":"forged"},"request":{}}),
+            serde_json::json!({"nonce":"observed","failure":"physical_ui_start_ready","receipt":{"runId":"forged"}}),
+            serde_json::json!({"nonce":"observed","failure":null}),
+        ] {
+            assert!(serde_json::from_value::<SavedDeliberationUiReport>(forged).is_err());
+        }
+    }
 }
 
 fn prepare_saved_profile_run_store() -> Result<(), String> {
@@ -2210,12 +2318,25 @@ pub(crate) fn run() {
                 );
             }
         })
-        .invoke_handler(crate::desktop::product_invoke_handler!(
-            get_console_snapshot,
-            pdf_ui_probe_report,
-            connections_ui_probe_report,
-            saved_deliberation_ui_report,
-        ))
+        .invoke_handler({
+            let start_handler: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool =
+                tauri::generate_handler![start_deliberation];
+            let product_handler: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool =
+                crate::desktop::product_invoke_handler!(
+                    get_console_snapshot,
+                    pdf_ui_probe_report,
+                    connections_ui_probe_report,
+                    saved_deliberation_ui_progress,
+                    saved_deliberation_ui_report,
+                );
+            move |invoke: tauri::ipc::Invoke<tauri::Wry>| {
+                if invoke.message.command() == "start_deliberation" {
+                    start_handler(invoke)
+                } else {
+                    product_handler(invoke)
+                }
+            }
+        })
         .setup(move |app| {
             setup_monitor.mark("setup");
             app.manage(saved_input.clone());
