@@ -1850,6 +1850,10 @@ enum SavedDeliberationUiPhase {
     DocumentReady,
     NewDeliberation,
     QuestionWritable,
+    ConnectionVerification,
+    ModelReconfirmation,
+    CoreReconfirmation,
+    DraftRestored,
     SourcesView,
     NativePicker,
     CaptureComplete,
@@ -1918,6 +1922,10 @@ fn saved_deliberation_ui_report(
             | "physical_ui_document_ready"
             | "physical_ui_new_deliberation"
             | "physical_ui_question_writable"
+            | "physical_ui_connection_verification"
+            | "physical_ui_model_reconfirmation"
+            | "physical_ui_core_reconfirmation"
+            | "physical_ui_draft_restored"
             | "physical_ui_sources_view"
             | "physical_ui_native_picker"
             | "physical_ui_capture_complete"
@@ -2985,7 +2993,7 @@ async fn probe(
         let nonce = uuid::Uuid::new_v4().simple().to_string();
         *state.nonce.lock().map_err(|_| "UI nonce lock")? = Some(nonce.clone());
         let config = serde_json::to_string(
-            &serde_json::json!({"nonce":nonce,"question":question,"sourceMode":source_mode}),
+            &serde_json::json!({"nonce":nonce,"question":question,"sourceMode":source_mode,"selections":observed_selections}),
         )
         .map_err(|_| "UI config encoding")?;
         window
@@ -3008,13 +3016,68 @@ async fn probe(
         };
         *state.nonce.lock().map_err(|_| "UI nonce lock")? = None;
         let request = observed["request"].clone();
-        if request["question"] != question
-            || request["coreBindings"]
-                != serde_json::to_value(&core_bindings).map_err(|_| "UI binding encoding")?
-            || request["disclosureConfirmed"] != true
-        {
+        if request["question"] != question || request["disclosureConfirmed"] != true {
             return Err("actual UI admitted input differs from reviewed saved selections".into());
         }
+        let mut current_bindings = Vec::new();
+        for original in &core_bindings {
+            let core = storage
+                .load_core_model_selection(original.core_id)
+                .map_err(|_| "UI current core authority")?
+                .ok_or("UI current core missing")?;
+            let model = storage
+                .load_provider_model_selection(&original.provider_profile_id)
+                .map_err(|_| "UI current model authority")?
+                .ok_or("UI current model missing")?;
+            let fixed = observed_selections
+                .iter()
+                .find(|choice| {
+                    choice["coreId"] == serde_json::to_value(original.core_id).unwrap_or_default()
+                })
+                .ok_or("UI fixed selection missing")?;
+            if core.provider_profile_id != original.provider_profile_id
+                || core.profile_revision != original.profile_revision
+                || core.model_selection_revision != model.selection_revision
+                || model.binding.profile_revision != original.profile_revision
+                || serde_json::to_value(&model.binding.model_id).map_err(|_| "UI model encoding")?
+                    != fixed["modelId"]
+                || serde_json::to_value(&model.binding.mode_id).map_err(|_| "UI mode encoding")?
+                    != fixed["modeId"]
+                || serde_json::to_value(&model.binding.artifact_set_digest)
+                    .map_err(|_| "UI artifact encoding")?
+                    != fixed["artifactSetDigest"]
+                || serde_json::to_value(&model.binding.adapter_digest)
+                    .map_err(|_| "UI executable encoding")?
+                    != fixed["acpExecutableSha256"]
+            {
+                return Err("UI changed fixed saved execution identity".into());
+            }
+            current_bindings.push(magi_storage::CoreBindingReference {
+                core_id: core.core_id,
+                provider_profile_id: core.provider_profile_id,
+                profile_revision: core.profile_revision,
+                model_selection_revision: core.model_selection_revision,
+                core_selection_revision: core.selection_revision,
+            });
+        }
+        if request["coreBindings"]
+            != serde_json::to_value(&current_bindings).map_err(|_| "UI binding encoding")?
+        {
+            return Err("UI bindings differ from authoritative current selections".into());
+        }
+        let current_witnesses = profiles::load_core_execution_witnesses(
+            window.clone(),
+            app.state(),
+            serde_json::from_value(serde_json::json!({"coreBindings":current_bindings}))
+                .map_err(|_| "UI witness input")?,
+        )
+        .map_err(|_| "UI fresh execution authority missing")?;
+        std::fs::write(
+            root.join("physical-ui-current-witnesses.json"),
+            serde_json::to_vec_pretty(&current_witnesses).map_err(|_| "UI witness encoding")?,
+        )
+        .map_err(|_| "UI witness output")?;
+        core_bindings = current_bindings;
         if source_mode == PhysicalSourceMode::QuestionOnly {
             if !request["contextDraftId"].is_null() || !request["contextRevision"].is_null() {
                 return Err("question-only UI unexpectedly supplied captured context".into());
