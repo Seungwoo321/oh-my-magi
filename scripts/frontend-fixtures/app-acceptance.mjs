@@ -7,7 +7,7 @@ await page.addInitScript(()=>{
  let callback=0; const callbacks={}; const events={};
  window.__TAURI_EVENT_PLUGIN_INTERNALS__={unregisterListener(){}};
  const profiles=[{providerProfileId:'fixture-profile',revision:1,providerId:'codex-acp',displayName:'Saved profile',accountAlias:'Saved profile',authenticationMethod:'local_subscription',credentialConfigured:true,credentialHome:{displayPath:'~/.codex'},digest:'fixture-digest',updatedAt:'2026-10-01T00:00:00Z'}];
- window.fixture={profiles,saveMode:'success',saveCalls:0, calls:[], modes:{}, pending:{},validationReady:new URLSearchParams(location.search).has('terminal')};
+ window.fixture={profiles,saveMode:'success',saveCalls:0, calls:[], modes:{}, pending:{},validationReady:new URLSearchParams(location.search).has('terminal')||new URLSearchParams(location.search).has('manual-initial')};
  const catalog={schemaVersion:3,artifactSetDigest:'d'.repeat(64),catalogSnapshotId:'cat1',catalogDigest:'f'.repeat(64),providerId:'codex-acp',acpMode:'acp',providerProfileId:'fixture-profile',profileRevision:1,adapterId:'codex-acp',adapterVersion:'1',adapterDigest:'e'.repeat(64),fetchedAt:'2026-10-01T00:00:00Z',models:[{modelId:'model-a',name:'Model A'},{modelId:'model-b',name:'Model B'}],negotiatedModes:{currentModeId:'default',modes:[{modeId:'default',name:'Default',description:null}]}};
  window.fixture.catalog={providerProfileId:'fixture-profile',profileRevision:1,catalog,modelSelection:null,modelSelectionRevision:null,selectionState:'unselected'};
  window.fixture.cores=['MELCHIOR-1','BALTHASAR-2','CASPER-3'].map(coreId=>({coreId,selection:null,selectionRevision:null,selectionState:'unselected'}));
@@ -79,7 +79,7 @@ await page.addInitScript(()=>{
    if(window.fixture.saveMode==='error')throw new Error('fixture save failure');
    if(window.fixture.saveMode==='pending')await new Promise(resolve=>window.fixture.resolveSave=resolve);
    const d=args.draft,p={...profiles[0],providerProfileId:d.profileId??'created-fixture',revision:(d.expectedRevision??0)+1,displayName:d.displayName,accountAlias:d.displayName,credentialHome:{displayPath:d.credentialHomePath}};
-   const i=profiles.findIndex(x=>x.providerProfileId===p.providerProfileId);if(i<0)profiles.push(p);else profiles[i]=p;return structuredClone(p);
+   const i=profiles.findIndex(x=>x.providerProfileId===p.providerProfileId);if(i<0)profiles.push(p);else profiles[i]=p;if(location.search.includes('manual-initial')){const state=window.fixture.catalogs[p.providerProfileId];state.profileRevision=p.revision;state.catalog.profileRevision=p.revision;state.selectionState='stale';}return structuredClone(p);
   }
   return null;
  }};
@@ -91,6 +91,7 @@ await page.addInitScript(()=>{
  window.fixture.catalogs={};
  profiles.forEach((p,i)=>{const c={...catalog,providerProfileId:p.providerProfileId,catalogSnapshotId:'cat'+i,catalogDigest:String(i+1).repeat(64),models:[{modelId:'model'+i,name:'Model '+i,description:null,contextWindowTokens:128000,maxOutputTokens:8192}]};const {fetchedAt,models,negotiatedModes,...identity}=c;window.fixture.catalogs[p.providerProfileId]={providerProfileId:p.providerProfileId,profileRevision:1,catalog:c,modelSelection:{binding:{...identity,modelId:'model'+i,modeId:'default',bindingDigest:String(i+4).repeat(64)},selectionRevision:0,updatedAt:'server'},modelSelectionRevision:0,selectionState:'selected'};});
  window.fixture.cores.forEach((row,i)=>{row.selectionState='selected';row.selectionRevision=0;row.selection={coreId:row.coreId,providerProfileId:'p'+(i+1),profileRevision:1,modelSelectionRevision:0,selectionRevision:0,updatedAt:'server'};});
+if(location.search.includes('manual-initial'))window.fixture.cores.forEach(row=>{row.selection=null;row.selectionRevision=null;row.selectionState='unselected';});
 });
 
 
@@ -222,6 +223,37 @@ await page.evaluate(()=>fixture.emit('magi:run-update',{runId:'queue-run',stage:
 await page.getByRole('button',{name:'진행 심의 기록 열기',exact:false}).click();await page.getByText('BASELINE DOSSIER',{exact:true}).waitFor();await page.evaluate(()=>fixture.deferDossier=true);await page.getByRole('button',{name:'저장 상태 새로고침',exact:true}).click();await page.waitForFunction(()=>typeof fixture.resolveDossier==='function');await page.evaluate(()=>{fixture.dossier.revision=3;fixture.dossier.generation=3;fixture.dossier.proposal.body='LATEST AUTHORITATIVE DOSSIER';fixture.emit('magi:run-update',{runId:'queue-run',stage:'independent_review',state:'completed',result:structuredClone(fixture.dossier)});});await page.getByText('LATEST AUTHORITATIVE DOSSIER',{exact:true}).waitFor();await page.evaluate(()=>{const old={...structuredClone(fixture.dossier),revision:2,generation:2,proposal:{...fixture.dossier.proposal,body:'STALE SAME RUN DOSSIER'}};fixture.resolveDossier(old);fixture.emit('magi:run-update',{runId:'queue-run',stage:'independent_review',state:'completed',result:{...old,revision:4,generation:1}});});await page.waitForTimeout(50);assert.equal(await page.getByText('STALE SAME RUN DOSSIER',{exact:true}).count(),0);await page.getByText('LATEST AUTHORITATIVE DOSSIER',{exact:true}).waitFor();console.log('PASS late same-run readonly response and lower-generation result cannot overwrite latest dossier publication');
 await page.evaluate(()=>{fixture.deferDossier=true;fixture.resolveDossier=null;});await page.getByRole('button',{name:/Other question/}).click();await page.waitForFunction(()=>typeof fixture.resolveDossier==='function');await page.getByRole('button',{name:/Queue question/}).click();await page.getByText('LATEST AUTHORITATIVE DOSSIER',{exact:true}).waitFor();await page.evaluate(()=>fixture.resolveDossier({...structuredClone(fixture.dossier),runId:'other-run',revision:9,generation:9,proposal:{...fixture.dossier.proposal,body:'STALE OTHER RUN DOSSIER'}}));await page.waitForTimeout(50);assert.equal(await page.getByText('STALE OTHER RUN DOSSIER',{exact:true}).count(),0);await page.getByText('LATEST AUTHORITATIVE DOSSIER',{exact:true}).waitFor();console.log('PASS obsolete different-run history response cannot publish into returned current selection');
 await page.goto(base+'?queue&companion');await page.locator('.core-status strong').filter({hasText:'요청 종료 · 산출물 미확인'}).first().waitFor();const subscription=await page.evaluate(()=>fixture.calls.findIndex(call=>call.cmd==='plugin:event|listen'&&call.args.event==='magi:core-dispatches'));const initialRead=await page.evaluate(()=>fixture.calls.findIndex(call=>call.cmd==='load_run_core_dispatches'));assert.ok(subscription>=0&&initialRead>subscription);await page.evaluate(()=>{fixture.queue.coreDispatches[0].resultRef='companion-accepted';fixture.queue.projectionDigest='d'.repeat(64);fixture.emit('magi:core-dispatches',fixture.queue);});await page.locator('.core-status strong').filter({hasText:'공개 산출물 저장됨'}).first().waitFor();const reads=await page.evaluate(()=>fixture.calls.filter(call=>call.cmd==='load_run_core_dispatches').length);await page.evaluate(()=>fixture.emit('magi:core-dispatches',{...fixture.queue,runId:'other-run'}));await page.waitForTimeout(50);assert.equal(await page.evaluate(()=>fixture.calls.filter(call=>call.cmd==='load_run_core_dispatches').length),reads);assert.equal(await page.evaluate(()=>fixture.calls.some(call=>call.cmd==='start_deliberation'||call.cmd==='start_live_run')),false);console.log('PASS companion subscribes before native readonly read, consumes same-run metadata transitions, and ignores unpinned run without inference');
+await page.goto(base+'?manual-initial');
+await page.getByRole('button',{name:'모델 연결',exact:true}).click();
+for(const id of ['p1','p2','p3']) {
+ const profileRow=page.locator(`li[data-profile-id="${id}"]`);
+ await profileRow.getByRole('button',{name:'연결 확인',exact:true}).click();
+ await profileRow.getByText('기존 구독 확인됨',{exact:false}).waitFor();
+}
+assert.equal(await page.evaluate(()=>fixture.calls.filter(c=>c.cmd==='authenticate_provider_profile').length),3);
+const manualCore=page.locator('#core-MELCHIOR-1').locator('..');
+await manualCore.locator('select').selectOption('p1');
+await manualCore.getByRole('button',{name:'코어 연결 저장',exact:true}).click();
+await page.waitForFunction(()=>fixture.cores[0].selection?.providerProfileId==='p1'&&!document.querySelector('#core-MELCHIOR-1').disabled);
+await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
+assert.equal(await page.evaluate(()=>fixture.calls.filter(c=>c.cmd==='authenticate_provider_profile').length),3);
+await page.getByRole('button',{name:'저장 상태 다시 확인',exact:true}).click();
+await page.waitForFunction(()=>!document.querySelector('#core-MELCHIOR-1').disabled);
+await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
+assert.equal(await page.evaluate(()=>fixture.calls.filter(c=>c.cmd==='authenticate_provider_profile').length),3);
+const revisionRow=page.locator('li[data-profile-id="p1"]');
+await revisionRow.getByRole('button',{name:'편집',exact:true}).click();
+await page.locator('#acp-profile-alias').fill('Revised Profile 1');
+await page.getByRole('button',{name:'프로필 저장',exact:true}).click();
+await page.waitForFunction(()=>fixture.calls.some(c=>c.cmd==='authenticate_provider_profile'&&c.args.profileId==='p1'&&c.args.expectedRevision===2));
+await page.locator('li[data-profile-id="p1"]').getByText('기존 구독 확인됨',{exact:false}).waitFor();
+assert.equal(await page.evaluate(()=>fixture.calls.filter(c=>c.cmd==='authenticate_provider_profile').length),4);
+await page.goto(base+'?terminal=completed');
+await page.waitForFunction(()=>fixture.calls.filter(c=>c.cmd==='authenticate_provider_profile').length===3);
+await page.getByRole('button',{name:'모델 연결',exact:true}).click();
+for(const id of ['p1','p2','p3'])await page.locator(`li[data-profile-id="${id}"]`).getByText('기존 구독 확인됨',{exact:false}).waitFor();
+assert.equal(await page.evaluate(()=>fixture.calls.some(c=>['select_provider_model','select_core_model'].includes(c.cmd))),false);
+console.log('PASS manual initial checks survive explicit core save and reload without duplicate automatic authentication; new profile revision and restart still verify automatically');
 for(const status of ['completed','cancelled','failed']) {
  await page.goto(base+'?terminal='+status);
  await page.getByRole('button',{name:'새 심의 시작',exact:true}).waitFor();

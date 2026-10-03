@@ -1341,6 +1341,7 @@ export default function App() {
   const checkConnection = useCallback(async (profileId: string) => {
     const profile = profileRevisionsRef.current.find(item => item.id === profileId);
     if (!profile || profile.authenticationMethod !== "local_subscription" || activeProviderAuthentication.current) return;
+    automaticConnectionChecks.current.add(`${profile.id}:${profile.revision}`);
     const check = coreBindings.beginConnectionCheck(profileId, profile.revision);
     const request = ++connectionCheckSequence.current;
     const binding = { profileId, profileRevision: profile.revision };
@@ -1406,7 +1407,6 @@ export default function App() {
       .map(core => profileRevisionsRef.current.find(item => item.id === core.selection?.providerProfileId))
       .find(item => item?.authenticationMethod === "local_subscription" && !automaticConnectionChecks.current.has(`${item.id}:${item.revision}`));
     if (!profile) return;
-    automaticConnectionChecks.current.add(`${profile.id}:${profile.revision}`);
     void checkConnection(profile.id).finally(() => setAutomaticCheckStep(step => step + 1));
   }, [acpProfilesState, acpProfiles, coreBindings.cores, checkConnection, authenticatingProfileId, automaticCheckStep]);
 
