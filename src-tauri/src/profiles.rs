@@ -4105,7 +4105,7 @@ struct ProposalClaimTurnOutput {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct OpenObjectionTurnOutput {
-    claim_key: String,
+    source_claim_id: String,
     rationale: String,
     #[serde(default)]
     required_information: Vec<String>,
@@ -4482,6 +4482,19 @@ fn deliberation_turn_prompt(
         DeliberationTurn::Synthesis => state.assessments.iter().collect::<Vec<_>>(),
         DeliberationTurn::Ballot(_) => state.assessments.iter().collect::<Vec<_>>(),
     };
+    let accepted_source_claim_ids = if matches!(turn, DeliberationTurn::Synthesis) {
+        reviews
+            .iter()
+            .flat_map(|assessment| {
+                assessment
+                    .claims
+                    .iter()
+                    .map(|claim| claim.claim_id.as_str())
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let context = serde_json::json!({
         "run_id": state.run.run_id,
         "input_digest": state.run.input_digest,
@@ -4489,6 +4502,7 @@ fn deliberation_turn_prompt(
         "approved_sources": sources,
         "role": role_context,
         "allowed_prior_reviews": reviews,
+        "accepted_source_claim_ids": accepted_source_claim_ids,
         "frozen_proposal": if matches!(turn, DeliberationTurn::Ballot(_)) { state.proposal } else { None },
     });
     let instruction = match turn {
@@ -4499,7 +4513,7 @@ fn deliberation_turn_prompt(
             "교차 검토를 작성하세요. 입력된 세 독립 검토만 검토 대상으로 사용하고 다른 교차 검토는 보지 마세요. claim_responses.target_claim_id와 position_changes의 claim_id 및 influenced_by_claim_ids는 allowed_prior_reviews에 있는 정확한 claim_id만 사용하세요. 각 응답의 response 값은 스키마의 열거값을 사용하세요."
         }
         DeliberationTurn::Synthesis => {
-            "비투표 서기로서 여섯 검토를 종합해 결의안을 작성하세요. 찬반 표결을 하지 말고 개별 코어의 표를 추정하지 마세요. 각 claims.key는 고유하고 비어 있지 않아야 합니다. open_objections.claim_key는 같은 응답의 정확한 claims.key만 참조하세요."
+            "비투표 서기로서 여섯 검토를 종합해 결의안을 작성하세요. 찬반 표결을 하지 말고 개별 코어의 표를 추정하지 마세요. 각 claims.key는 고유하고 비어 있지 않아야 합니다. open_objections.source_claim_id는 accepted_source_claim_ids에 있는 원래 검토의 정확한 claim_id만 참조하세요. 결의안 claims.key나 새 ID로 바꾸지 마세요."
         }
         DeliberationTurn::Ballot(_) => {
             "최종 결의안에 대해 독립적으로 비밀 표결하세요. 다른 코어의 표결은 제공되지 않습니다. objection_refs는 frozen_proposal.open_objections에 있는 정확한 claim_id만 사용하세요. vote는 스키마의 열거값을 사용하세요."
@@ -4589,12 +4603,12 @@ fn accept_deliberation_output(
                     false,
                 )
             })?;
-            let mut claim_ids = HashMap::new();
+            let mut claim_keys = std::collections::HashSet::new();
             let claims = draft
                 .claims
                 .into_iter()
                 .map(|claim| {
-                    if claim.key.trim().is_empty() || claim_ids.contains_key(&claim.key) {
+                    if claim.key.trim().is_empty() || !claim_keys.insert(claim.key.clone()) {
                         return Err(deliberation_error(
                             "provider_output_invalid",
                             "The provider response contains an invalid proposal claim key.",
@@ -4602,7 +4616,6 @@ fn accept_deliberation_output(
                         ));
                     }
                     let claim_id = format!("proposal-claim-{}", Uuid::new_v4().simple());
-                    claim_ids.insert(claim.key, claim_id.clone());
                     Ok(ProposalClaim {
                         claim_id,
                         kind: claim.kind,
@@ -4615,25 +4628,12 @@ fn accept_deliberation_output(
             let open_objections = draft
                 .open_objections
                 .into_iter()
-                .map(|objection| {
-                    let claim_id =
-                        claim_ids
-                            .get(&objection.claim_key)
-                            .cloned()
-                            .ok_or_else(|| {
-                                deliberation_error(
-                                    "provider_output_invalid",
-                                    "The proposal objection references an unknown claim.",
-                                    false,
-                                )
-                            })?;
-                    Ok(OpenObjection {
-                        claim_id,
-                        rationale: objection.rationale,
-                        required_information: objection.required_information,
-                    })
+                .map(|objection| OpenObjection {
+                    claim_id: objection.source_claim_id,
+                    rationale: objection.rationale,
+                    required_information: objection.required_information,
                 })
-                .collect::<Result<Vec<_>, LiveRunDispatchFailure>>()?;
+                .collect::<Vec<_>>();
             let proposal = ProposalSnapshot {
                 schema_version: CONTRACT_SCHEMA_VERSION,
                 proposal_id: Uuid::new_v4().simple().to_string(),
@@ -8563,7 +8563,7 @@ pub(crate) mod catalog_selection_ipc_tests {
             .map_err(|failure| failure.failure.code)
             .unwrap();
         }
-        let proposal = serde_json::json!({"body":"Require confirmation before sharing selected files", "claims":[{"key":"consent","kind":"inference","text":"Explicit consent reduces accidental sharing","evidence_refs":[],"limitations":[]}],"conditions":[],"alternatives":[],"open_objections":[]});
+        let proposal = serde_json::json!({"body":"Require confirmation before sharing selected files", "claims":[{"key":"consent","kind":"inference","text":"Explicit consent reduces accidental sharing","evidence_refs":[],"limitations":[]}],"conditions":[],"alternatives":[],"open_objections":[{"source_claim_id":target,"rationale":"The original assumption still needs verification","required_information":["Confirm the assumption"]}]});
         let proposal_schema: serde_json::Value = serde_json::from_str(
             &deliberation_output_schema(DeliberationTurn::Synthesis)
                 .map_err(|failure| failure.failure.code)
@@ -8602,16 +8602,63 @@ pub(crate) mod catalog_selection_ipc_tests {
             serde_json::from_str::<serde_json::Value>(embedded).unwrap(),
             proposal_schema
         );
-        let mut bad = proposal.clone();
-        bad["open_objections"] = serde_json::json!([{"claim_key":"unknown","rationale":"Not in proposal","required_information":[]}]);
+        let context: serde_json::Value =
+            serde_json::from_str(prompt.split("\n\n입력 JSON:\n").nth(1).unwrap()).unwrap();
+        assert_eq!(
+            context["accepted_source_claim_ids"]
+                .as_array()
+                .unwrap()
+                .len(),
+            6
+        );
         assert!(
-            accept_deliberation_output(
+            context["accepted_source_claim_ids"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(target))
+        );
+        let foreign_input = aggregate.persistence_state().input;
+        let mut foreign = RunAggregate::new(
+            Run::new(
+                "foreign-source-run".into(),
+                "foreign-source-conversation".into(),
+                None,
+                &foreign_input,
+                now_rfc3339(),
+            )
+            .unwrap(),
+            foreign_input,
+        )
+        .unwrap();
+        foreign.request_confirmation(0, now_rfc3339()).unwrap();
+        foreign
+            .confirm_and_start(foreign.run().revision, now_rfc3339())
+            .unwrap();
+        accept_deliberation_output(&mut foreign, independent, &valid.to_string()).unwrap();
+        let foreign_claim = foreign.persistence_state().assessments[0].claims[0]
+            .claim_id
+            .clone();
+        for source_id in ["unknown", "consent", foreign_claim.as_str()] {
+            let mut bad = proposal.clone();
+            bad["open_objections"][0]["source_claim_id"] = serde_json::json!(source_id);
+            let failure = accept_deliberation_output(
                 &mut aggregate,
                 DeliberationTurn::Synthesis,
-                &bad.to_string()
+                &bad.to_string(),
             )
-            .is_err()
+            .unwrap_err();
+            assert!(failure.failure.detail.contains("unknown_source_claim"));
+            assert!(matches!(aggregate.run().status, RunStatus::Synthesis));
+        }
+        let mut wrong_key = proposal.clone();
+        wrong_key["open_objections"][0] = serde_json::json!({"claim_key":"consent","rationale":"Wrong relation","required_information":[]});
+        assert!(serde_json::from_value::<ProposalTurnOutput>(wrong_key).is_err());
+        let correction = malformed_output_correction_prompt(
+            &prompt,
+            &deliberation_error("provider_output_invalid", "Rejected", false),
         );
+        assert!(correction.contains("open_objections.source_claim_id"));
+        assert!(correction.contains("accepted_source_claim_ids"));
         accept_deliberation_output(
             &mut aggregate,
             DeliberationTurn::Synthesis,
@@ -8619,7 +8666,32 @@ pub(crate) mod catalog_selection_ipc_tests {
         )
         .map_err(|failure| failure.failure.code)
         .unwrap();
-        let ballot = serde_json::json!({"vote":"support","rationale":"The consent policy is appropriate","objection_refs":[]});
+        assert!(matches!(aggregate.run().status, RunStatus::Balloting));
+        let persisted = aggregate.persistence_state();
+        let frozen = persisted.proposal.as_ref().unwrap();
+        assert_eq!(frozen.open_objections[0].claim_id, target);
+        assert_ne!(frozen.claims[0].claim_id, target);
+        let bytes = serde_json::to_vec(frozen).unwrap();
+        let restored = RunAggregate::restore(persisted.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_vec(restored.persistence_state().proposal.as_ref().unwrap()).unwrap(),
+            bytes
+        );
+        for source_id in [
+            "unknown",
+            frozen.claims[0].claim_id.as_str(),
+            foreign_claim.as_str(),
+        ] {
+            let mut invalid = persisted.clone();
+            let mut invalid_proposal = invalid.proposal.take().unwrap();
+            invalid_proposal.open_objections[0].claim_id = source_id.into();
+            invalid.proposal = Some(invalid_proposal.seal().unwrap());
+            assert!(RunAggregate::restore(invalid).is_err());
+        }
+        let mut blank = frozen.clone();
+        blank.open_objections[0].claim_id = String::new();
+        assert!(blank.seal().is_err());
+        let ballot = serde_json::json!({"vote":"support","rationale":"The consent policy is appropriate","objection_refs":[target]});
         let vote_schema: serde_json::Value = serde_json::from_str(
             &deliberation_output_schema(DeliberationTurn::Ballot(CoreId::Melchior1))
                 .map_err(|failure| failure.failure.code)

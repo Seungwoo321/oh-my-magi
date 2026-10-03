@@ -13,7 +13,6 @@ use std::{
     time::{Duration, Instant},
 };
 use tauri::{AppHandle, Manager, State, WebviewWindow};
-use tauri_plugin_dialog::DialogExt;
 
 const LIMIT: u64 = 16 * 1024;
 const LIFETIME: Duration = Duration::from_secs(15 * 60);
@@ -722,6 +721,26 @@ pub(crate) fn get_store_selection_state(
         pending_selection,
     })
 }
+fn restored_picker_path(
+    outcome: Result<
+        crate::native_source_picker::PickerOutcome,
+        crate::native_source_picker::PickerError,
+    >,
+) -> Result<Option<PathBuf>, String> {
+    use crate::native_source_picker::{PickerError, PickerOutcome};
+    match outcome {
+        Ok(PickerOutcome::Cancelled) => Ok(None),
+        Ok(PickerOutcome::Selected(mut paths)) if paths.len() == 1 => Ok(paths.pop()),
+        Ok(PickerOutcome::Selected(_)) | Err(PickerError::InvalidSelection) => {
+            Err("The restored-store folder selection is invalid.".into())
+        }
+        Err(PickerError::Unavailable) => {
+            Err("The restored-store folder picker is unavailable.".into())
+        }
+        Err(PickerError::TimedOut) => Err("The restored-store folder picker timed out.".into()),
+    }
+}
+
 #[tauri::command]
 pub(crate) async fn select_restored_store(
     window: WebviewWindow,
@@ -729,17 +748,11 @@ pub(crate) async fn select_restored_store(
     state: State<'_, DesktopState>,
 ) -> Result<Option<SelectionReview>, String> {
     main_window(&window)?;
-    let picker = app.clone();
-    let selected =
-        tauri::async_runtime::spawn_blocking(move || picker.dialog().file().blocking_pick_folder())
-            .await
-            .map_err(|_| "Cannot open store folder picker.")?;
-    let Some(selected) = selected else {
+    let Some(path) =
+        restored_picker_path(crate::native_source_picker::select(&window, true).await)?
+    else {
         return Ok(None);
     };
-    let path = selected
-        .into_path()
-        .map_err(|_| "Cannot read selected folder.")?;
     let directory = private_directory(&path)?;
     let database = held_file(&path.join("state/magi.sqlite"))?;
     let current = state.storage()?.identity().clone();

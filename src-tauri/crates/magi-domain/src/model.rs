@@ -2535,13 +2535,11 @@ impl ProposalSnapshot {
             }
         }
         for (index, objection) in self.open_objections.iter().enumerate() {
-            if !claim_ids.contains(&objection.claim_id) {
-                issues.push(ValidationIssue::new(
-                    format!("open_objections[{index}].claim_id"),
-                    "unknown_claim",
-                    "open objection must reference a claim in this proposal",
-                ));
-            }
+            check_id(
+                &format!("open_objections[{index}].claim_id"),
+                &objection.claim_id,
+                &mut issues,
+            );
             check_nonblank(
                 &format!("open_objections[{index}].rationale"),
                 &objection.rationale,
