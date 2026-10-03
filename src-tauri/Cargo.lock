@@ -2195,6 +2195,7 @@ name = "magi-console"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "block2",
  "cap-std",
  "ed25519-dalek",
  "libc",
@@ -2203,6 +2204,9 @@ dependencies = [
  "magi-provider",
  "magi-storage",
  "minisign-verify",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
  "plist",
  "reqwest",
  "rusqlite",

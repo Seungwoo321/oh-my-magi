@@ -1,6 +1,7 @@
 mod commands;
 mod core_dispatch;
 mod desktop;
+mod native_source_picker;
 mod pdf_capture;
 mod preferences;
 mod profiles;

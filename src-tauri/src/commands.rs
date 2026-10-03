@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::sync::mpsc;
 #[path = "extraction_helper.rs"]
 pub(crate) mod extraction_helper;
 
@@ -20,12 +22,10 @@ use std::{
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        mpsc,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow, async_runtime};
-use tauri_plugin_dialog::DialogExt;
 use uuid::Uuid;
 
 use crate::profiles::ProviderWorkdir;
@@ -2537,31 +2537,15 @@ pub async fn select_context_files(
         None => (Uuid::new_v4().to_string(), None),
     };
 
-    let (sender, receiver) = mpsc::sync_channel(1);
-    app.dialog().file().pick_files(move |paths| {
-        let _ = sender.send(paths);
-    });
-    let paths = tauri::async_runtime::spawn_blocking(move || receiver.recv())
-        .await
-        .map_err(|_| "The native file picker stopped unexpectedly.")?
-        .map_err(|_| "The native file picker did not return a result.")?;
-    let Some(paths) = paths else {
-        return Ok(None);
+    let paths = match crate::native_source_picker::select(&window, false).await {
+        Ok(crate::native_source_picker::PickerOutcome::Selected(paths)) => paths,
+        Ok(crate::native_source_picker::PickerOutcome::Cancelled) => return Ok(None),
+        Err(error) => return Err(error.message().into()),
     };
-    if paths.is_empty() {
-        return Ok(None);
-    }
     if paths.len() > MAX_MANIFEST_ITEMS {
         return Err("Select no more than 1,000 files at a time.".into());
     }
 
-    let paths = paths
-        .into_iter()
-        .map(|path| {
-            path.into_path()
-                .map_err(|_| "The selected item is not a local file.")
-        })
-        .collect::<Result<Vec<_>, _>>()?;
     let summary = tauri::async_runtime::spawn_blocking(move || {
         let _operation = operation;
         _operation
@@ -2613,20 +2597,14 @@ pub async fn select_context_directory(
         None => (Uuid::new_v4().to_string(), None),
     };
 
-    let (sender, receiver) = mpsc::sync_channel(1);
-    app.dialog().file().pick_folder(move |path| {
-        let _ = sender.send(path);
-    });
-    let path = tauri::async_runtime::spawn_blocking(move || receiver.recv())
-        .await
-        .map_err(|_| "The native folder picker stopped unexpectedly.")?
-        .map_err(|_| "The native folder picker did not return a result.")?;
-    let Some(path) = path else {
-        return Ok(None);
+    let path = match crate::native_source_picker::select(&window, true).await {
+        Ok(crate::native_source_picker::PickerOutcome::Selected(mut paths)) if paths.len() == 1 => {
+            paths.remove(0)
+        }
+        Ok(crate::native_source_picker::PickerOutcome::Cancelled) => return Ok(None),
+        Ok(_) => return Err("The native folder picker returned an invalid selection.".into()),
+        Err(error) => return Err(error.message().into()),
     };
-    let path = path
-        .into_path()
-        .map_err(|_| "The selected folder is not a local directory.")?;
     let summary = tauri::async_runtime::spawn_blocking(move || {
         let _operation = operation;
         _operation
