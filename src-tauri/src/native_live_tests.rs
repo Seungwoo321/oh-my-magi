@@ -1843,6 +1843,7 @@ struct SavedDeliberationUiState {
     progress: Mutex<Option<SavedDeliberationUiPhase>>,
     connection_step: Mutex<Option<ConnectionDiagnostic>>,
     core_step: Mutex<Option<CoreDiagnostic>>,
+    confirmation_diagnostic: Mutex<Option<ConfirmationDiagnostic>>,
     outcome: Mutex<Option<Result<serde_json::Value, String>>>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize)]
@@ -2160,6 +2161,85 @@ mod connection_diagnostic_tests {
         }
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ConfirmationBlockReason {
+    None,
+    ActiveRun,
+    ProfileStore,
+    CoreConnection,
+    Roles,
+    Storage,
+    Disclosure,
+    Budget,
+    Unknown,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConfirmationDiagnostic {
+    checkbox_present: bool,
+    checkbox_disabled: bool,
+    heading_is_confirmation: bool,
+    block_reason_category: ConfirmationBlockReason,
+    destination_needs_check_count: u8,
+}
+fn validate_confirmation_diagnostic(
+    phase: SavedDeliberationUiPhase,
+    diagnostic: ConfirmationDiagnostic,
+) -> Result<(), String> {
+    if phase != SavedDeliberationUiPhase::ConsentReady
+        || diagnostic.destination_needs_check_count > 3
+        || (!diagnostic.checkbox_present && diagnostic.checkbox_disabled)
+    {
+        return Err("UI confirmation diagnostic fenced".into());
+    }
+    Ok(())
+}
+#[cfg(test)]
+mod confirmation_diagnostic_tests {
+    use super::*;
+    #[test]
+    fn confirmation_metadata_is_closed_and_phase_bounded() {
+        let value = serde_json::json!({"checkboxPresent":true,"checkboxDisabled":true,"headingIsConfirmation":true,"blockReasonCategory":"core_connection","destinationNeedsCheckCount":3});
+        let diagnostic: ConfirmationDiagnostic = serde_json::from_value(value.clone()).unwrap();
+        assert!(
+            validate_confirmation_diagnostic(SavedDeliberationUiPhase::ConsentReady, diagnostic)
+                .is_ok()
+        );
+        assert!(
+            validate_confirmation_diagnostic(SavedDeliberationUiPhase::StartReady, diagnostic)
+                .is_err()
+        );
+        assert!(
+            validate_confirmation_diagnostic(
+                SavedDeliberationUiPhase::ConsentReady,
+                ConfirmationDiagnostic {
+                    destination_needs_check_count: 4,
+                    ..diagnostic
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            validate_confirmation_diagnostic(
+                SavedDeliberationUiPhase::ConsentReady,
+                ConfirmationDiagnostic {
+                    checkbox_present: false,
+                    ..diagnostic
+                }
+            )
+            .is_err()
+        );
+        for (key, replacement) in [
+            ("blockReasonCategory", serde_json::json!("ready")),
+            ("unexpected", serde_json::json!(true)),
+        ] {
+            let mut invalid = value.clone();
+            invalid[key] = replacement;
+            assert!(serde_json::from_value::<ConfirmationDiagnostic>(invalid).is_err());
+        }
+    }
+}
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SavedDeliberationUiProgress {
@@ -2169,6 +2249,8 @@ struct SavedDeliberationUiProgress {
     connection_step: Option<ConnectionDiagnostic>,
     #[serde(default)]
     core_step: Option<CoreDiagnostic>,
+    #[serde(default)]
+    confirmation_diagnostic: Option<ConfirmationDiagnostic>,
 }
 #[tauri::command]
 fn saved_deliberation_ui_progress(
@@ -2216,6 +2298,17 @@ fn saved_deliberation_ui_progress(
                 next.core_index, next.step, next.metadata
             );
             *step = Some(next);
+        }
+    }
+    if let Some(next) = input.confirmation_diagnostic {
+        validate_confirmation_diagnostic(input.phase, next)?;
+        let mut previous = state
+            .confirmation_diagnostic
+            .lock()
+            .map_err(|_| "UI confirmation diagnostic lock")?;
+        if *previous != Some(next) {
+            eprintln!("native actual UI confirmation: {:?}", next);
+            *previous = Some(next);
         }
     }
     if *progress != Some(input.phase) {

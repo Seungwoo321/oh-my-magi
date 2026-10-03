@@ -168,7 +168,34 @@
     await mark("input_review");
     click((await wait(() => button(["입력 확인", "Review input"]))));
     await mark("consent_ready");
-    const consent = await wait(() => { const el = document.querySelector(".check-row input[type=checkbox]:not(:disabled)"); return usable(el) ? el : null; });
+    let lastConfirmationSummary = null;
+    const consent = await wait(async () => {
+      const checkbox = document.querySelector(".check-row input[type=checkbox]");
+      const reason = document.querySelector(".blocked-reason")?.textContent.trim() ?? "";
+      const exactReasons = [
+        ["active_run", ["현재 심의의 저장 상태를 확인한 뒤 새 심의를 시작할 수 있습니다.", "Verify the current deliberation's saved state before starting another."]],
+        ["profile_store", ["ACP 프로필 저장소 상태를 확인하지 못했습니다.", "Could not verify the ACP profile store."]],
+        ["roles", ["실행에 사용할 세 코어 역할 프리셋을 확인하십시오.", "Verify the three-core role preset to use for execution."]],
+        ["storage", ["로컬 저장소 준비 상태가 확인되지 않아 실행을 차단했습니다.", "Execution is blocked because local storage readiness is unverified."]],
+        ["disclosure", ["전송 범위를 읽고 명시적으로 동의해야 시작할 수 있습니다.", "Read the transfer scope and give explicit consent before starting."]],
+        ["budget", ["단계별 전송 예산을 확인해야 시작할 수 있습니다."]],
+      ];
+      const needsCheck = Array.from(document.querySelectorAll(".confirmation-destination p")).filter(el => ["저장된 연결 확인 필요", "Saved connection verification required"].includes(el.textContent.trim())).length;
+      const category = exactReasons.find(([, labels]) => labels.includes(reason))?.[0]
+        ?? (/^(MELCHIOR-1|BALTHASAR-2|CASPER-3)( · (MELCHIOR-1|BALTHASAR-2|CASPER-3))*의 저장된 모델 연결을 확인하십시오\.$/.test(reason) ? "core_connection" : reason ? "unknown" : "none");
+      const metadata = {
+        checkboxPresent: Boolean(checkbox), checkboxDisabled: Boolean(checkbox?.disabled),
+        headingIsConfirmation: Array.from(document.querySelectorAll("h1,h2")).some(el => ["입력·전송 확인", "Input and transfer confirmation"].includes(el.textContent.trim())),
+        blockReasonCategory: category, destinationNeedsCheckCount: Math.min(needsCheck, 3),
+      };
+      const summary = JSON.stringify(metadata);
+      if (summary !== lastConfirmationSummary) {
+        await bounded(() => original("saved_deliberation_ui_progress", { input: { nonce: config.nonce, phase, confirmationDiagnostic: metadata } }));
+        lastConfirmationSummary = summary;
+      }
+      const el = document.querySelector(".check-row input[type=checkbox]:not(:disabled)");
+      return usable(el) ? el : null;
+    });
     if (!consent.checked) click(consent);
     await mark("start_ready");
     click(await wait(() => {
