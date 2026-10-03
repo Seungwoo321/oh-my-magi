@@ -2240,7 +2240,7 @@ export default function App() {
             <button type="button" className="text-action" onClick={() => navigate("intake")}>{t("자료 보기")}</button>
           </div>
           <button type="button" className="button button-primary agenda-primary" onClick={confirmQuestion} disabled={!isDraft}>
-            {isDraft ? t("입력 확인") : activeRun ? t("진행 중") : t("새 안건")}
+            {isDraft || retainedDraftIdentity ? t("입력 확인") : activeRun && !["completed", "cancelled", "failed"].includes(activeRun.status) ? t("진행 중") : t("새 안건")}
             <span aria-hidden="true">↗</span>
           </button>
         </div>

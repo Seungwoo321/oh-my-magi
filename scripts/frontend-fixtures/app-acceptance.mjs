@@ -111,7 +111,7 @@ const cap=page.getByRole('spinbutton',{name:'공통 문맥 토큰 상한',exact:
 await cap.waitFor();assert.equal(await cap.inputValue(),'32000');
 const capCalls=()=>page.evaluate(()=>fixture.calls.filter(c=>c.cmd==='save_console_preferences' && 'commonContextTokenLimit' in c.args.input.patch).length);
 const beforeCap=await capCalls();
-await cap.fill('');assert.equal(await cap.inputValue(),'');await cap.blur();await page.getByRole('alert').filter({hasText:'정수를 입력하세요'}).waitFor();assert.equal(await capCalls(),beforeCap);
+await cap.fill('');await page.waitForFunction(el=>el.value==='',await cap.elementHandle());assert.equal(await cap.inputValue(),'');await cap.blur();await page.getByRole('alert').filter({hasText:'정수를 입력하세요'}).waitFor();assert.equal(await capCalls(),beforeCap);
 await cap.fill('1.5');await cap.blur();assert.equal(await capCalls(),beforeCap);
 await cap.fill('128001');await cap.blur();assert.equal(await capCalls(),beforeCap);
 await cap.fill('64000');assert.equal(await capCalls(),beforeCap,'typing must not save each digit');await cap.press('Enter');
@@ -266,29 +266,36 @@ for(const status of ['completed','cancelled','failed']) {
  assert.equal(await draft.inputValue(),'New question after '+status);assert.equal(await draft.getAttribute('readonly'),null);
  await page.getByRole('button',{name:'모델 연결',exact:true}).click();
  await page.getByRole('heading',{name:'모델 연결',exact:true}).waitFor();
+ assert.equal((await page.locator('.agenda-primary').textContent()).replace('↗','').trim(),'입력 확인');assert.equal(await page.locator('.agenda-primary').isEnabled(),false);
  assert.equal(await draft.inputValue(),'New question after '+status);
  assert.equal(await page.locator('.agenda-source-status span').last().textContent(),'자료 0개');
  await page.evaluate(()=>{const result={...structuredClone(fixture.dossier),revision:4,generation:4};fixture.emit('magi:run-update',{runId:result.runId,stage:result.stage,state:result.status,result});});
  await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
  await page.getByRole('heading',{name:'모델 연결',exact:true}).waitFor();
+ assert.equal((await page.locator('.agenda-primary').textContent()).replace('↗','').trim(),'입력 확인');assert.equal(await page.locator('.agenda-primary').isEnabled(),false);
  assert.equal(await draft.inputValue(),'New question after '+status);
  await page.getByRole('button',{name:'원래 화면으로 돌아가기',exact:true}).click();
  assert.equal(await draft.getAttribute('readonly'),null);
  await page.getByRole('button',{name:'설정',exact:true}).click();
  await page.getByRole('heading',{name:'콘솔 설정',exact:true}).waitFor();
+ assert.equal((await page.locator('.agenda-primary').textContent()).replace('↗','').trim(),'입력 확인');assert.equal(await page.locator('.agenda-primary').isEnabled(),false);
  assert.equal(await draft.inputValue(),'New question after '+status);
  await page.evaluate(()=>{const result={...structuredClone(fixture.dossier),revision:5,generation:5};fixture.emit('magi:run-update',{runId:result.runId,stage:result.stage,state:result.status,result});});
  await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
  await page.getByRole('heading',{name:'콘솔 설정',exact:true}).waitFor();
+ assert.equal((await page.locator('.agenda-primary').textContent()).replace('↗','').trim(),'입력 확인');assert.equal(await page.locator('.agenda-primary').isEnabled(),false);
  assert.equal(await draft.inputValue(),'New question after '+status);
  await page.getByRole('button',{name:'원래 화면으로 돌아가기',exact:true}).click();
  assert.equal(await draft.inputValue(),'New question after '+status);assert.equal(await draft.getAttribute('readonly'),null);
  await page.getByRole('button',{name:'자료 보기',exact:true}).click();
+ assert.equal((await page.locator('.agenda-primary').textContent()).replace('↗','').trim(),'입력 확인');assert.equal(await page.locator('.agenda-primary').isEnabled(),false);
  await page.getByRole('button',{name:'입력 확인',exact:false}).last().click();
  await page.getByRole('heading',{name:'입력·전송 확인',exact:true}).waitFor();
+ assert.equal((await page.locator('.agenda-primary').textContent()).replace('↗','').trim(),'입력 확인');assert.equal(await page.locator('.agenda-primary').isEnabled(),false);
  await page.evaluate(()=>{const result={...structuredClone(fixture.dossier),revision:6,generation:6};fixture.emit('magi:run-update',{runId:result.runId,stage:result.stage,state:result.status,result});});
  await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
  await page.getByRole('heading',{name:'입력·전송 확인',exact:true}).waitFor();
+ assert.equal((await page.locator('.agenda-primary').textContent()).replace('↗','').trim(),'입력 확인');assert.equal(await page.locator('.agenda-primary').isEnabled(),false);
  assert.equal(await page.locator('#question-draft').inputValue(),'New question after '+status);
  assert.equal(await page.evaluate(()=>fixture.calls.some(c=>['register_deliberation_request','start_deliberation','select_provider_model','select_core_model'].includes(c.cmd))),false);
  await page.getByText('모든 단계의 사전 예산 확인됨',{exact:true}).waitFor();
@@ -301,7 +308,7 @@ for(const status of ['completed','cancelled','failed']) {
  assert.equal(await page.evaluate(()=>fixture.calls.some(c=>['select_provider_model','select_core_model'].includes(c.cmd))),false);
 }
 await page.goto(base+'?queue');await page.getByRole('button',{name:'진행 심의 기록 열기',exact:false}).waitFor();assert.equal(await page.getByRole('button',{name:'새 심의 시작',exact:true}).count(),0);
-await page.getByRole('button',{name:'진행 심의 기록 열기',exact:false}).click();assert.notEqual(await page.locator('#question-draft').getAttribute('readonly'),null);assert.equal(await page.evaluate(()=>fixture.calls.some(c=>c.cmd==='register_deliberation_request'||c.cmd==='start_deliberation')),false);
+await page.getByRole('button',{name:'진행 심의 기록 열기',exact:false}).click();assert.notEqual(await page.locator('#question-draft').getAttribute('readonly'),null);assert.equal((await page.locator('.agenda-primary').textContent()).replace('↗','').trim(),'진행 중');assert.equal(await page.locator('.agenda-primary').isEnabled(),false);assert.equal(await page.evaluate(()=>fixture.calls.some(c=>c.cmd==='register_deliberation_request'||c.cmd==='start_deliberation')),false);
 console.log('PASS terminal records preserve immutable dossier while new editable draft reaches exact three-binding admission; ongoing run blocks new entry');
 assert.deepEqual(pageErrors,[]);
 } finally {try {await page.evaluate(()=>{for(const release of window.fixture?.budgetResolvers?.splice(0)??[])release();});} finally {await page.close();}}
