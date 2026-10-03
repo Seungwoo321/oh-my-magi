@@ -78,6 +78,8 @@ path = "tests/resource-build-contract.rs"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "=0.6.4"
-objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "block2", "NSApplication", "NSOpenPanel", "NSPanel", "NSResponder", "NSSavePanel", "NSView", "NSWindow"] }
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "block2", "NSApplication", "NSOpenPanel", "NSPanel", "NSResponder", "NSSavePanel", "NSView", "NSWindow", "objc2-uniform-type-identifiers"] }
 block2 = "=0.6.2"
 objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "NSArray", "NSBundle", "NSString", "NSURL"] }
+
+objc2-uniform-type-identifiers = { version = "=0.3.2", default-features = false, features = ["std", "UTType"] }
